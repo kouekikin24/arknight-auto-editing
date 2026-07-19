@@ -1,0 +1,81 @@
+# Virtual environments
+.venv/
+venv/
+env/
+.kilo/
+
+# Python cache / bytecode / test cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+*.egg-info/
+.eggs/
+*.egg
+
+# Build / packaging / temporary outputs
+build/
+dist/
+tmp/
+temp/
+output/
+outputs/
+exports/
+*.log
+logs/
+ArknightsAutoEditor_v1.0.zip
+ArknightsAutoEditor.spec
+
+# Environment / secrets / certificates
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+secrets/
+credentials/
+
+# Claude / local AI tooling
+.claude/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS files
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Local handoff draft (tracked template: CLAUDE_HANDOFF.example.md)
+CLAUDE_HANDOFF.md
+
