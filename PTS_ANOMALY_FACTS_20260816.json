@@ -1,0 +1,443 @@
+{
+  "kind": "pts_anomaly_fact_report",
+  "schema_version": 1,
+  "created_utc": "2026-08-16T07:03:57.999792+00:00",
+  "inputs_policy": "read-only over existing oracle/skip evidence; no media re-scan",
+  "samples": [
+    {
+      "stem": 1,
+      "oracle_file": "1_20260809_threads4.json",
+      "oracle_sha256": "656b86662378d59364fc70863cb828d7c940a576421df1459720bde6fb4bfa37",
+      "skip_segs_file": "1_skip_segs.json",
+      "skip_segs_sha256": "93c20a6f8b3d5f24963f3fdf17cf8ff030b98ead6017095a590b407f07977f14",
+      "frames": 249097,
+      "fps": 59.999518263822814,
+      "time_base": "1/15360",
+      "skip_segment_count": 2311,
+      "boundary_count": 4621,
+      "cross_check": {
+        "oracle_duplicate_count": 2,
+        "recomputed_duplicate_frames": 4,
+        "oracle_non_monotonic_count": 1,
+        "recomputed_non_monotonic_steps": 1
+      },
+      "duplicate_pts_groups": [
+        {
+          "pts": 1280,
+          "frames": [
+            5,
+            7
+          ]
+        },
+        {
+          "pts": 1792,
+          "frames": [
+            6,
+            9
+          ]
+        }
+      ],
+      "non_monotonic_steps": [
+        {
+          "previous_n": 6,
+          "n": 7,
+          "previous_pts": 1792,
+          "pts": 1280
+        }
+      ],
+      "anomaly_frame_facts": [
+        {
+          "n": 5,
+          "pts": 1280,
+          "pts_time": 0.0833333,
+          "region": "kept",
+          "nearest_boundary_frame": 988,
+          "distance_frames": 983,
+          "distance_seconds": 16.383465,
+          "nearest_boundary_tick_gap": 251136,
+          "nearest_boundary_tick_gap_ms": 16350.0
+        },
+        {
+          "n": 6,
+          "pts": 1792,
+          "pts_time": 0.116667,
+          "region": "kept",
+          "nearest_boundary_frame": 988,
+          "distance_frames": 982,
+          "distance_seconds": 16.366798,
+          "nearest_boundary_tick_gap": 250624,
+          "nearest_boundary_tick_gap_ms": 16316.666667
+        },
+        {
+          "n": 7,
+          "pts": 1280,
+          "pts_time": 0.0833333,
+          "region": "kept",
+          "nearest_boundary_frame": 988,
+          "distance_frames": 981,
+          "distance_seconds": 16.350131,
+          "nearest_boundary_tick_gap": 251136,
+          "nearest_boundary_tick_gap_ms": 16350.0
+        },
+        {
+          "n": 9,
+          "pts": 1792,
+          "pts_time": 0.116667,
+          "region": "kept",
+          "nearest_boundary_frame": 988,
+          "distance_frames": 979,
+          "distance_seconds": 16.316798,
+          "nearest_boundary_tick_gap": 250624,
+          "nearest_boundary_tick_gap_ms": 16316.666667
+        }
+      ],
+      "max_anomaly_frame": 9,
+      "min_distance_frames": 979,
+      "min_boundary_tick_gap_ms": 16316.666667,
+      "all_anomalies_inside_deleted_regions": false,
+      "first_kept_frame": 1025,
+      "kept_interval_count": 2311,
+      "tick_dropped_kept_frames": []
+    },
+    {
+      "stem": 2,
+      "oracle_file": "2_20260809.json",
+      "oracle_sha256": "131e50b6d70b8dda66c5591e499b5e41d5d05793e7b95f0599ac10ac13eaa1a8",
+      "skip_segs_file": "2_skip_segs.json",
+      "skip_segs_sha256": "bc90db62ad1812b16f4398ceb40a1ee19fc0a045fd063c80c14ecc1dac7f8242",
+      "frames": 184293,
+      "fps": 59.999348870018174,
+      "time_base": "1/15360",
+      "skip_segment_count": 683,
+      "boundary_count": 1366,
+      "cross_check": {
+        "oracle_duplicate_count": 2,
+        "recomputed_duplicate_frames": 4,
+        "oracle_non_monotonic_count": 1,
+        "recomputed_non_monotonic_steps": 1
+      },
+      "duplicate_pts_groups": [
+        {
+          "pts": 256,
+          "frames": [
+            1,
+            3
+          ]
+        },
+        {
+          "pts": 768,
+          "frames": [
+            2,
+            5
+          ]
+        }
+      ],
+      "non_monotonic_steps": [
+        {
+          "previous_n": 2,
+          "n": 3,
+          "previous_pts": 768,
+          "pts": 256
+        }
+      ],
+      "anomaly_frame_facts": [
+        {
+          "n": 1,
+          "pts": 256,
+          "pts_time": 0.0166667,
+          "region": "kept",
+          "nearest_boundary_frame": 5,
+          "distance_frames": 4,
+          "distance_seconds": 0.066667,
+          "nearest_boundary_tick_gap": 512,
+          "nearest_boundary_tick_gap_ms": 33.333333
+        },
+        {
+          "n": 2,
+          "pts": 768,
+          "pts_time": 0.05,
+          "region": "kept",
+          "nearest_boundary_frame": 5,
+          "distance_frames": 3,
+          "distance_seconds": 0.050001,
+          "nearest_boundary_tick_gap": 0,
+          "nearest_boundary_tick_gap_ms": 0.0
+        },
+        {
+          "n": 3,
+          "pts": 256,
+          "pts_time": 0.0166667,
+          "region": "kept",
+          "nearest_boundary_frame": 5,
+          "distance_frames": 2,
+          "distance_seconds": 0.033334,
+          "nearest_boundary_tick_gap": 512,
+          "nearest_boundary_tick_gap_ms": 33.333333
+        },
+        {
+          "n": 5,
+          "pts": 768,
+          "pts_time": 0.05,
+          "region": "deleted",
+          "skip_segment": [
+            5,
+            5139
+          ],
+          "nearest_boundary_frame": 5,
+          "distance_frames": 0,
+          "distance_seconds": 0.0,
+          "nearest_boundary_tick_gap": 0,
+          "nearest_boundary_tick_gap_ms": 0.0
+        }
+      ],
+      "max_anomaly_frame": 5,
+      "min_distance_frames": 0,
+      "min_boundary_tick_gap_ms": 0.0,
+      "all_anomalies_inside_deleted_regions": false,
+      "first_kept_frame": 5140,
+      "kept_interval_count": 683,
+      "tick_dropped_kept_frames": [
+        {
+          "n": 2,
+          "pts": 768,
+          "interval": [
+            0,
+            5
+          ],
+          "interval_ticks": [
+            0,
+            768
+          ]
+        }
+      ]
+    },
+    {
+      "stem": 3,
+      "oracle_file": "3_20260809.json",
+      "oracle_sha256": "24e692a45631a9d584b095367fd560424da17e036f419ba817a7f7e0f23442aa",
+      "skip_segs_file": "3_skip_segs.json",
+      "skip_segs_sha256": "531d9dbb2ed36aea1a8178dc35aef93e679f2f01751f974df3200cc28bd6d522",
+      "frames": 29804,
+      "fps": 59.995973964973494,
+      "time_base": "1/15360",
+      "skip_segment_count": 108,
+      "boundary_count": 216,
+      "cross_check": {
+        "oracle_duplicate_count": 2,
+        "recomputed_duplicate_frames": 4,
+        "oracle_non_monotonic_count": 1,
+        "recomputed_non_monotonic_steps": 1
+      },
+      "duplicate_pts_groups": [
+        {
+          "pts": 768,
+          "frames": [
+            3,
+            5
+          ]
+        },
+        {
+          "pts": 1280,
+          "frames": [
+            4,
+            7
+          ]
+        }
+      ],
+      "non_monotonic_steps": [
+        {
+          "previous_n": 4,
+          "n": 5,
+          "previous_pts": 1280,
+          "pts": 768
+        }
+      ],
+      "anomaly_frame_facts": [
+        {
+          "n": 3,
+          "pts": 768,
+          "pts_time": 0.05,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            10653
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 3,
+          "distance_seconds": 0.050003,
+          "nearest_boundary_tick_gap": 768,
+          "nearest_boundary_tick_gap_ms": 50.0
+        },
+        {
+          "n": 4,
+          "pts": 1280,
+          "pts_time": 0.0833333,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            10653
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 4,
+          "distance_seconds": 0.066671,
+          "nearest_boundary_tick_gap": 1280,
+          "nearest_boundary_tick_gap_ms": 83.333333
+        },
+        {
+          "n": 5,
+          "pts": 768,
+          "pts_time": 0.05,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            10653
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 5,
+          "distance_seconds": 0.083339,
+          "nearest_boundary_tick_gap": 768,
+          "nearest_boundary_tick_gap_ms": 50.0
+        },
+        {
+          "n": 7,
+          "pts": 1280,
+          "pts_time": 0.0833333,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            10653
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 7,
+          "distance_seconds": 0.116674,
+          "nearest_boundary_tick_gap": 1280,
+          "nearest_boundary_tick_gap_ms": 83.333333
+        }
+      ],
+      "max_anomaly_frame": 7,
+      "min_distance_frames": 3,
+      "min_boundary_tick_gap_ms": 50.0,
+      "all_anomalies_inside_deleted_regions": true,
+      "first_kept_frame": 10654,
+      "kept_interval_count": 108,
+      "tick_dropped_kept_frames": []
+    },
+    {
+      "stem": 4,
+      "oracle_file": "4_20260809_threads4.json",
+      "oracle_sha256": "888e908df990f29c5a048ed7b013b000c2a466a00c8131d0e523885117bc90e2",
+      "skip_segs_file": "4_skip_segs.json",
+      "skip_segs_sha256": "64c0515c9516b4b1f735a738154ca2282afa2c806ad07b8e63dfcffe1059dfec",
+      "frames": 424176,
+      "fps": 59.99971709989674,
+      "time_base": "1/15360",
+      "skip_segment_count": 2623,
+      "boundary_count": 5246,
+      "cross_check": {
+        "oracle_duplicate_count": 2,
+        "recomputed_duplicate_frames": 4,
+        "oracle_non_monotonic_count": 1,
+        "recomputed_non_monotonic_steps": 1
+      },
+      "duplicate_pts_groups": [
+        {
+          "pts": 768,
+          "frames": [
+            3,
+            5
+          ]
+        },
+        {
+          "pts": 1280,
+          "frames": [
+            4,
+            7
+          ]
+        }
+      ],
+      "non_monotonic_steps": [
+        {
+          "previous_n": 4,
+          "n": 5,
+          "previous_pts": 1280,
+          "pts": 768
+        }
+      ],
+      "anomaly_frame_facts": [
+        {
+          "n": 3,
+          "pts": 768,
+          "pts_time": 0.05,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            2179
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 3,
+          "distance_seconds": 0.05,
+          "nearest_boundary_tick_gap": 768,
+          "nearest_boundary_tick_gap_ms": 50.0
+        },
+        {
+          "n": 4,
+          "pts": 1280,
+          "pts_time": 0.0833333,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            2179
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 4,
+          "distance_seconds": 0.066667,
+          "nearest_boundary_tick_gap": 1280,
+          "nearest_boundary_tick_gap_ms": 83.333333
+        },
+        {
+          "n": 5,
+          "pts": 768,
+          "pts_time": 0.05,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            2179
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 5,
+          "distance_seconds": 0.083334,
+          "nearest_boundary_tick_gap": 768,
+          "nearest_boundary_tick_gap_ms": 50.0
+        },
+        {
+          "n": 7,
+          "pts": 1280,
+          "pts_time": 0.0833333,
+          "region": "deleted",
+          "skip_segment": [
+            0,
+            2179
+          ],
+          "nearest_boundary_frame": 0,
+          "distance_frames": 7,
+          "distance_seconds": 0.116667,
+          "nearest_boundary_tick_gap": 1280,
+          "nearest_boundary_tick_gap_ms": 83.333333
+        }
+      ],
+      "max_anomaly_frame": 7,
+      "min_distance_frames": 3,
+      "min_boundary_tick_gap_ms": 50.0,
+      "all_anomalies_inside_deleted_regions": true,
+      "first_kept_frame": 2180,
+      "kept_interval_count": 2623,
+      "tick_dropped_kept_frames": []
+    }
+  ],
+  "aggregate": {
+    "all_anomalies_inside_deleted_regions": false,
+    "min_distance_frames_to_any_cut_boundary": 0,
+    "min_boundary_tick_gap_ms": 0.0,
+    "kept_frames_unrepresentable_by_tick_trim": 1
+  }
+}

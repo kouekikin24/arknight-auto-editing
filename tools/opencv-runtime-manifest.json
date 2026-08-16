@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "kind": "opencv_runtime_manifest",
+  "status": "runtime_observed_dependency_lock_pending",
+  "python": {
+    "executable": "C:/Users/AAA/AppData/Local/Programs/Python/Python311/python.exe",
+    "module_path": "C:/Users/AAA/AppData/Local/Programs/Python/Python311/Lib/site-packages/cv2/__init__.py"
+  },
+  "distribution": {
+    "name": "opencv-python",
+    "version": "4.13.0.92",
+    "cv2_version": "4.13.0",
+    "dist_info": "C:/Users/AAA/AppData/Local/Programs/Python/Python311/Lib/site-packages/opencv_python-4.13.0.92.dist-info",
+    "metadata_sha256": "b7ec32edc5943818be42a7d67f3b0f2091ac537b99ab7f1c3f33c13e6fbfcb38",
+    "record_sha256": "50d6a5c50cff29a7f0d0cb1ae712c57b140464f2529ba2a76617d827c63d84ef"
+  },
+  "videoio_ffmpeg_dll": {
+    "path": "C:/Users/AAA/AppData/Local/Programs/Python/Python311/Lib/site-packages/cv2/opencv_videoio_ffmpeg4130_64.dll",
+    "size_bytes": 28578304,
+    "sha256": "fcc614672159094a35815b7ea2819a648cbf86c30d90c57e8c6ba1432f594548"
+  },
+  "dependency_lock_observed": {
+    "pyproject_declared": "opencv-python",
+    "requirements_declared": "opencv-python==5.0.0.93",
+    "uv_lock_declared": "opencv-python 5.0.0.93",
+    "uv_available": false,
+    "note": "Runtime evidence is recorded; dependency lock synchronization must use the real uv tool and must not be hand-edited."
+  },
+  "verification": {
+    "commands": [
+      "import cv2; print(cv2.__version__)",
+      "import importlib.metadata; print(importlib.metadata.version('opencv-python'))",
+      "sha256(opencv_videoio_ffmpeg4130_64.dll)"
+    ],
+    "opencv_is_used_for": [
+      "VideoCapture compatibility decode",
+      "template matching",
+      "grayscale/resize/image difference analysis"
+    ],
+    "ffmpeg_is_used_for": [
+      "time and audio authority",
+      "export encoding",
+      "ffprobe metadata"
+    ]
+  }
+}
