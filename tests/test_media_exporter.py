@@ -15,7 +15,13 @@ from timeline_plan import TimelinePlan
 
 class MediaExporterTests(unittest.TestCase):
     @staticmethod
-    def _certified_media(root: Path, frame_count: int) -> media_info.MediaInfo:
+    def _certified_media(
+        root: Path,
+        frame_count: int,
+        *,
+        rows: list[dict[str, int]] | None = None,
+        adjudicated: bool = False,
+    ) -> media_info.MediaInfo:
         source = root / "source.mp4"
         ffprobe = root / "ffprobe.exe"
         ffmpeg = root / "ffmpeg.exe"
@@ -36,41 +42,48 @@ class MediaExporterTests(unittest.TestCase):
             "ffmpeg version 7.1-essentials_build-www.gyan.dev",
             True,
         )
-        rows = [
+        rows = rows or [
             {"n": n, "pts": n * 100, "duration": 100}
             for n in range(frame_count)
         ]
-        evidence.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "kind": "production_frame_pts_certification",
-                    "status": "PASS",
-                    "authoritative_frame_timeline": True,
-                    "reason_codes": [],
-                    "scope": "full",
-                    "source": {
-                        "path": str(source.resolve()),
-                        "sha256": source_sha256,
-                        "size": source.stat().st_size,
-                    },
-                    "time_base": {
-                        "numerator": 1,
-                        "denominator": 1000,
-                        "text": "1/1000",
-                    },
-                    "frame_pts_status": "cfr",
-                    "frame_count": len(rows),
-                    "tools": {
-                        "ffprobe": ffprobe_info.as_dict(),
-                        "ffmpeg": ffmpeg_info.as_dict(),
-                    },
-                    "pts_table_sha256": media_info._canonical_pts_table_sha256(rows),
-                    "pts_table": rows,
-                }
+        payload = {
+            "schema_version": 1,
+            "kind": "production_frame_pts_certification",
+            "status": (
+                media_info.ADJUDICATED_EVIDENCE_STATUS
+                if adjudicated
+                else "PASS"
             ),
-            encoding="utf-8",
-        )
+            "authoritative_frame_timeline": True,
+            "reason_codes": [],
+            "scope": "full",
+            "source": {
+                "path": str(source.resolve()),
+                "sha256": source_sha256,
+                "size": source.stat().st_size,
+            },
+            "time_base": {
+                "numerator": 1,
+                "denominator": 1000,
+                "text": "1/1000",
+            },
+            "frame_pts_status": "vfr" if adjudicated else "cfr",
+            "frame_count": len(rows),
+            "tools": {
+                "ffprobe": ffprobe_info.as_dict(),
+                "ffmpeg": ffmpeg_info.as_dict(),
+            },
+            "pts_table_sha256": media_info._canonical_pts_table_sha256(rows),
+            "pts_table": rows,
+        }
+        if adjudicated:
+            payload["anomaly_adjudication"] = {
+                "policy_version": "head-restricted-2026-08-16",
+                "head_frame_limit": media_info.HEAD_ANOMALY_FRAME_LIMIT,
+                "oracle_reason_codes": ["PTS_DUPLICATE", "PTS_NON_MONOTONIC"],
+                "facts": {"involved_frames": [1, 2, 3, 5]},
+            }
+        evidence.write_text(json.dumps(payload), encoding="utf-8")
         video = media_info.VideoStreamInfo(
             index=0,
             codec_name="h264",
@@ -104,7 +117,7 @@ class MediaExporterTests(unittest.TestCase):
         )
         certification = media_info.FramePtsCertification.from_evidence(
             evidence,
-            status="cfr",
+            status="vfr" if adjudicated else "cfr",
             source_sha256=source_sha256,
             time_base=video.time_base,
         )
@@ -411,6 +424,77 @@ class MediaExporterTests(unittest.TestCase):
                     MediaExporter().export(request, cancel_cb=cancel)
             self.assertFalse(request.output_path.exists())
             self.assertEqual(list(root.glob("*.partial*")), [])
+
+
+    def test_head_tick_collision_is_adjudicated_and_recorded(self) -> None:
+        # Mirrors the sample-2 fact pattern: kept frame n=2 shares its tick
+        # with the first deleted frame and with the interval end tick.
+        rows = [
+            {"n": 0, "pts": 0, "duration": 40},
+            {"n": 1, "pts": 40, "duration": 40},
+            {"n": 2, "pts": 120, "duration": 40},
+            {"n": 3, "pts": 40, "duration": 40},
+            {"n": 4, "pts": 80, "duration": 40},
+            {"n": 5, "pts": 120, "duration": 40},
+            {"n": 6, "pts": 160, "duration": 40},
+            {"n": 7, "pts": 200, "duration": 40},
+        ]
+        plan = TimelinePlan.from_deleted_ranges(8, [(5, 8)])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = self._certified_media(root, 8, rows=rows, adjudicated=True)
+            request = ExportRequest.full(
+                media.source_path,
+                root / "output.mp4",
+                plan,
+                fps=30,
+                quality=8,
+                media_info=media,
+            )
+            snapshot = MediaExporter._validate_certified_request(
+                request, source_path_override=None
+            )
+            self.assertIsNotNone(snapshot)
+            drops = snapshot.tick_collision_drops
+            self.assertEqual(len(drops), 1)
+            self.assertEqual(drops[0]["n"], 2)
+            self.assertEqual(drops[0]["pts"], 120)
+            adjudication = snapshot.metadata()["head_anomaly_adjudication"]
+            self.assertEqual(adjudication["expected_on_disk_frames"], 4)
+            self.assertEqual(
+                adjudication["head_anomaly_limit_ticks"],
+                media_info.HEAD_ANOMALY_FRAME_LIMIT,
+            )
+
+    def test_beyond_policy_tick_collision_fails_closed(self) -> None:
+        from fractions import Fraction as _Fraction
+
+        from pts_timeline import CertifiedPtsTimeline, FramePtsRow
+
+        rows = [
+            FramePtsRow(n=n, pts=n * 40, duration=40) for n in range(45)
+        ]
+        # A backward jump at n=41 leaves that kept frame's pts below the
+        # interval start; frame 41 sits beyond the registered policy head.
+        rows[40] = FramePtsRow(n=40, pts=1640, duration=40)
+        rows[41] = FramePtsRow(n=41, pts=1000, duration=40)
+        timeline = CertifiedPtsTimeline(
+            source_sha256="a" * 64,
+            status="vfr",
+            time_base=_Fraction(1, 1000),
+            pts_table_sha256="b" * 64,
+            evidence_sha256="c" * 64,
+            rows=tuple(rows),
+            head_anomaly_limit=50,
+        )
+        interval = timeline.interval_for_range((40, 45))
+        with self.assertRaises(media_info.MediaInfoError) as ctx:
+            media_exporter._head_tick_collision_drops(
+                timeline, [(40, 45)], [interval]
+            )
+        self.assertEqual(
+            ctx.exception.code, "FRAME_PTS_TICK_COLLISION_UNADJUDICATED"
+        )
 
 
 if __name__ == "__main__":

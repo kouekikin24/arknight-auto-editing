@@ -30,6 +30,11 @@ _GPU_PROBE_LOCK = threading.Lock()
 # 超过阈值则跳过，改走有帧进度的稳妥逐帧路径（不改变删帧语义）
 _MAX_FILTER_EXPORT_RANGES = 120
 _MAX_FILTER_EXPORT_RANGES_AUDIO = 80
+# The certified PTS exporter uses one compact trim/atrim chain per segment in
+# a filter_complex_script file, so the per-segment filter cost is linear and
+# the ceiling only guards against absurd graphs.  Real business plans reach
+# 2623 kept ranges (sample 4).
+_MAX_PTS_EXPORT_RANGES = 4000
 
 
 @dataclass
@@ -1565,42 +1570,36 @@ def _normalize_pts_schedule(
     return normalized
 
 
-def _vfr_pts_video_filter(
+def _pts_select_setpts_video_filter(
     schedule: Sequence[tuple[int, int, int, int]],
-    *,
-    time_base: Fraction,
 ) -> str:
-    """Build a VFR select/setpts filter without frame-rate arithmetic.
+    """Single-pass, tick-exact selection and renumbering for large schedules.
 
-    ``trim`` followed by ``concat`` can shorten the last frame of each VFR
-    segment.  Selecting source PTS directly and subtracting only the removed
-    tick spans preserves each certified frame duration.  A terminal ``tpad``
-    guard is added by the caller so the last real frame receives a positive
-    muxed duration.
+    ``select`` is one flat OR of ``between`` ranges.  ``setpts`` subtracts
+    every removed gap that ends at or before the frame via a flat sum of
+    depth-1 ``if`` terms: ``out = PTS - start_0 - sum(gap_j if PTS >=
+    gap_end_j)``.  Both alternatives fail at thousands of ranges — per-range
+    ``trim`` chains cost O(ranges x frames) because every chain scans the
+    whole source, and a nested piecewise ``if`` chain exceeds FFmpeg's
+    expression parser depth around 100 segments.
     """
-    time_base_text = f"{time_base.numerator}/{time_base.denominator}"
     conditions = "+".join(
         f"between(pts,{start_tick},{end_tick - 1})"
         for _start_frame, _end_frame, start_tick, end_tick in schedule
     )
-    offsets: list[int] = []
-    output_offset = 0
-    for _start_frame, _end_frame, start_tick, end_tick in schedule:
-        offsets.append(output_offset)
-        output_offset += end_tick - start_tick
-
-    expression = (
-        f"PTS-{schedule[-1][2]}+{offsets[-1]}"
-    )
-    for index in range(len(schedule) - 2, -1, -1):
-        start_tick = schedule[index][2]
-        expression = (
-            f"if(lt(PTS,{schedule[index + 1][2]}),"
-            f"PTS-{start_tick}+{offsets[index]},{expression})"
-        )
+    expression_parts = [f"PTS-{schedule[0][2]}"]
+    for index in range(len(schedule) - 1):
+        gap_start = schedule[index][3]
+        gap_end = schedule[index + 1][2]
+        if gap_end > gap_start:
+            expression_parts.append(
+                f"-if(gte(PTS,{gap_end}),{gap_end - gap_start},0)"
+            )
+    # The terminal clone guard gives the last real frame a positive muxed
+    # duration; without it the final frame is lost at EOF.
     return (
-        f"[0:v:0]settb={time_base_text},"
-        f"select='{conditions}',setpts='{expression}',"
+        f"[0:v:0]select='{conditions}',"
+        f"setpts='{''.join(expression_parts)}',"
         "tpad=stop_mode=clone:stop=1[outv]"
     )
 
@@ -1647,9 +1646,10 @@ def export_pts_schedule(
     schedule = _normalize_pts_schedule(intervals, time_base=time_base)
     if schedule[-1][1] > source_frame_count:
         raise ValueError("PTS interval exceeds the certified source frame count")
-    if len(schedule) > _MAX_FILTER_EXPORT_RANGES:
+    if len(schedule) > _MAX_PTS_EXPORT_RANGES:
         raise RuntimeError(
-            "认证 PTS 时间表段数超过 FFmpeg 滤镜安全上限，拒绝回退到 FPS 导出"
+            f"认证 PTS 时间表段数超过 FFmpeg 滤镜安全上限（{_MAX_PTS_EXPORT_RANGES}），"
+            "拒绝回退到 FPS 导出"
         )
     if frame_pts_status not in {None, "cfr", "vfr"}:
         raise ValueError("frame_pts_status must be cfr, vfr, or None")
@@ -1661,10 +1661,14 @@ def export_pts_schedule(
     has_audio = bool(include_audio and source_has_audio)
     with tempfile.TemporaryDirectory() as tmpdir:
         filter_file = os.path.join(tmpdir, "pts-filter.txt")
+        # VFR schedules use one flat select/setpts pass over the source; the
+        # cfr branch keeps the proven per-segment trim/setpts/concat chains.
+        # Interval end ticks are by construction the last kept frame's natural
+        # end (pts + duration), so nothing shortens a segment tail either way.
         lines: list[str] = []
         concat_inputs: list[str] = []
         if frame_pts_status == "vfr":
-            lines.append(_vfr_pts_video_filter(schedule, time_base=time_base))
+            lines.append(_pts_select_setpts_video_filter(schedule))
             if has_audio:
                 audio_inputs: list[str] = []
                 for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
@@ -1733,6 +1737,7 @@ def export_pts_schedule(
                 f"{time_base.numerator}/{time_base.denominator}",
                 "-video_track_timescale",
                 str(time_base.denominator),
+                # One extra slot for the terminal clone guard.
                 "-frames:v",
                 str(scheduled_written + 1),
             ]
@@ -1764,16 +1769,14 @@ def export_pts_schedule(
         "audio_mode": "muxed" if has_audio else ("no_stream" if include_audio else "disabled"),
         "pts_table_consumed": True,
         "pts_consumer": (
-            "ffmpeg_select_pts_setpts"
+            "ffmpeg_select_pts_setpts_flat"
             if frame_pts_status == "vfr"
             else "ffmpeg_trim_pts_concat"
         ),
         "pts_consumer_command_scope": (
-            (
-                "video_select_pts_setpts_terminal_guard_vfr"
-                if frame_pts_status == "vfr"
-                else f"video_start_pts_end_pts_{output_fps_mode}"
-            )
+            "video_select_flat_setpts_gap_sum_vfr"
+            if frame_pts_status == "vfr"
+            else f"video_start_pts_end_pts_{output_fps_mode}"
         ),
         "pts_output_fps_mode": output_fps_mode,
         "pts_terminal_guard": frame_pts_status == "vfr",

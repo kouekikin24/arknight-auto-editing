@@ -73,6 +73,7 @@ class FramePtsCertifierTests(unittest.TestCase):
         *,
         status: str = "PASS",
         reason_codes: list[str] | None = None,
+        ffmpeg_returncode: int = 0,
     ) -> dict:
         assert media.ffmpeg is not None
         return {
@@ -98,7 +99,7 @@ class FramePtsCertifierTests(unittest.TestCase):
                     media.source_path,
                     threads=1,
                 ),
-                "returncode": 0,
+                "returncode": ffmpeg_returncode,
             },
             "showinfo": {
                 "parsed_frames": len(rows),
@@ -154,13 +155,13 @@ class FramePtsCertifierTests(unittest.TestCase):
     def test_duplicate_pts_returns_blocked_without_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            media = self._media(root, frame_count=3)
+            media = self._media(root, frame_count=34)
             evidence = root / "blocked.json"
             rows = [
-                {"n": 0, "pts": 0, "duration": 20},
-                {"n": 1, "pts": 20, "duration": 20},
-                {"n": 2, "pts": 20, "duration": 20},
+                {"n": n, "pts": n * 20, "duration": 20} for n in range(33)
             ]
+            # Duplicate beyond the adjudicable head window must stay BLOCKED.
+            rows.append({"n": 33, "pts": 32 * 20, "duration": 20})
 
             outcome = frame_pts_certifier.produce_frame_pts_certification(
                 media,
@@ -187,17 +188,16 @@ class FramePtsCertifierTests(unittest.TestCase):
     def test_blocked_evidence_requires_explicit_retry_and_preserves_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            media = self._media(root)
+            media = self._media(root, frame_count=34)
             evidence = root / "blocked.json"
             blocked_rows = [
-                {"n": 0, "pts": 0, "duration": 20},
-                {"n": 1, "pts": 20, "duration": 20},
-                {"n": 2, "pts": 20, "duration": 20},
-                {"n": 3, "pts": 40, "duration": 20},
+                {"n": n, "pts": n * 20, "duration": 20} for n in range(33)
             ]
+            # Duplicate beyond the adjudicable head window stays BLOCKED.
+            blocked_rows.append({"n": 33, "pts": 32 * 20, "duration": 20})
             pass_rows = [
                 {"n": n, "pts": n * 20, "duration": 20}
-                for n in range(4)
+                for n in range(34)
             ]
             calls: list[str] = []
 
@@ -335,6 +335,124 @@ class FramePtsCertifierTests(unittest.TestCase):
                     oracle_probe=probe,
                 )
             self.assertFalse(evidence.exists())
+
+    # B' targeted adjudication (2026-08-16 ruling) -------------------------------
+
+    HEAD_ROWS = [
+        # Recording-start artifact shape (mirrors the four real samples):
+        # duplicate ticks and one backward step, all confined to the head.
+        {"n": 0, "pts": 0, "duration": 40},
+        {"n": 1, "pts": 40, "duration": 40},
+        {"n": 2, "pts": 120, "duration": 40},
+        {"n": 3, "pts": 40, "duration": 40},
+        {"n": 4, "pts": 80, "duration": 40},
+        {"n": 5, "pts": 120, "duration": 40},
+        {"n": 6, "pts": 160, "duration": 40},
+        {"n": 7, "pts": 200, "duration": 40},
+    ]
+
+    def test_head_confined_pts_anomaly_adjudicates_as_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = self._media(root, frame_count=8)
+            evidence = root / "adjudicated.json"
+
+            outcome = frame_pts_certifier.produce_frame_pts_certification(
+                media,
+                evidence_path=evidence,
+                oracle_probe=lambda *_args, **_kwargs: (
+                    self._report(
+                        media,
+                        self.HEAD_ROWS,
+                        status="BLOCKED",
+                        reason_codes=["PTS_DUPLICATE", "PTS_NON_MONOTONIC"],
+                    ),
+                    10,
+                ),
+            )
+
+            self.assertEqual(
+                outcome.status, media_info.ADJUDICATED_EVIDENCE_STATUS
+            )
+            self.assertTrue(outcome.certified)
+            self.assertTrue(outcome.media_info.complete_for_export)
+            self.assertEqual(outcome.reason_codes, ())
+            payload = json.loads(evidence.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["status"], media_info.ADJUDICATED_EVIDENCE_STATUS
+            )
+            self.assertTrue(payload["authoritative_frame_timeline"])
+            self.assertEqual(payload["reason_codes"], [])
+            adjudication = payload["anomaly_adjudication"]
+            self.assertEqual(
+                adjudication["head_frame_limit"],
+                media_info.HEAD_ANOMALY_FRAME_LIMIT,
+            )
+            self.assertIn(3, adjudication["facts"]["involved_frames"])
+            self.assertEqual(
+                payload["pts_table_sha256"],
+                media_info._canonical_pts_table_sha256(self.HEAD_ROWS),
+            )
+
+            cached = frame_pts_certifier.produce_frame_pts_certification(
+                media,
+                evidence_path=evidence,
+                oracle_probe=lambda *_args, **_kwargs: self.fail(
+                    "cache reran oracle"
+                ),
+            )
+            self.assertEqual(
+                cached.status, media_info.ADJUDICATED_EVIDENCE_STATUS
+            )
+            self.assertTrue(cached.certified)
+
+            from pts_timeline import CertifiedPtsTimeline
+
+            timeline = CertifiedPtsTimeline.from_media_info(cached.media_info)
+            self.assertEqual(
+                timeline.head_anomaly_limit,
+                media_info.HEAD_ANOMALY_FRAME_LIMIT,
+            )
+            interval = timeline.interval_for_range((0, 5))
+            self.assertEqual((interval.start_tick, interval.end_tick), (0, 120))
+
+    def test_head_anomaly_with_decode_failure_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = self._media(root, frame_count=8)
+            evidence = root / "blocked.json"
+
+            outcome = frame_pts_certifier.produce_frame_pts_certification(
+                media,
+                evidence_path=evidence,
+                oracle_probe=lambda *_args, **_kwargs: (
+                    self._report(
+                        media,
+                        self.HEAD_ROWS,
+                        status="BLOCKED",
+                        reason_codes=["PTS_DUPLICATE", "PTS_NON_MONOTONIC"],
+                        ffmpeg_returncode=1,
+                    ),
+                    10,
+                ),
+            )
+
+            self.assertEqual(outcome.status, "BLOCKED")
+            self.assertFalse(outcome.media_info.complete_for_export)
+            self.assertIn("FFMPEG_DECODE_FAILED", outcome.reason_codes)
+            self.assertIn("PTS_DUPLICATE", outcome.reason_codes)
+
+    def test_decode_threads_parameter_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = self._media(root)
+            with self.assertRaises(media_info.MediaInfoError) as ctx:
+                frame_pts_certifier.produce_frame_pts_certification(
+                    media,
+                    evidence_path=root / "never.json",
+                    decode_threads=0,
+                )
+            self.assertEqual(ctx.exception.code, "FRAME_PTS_THREADS_INVALID")
 
 
 if __name__ == "__main__":

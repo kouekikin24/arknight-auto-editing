@@ -1,7 +1,7 @@
 {
   "kind": "pts_anomaly_fact_report",
   "schema_version": 1,
-  "created_utc": "2026-08-16T07:03:57.999792+00:00",
+  "created_utc": "2026-08-16T07:37:56.784875+00:00",
   "inputs_policy": "read-only over existing oracle/skip evidence; no media re-scan",
   "samples": [
     {
@@ -14,7 +14,7 @@
       "fps": 59.999518263822814,
       "time_base": "1/15360",
       "skip_segment_count": 2311,
-      "boundary_count": 4621,
+      "boundary_count": 4622,
       "cross_check": {
         "oracle_duplicate_count": 2,
         "recomputed_duplicate_frames": 4,
@@ -95,8 +95,8 @@
       "min_distance_frames": 979,
       "min_boundary_tick_gap_ms": 16316.666667,
       "all_anomalies_inside_deleted_regions": false,
-      "first_kept_frame": 1025,
-      "kept_interval_count": 2311,
+      "first_kept_frame": 1024,
+      "kept_interval_count": 2312,
       "tick_dropped_kept_frames": []
     },
     {
@@ -194,7 +194,7 @@
       "min_distance_frames": 0,
       "min_boundary_tick_gap_ms": 0.0,
       "all_anomalies_inside_deleted_regions": false,
-      "first_kept_frame": 5140,
+      "first_kept_frame": 5139,
       "kept_interval_count": 683,
       "tick_dropped_kept_frames": [
         {
@@ -318,7 +318,7 @@
       "min_distance_frames": 3,
       "min_boundary_tick_gap_ms": 50.0,
       "all_anomalies_inside_deleted_regions": true,
-      "first_kept_frame": 10654,
+      "first_kept_frame": 10653,
       "kept_interval_count": 108,
       "tick_dropped_kept_frames": []
     },
@@ -429,7 +429,7 @@
       "min_distance_frames": 3,
       "min_boundary_tick_gap_ms": 50.0,
       "all_anomalies_inside_deleted_regions": true,
-      "first_kept_frame": 2180,
+      "first_kept_frame": 2179,
       "kept_interval_count": 2623,
       "tick_dropped_kept_frames": []
     }

@@ -16,10 +16,13 @@ import media_info
 
 EVIDENCE_SCHEMA_VERSION = 1
 EVIDENCE_KIND = "production_frame_pts_certification"
-CertificationStatus = Literal["PASS", "BLOCKED"]
+CertificationStatus = Literal["PASS", "PASS_WITH_HEAD_ANOMALIES", "BLOCKED"]
 Checkpoint = Callable[[], Any]
 OracleProbe = Callable[..., tuple[dict[str, Any], int]]
 PublishCommit = Callable[..., Any]
+
+ADJUDICATION_POLICY_VERSION = "head-restricted-2026-08-16"
+ADJUDICABLE_ORACLE_REASONS = frozenset({"PTS_DUPLICATE", "PTS_NON_MONOTONIC"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +37,11 @@ class FramePtsCertificationOutcome:
 
     @property
     def certified(self) -> bool:
-        return self.status == "PASS" and self.media_info.complete_for_export
+        return (
+            self.status
+            in ("PASS", media_info.ADJUDICATED_EVIDENCE_STATUS)
+            and self.media_info.complete_for_export
+        )
 
 
 def _utc_now() -> str:
@@ -218,13 +225,13 @@ def _validate_oracle_identity(
 
 
 def _validate_authoritative_rows(rows: Any) -> list[dict[str, int]]:
+    """Structural row validation: contiguous n, integer ticks, duration > 0."""
     if not isinstance(rows, list) or not rows:
         raise media_info.MediaInfoError(
             "FRAME_PTS_EVIDENCE_INCOMPLETE",
             "frame PTS oracle has no complete pts_table",
         )
     normalized: list[dict[str, int]] = []
-    previous_pts: int | None = None
     for expected, raw in enumerate(rows):
         if not isinstance(raw, Mapping):
             raise media_info.MediaInfoError(
@@ -250,14 +257,7 @@ def _validate_authoritative_rows(rows: Any) -> list[dict[str, int]]:
                 "frame PTS rows require contiguous integer n/pts and positive duration",
                 details={"row": expected},
             )
-        if previous_pts is not None and pts <= previous_pts:
-            raise media_info.MediaInfoError(
-                "FRAME_PTS_EVIDENCE_NON_MONOTONIC",
-                "frame PTS rows must be strictly increasing",
-                details={"row": expected, "previous_pts": previous_pts, "pts": pts},
-            )
         normalized.append({"n": number, "pts": pts, "duration": duration})
-        previous_pts = pts
     return normalized
 
 
@@ -315,24 +315,30 @@ def _build_evidence(
             "frame PTS oracle reason_codes must be a list of strings",
         )
     reason_codes = list(dict.fromkeys(oracle_reasons))
+    internal_reasons: list[str] = []
+
+    def _internal(code: str) -> None:
+        internal_reasons.append(code)
+        reason_codes.append(code)
+
     if report.get("status") == "BLOCKED" and not reason_codes:
-        reason_codes.append("FRAME_PTS_ORACLE_BLOCKED")
+        _internal("FRAME_PTS_ORACLE_BLOCKED")
     assessment = report.get("pts_conflict_assessment")
     if not isinstance(assessment, Mapping) or assessment.get("scan_scope") != "complete":
-        reason_codes.append("FRAME_PTS_SCOPE_NOT_FULL")
+        _internal("FRAME_PTS_SCOPE_NOT_FULL")
 
     rows_value = report.get("pts_table")
     normalized_rows: list[dict[str, int]] | None = None
     try:
         normalized_rows = _validate_authoritative_rows(rows_value)
     except media_info.MediaInfoError as exc:
-        reason_codes.append(exc.code)
+        _internal(exc.code)
 
     showinfo = report.get("showinfo")
     parsed_frames = showinfo.get("parsed_frames") if isinstance(showinfo, Mapping) else None
     ffmpeg_record = report.get("ffmpeg")
     if isinstance(ffmpeg_record, Mapping) and ffmpeg_record.get("returncode") != 0:
-        reason_codes.append("FFMPEG_DECODE_FAILED")
+        _internal("FFMPEG_DECODE_FAILED")
     observed_time_bases = (
         showinfo.get("observed_time_bases")
         if isinstance(showinfo, Mapping)
@@ -340,11 +346,11 @@ def _build_evidence(
     )
     if isinstance(observed_time_bases, list):
         if any(not isinstance(item, str) for item in observed_time_bases):
-            reason_codes.append("FRAME_PTS_TIME_BASE_INVALID")
+            _internal("FRAME_PTS_TIME_BASE_INVALID")
         elif len(set(observed_time_bases)) > 1:
-            reason_codes.append("FRAME_PTS_TIME_BASE_MULTIPLE")
+            _internal("FRAME_PTS_TIME_BASE_MULTIPLE")
     if normalized_rows is None or parsed_frames != len(normalized_rows):
-        reason_codes.append("FRAME_PTS_FRAME_COUNT_MISMATCH")
+        _internal("FRAME_PTS_FRAME_COUNT_MISMATCH")
 
     time_base = _oracle_time_base(report)
     expected_time_base = {
@@ -353,14 +359,8 @@ def _build_evidence(
         "text": f"{primary_time_base.numerator}/{primary_time_base.denominator}",
     }
     if time_base != expected_time_base:
-        reason_codes.append("FRAME_PTS_TIME_BASE_MISMATCH")
+        _internal("FRAME_PTS_TIME_BASE_MISMATCH")
 
-    oracle_pass = (
-        exit_code == 0
-        and report.get("status") == "PASS"
-        and report.get("authoritative_frame_timeline") is True
-        and not reason_codes
-    )
     if report.get("status") not in {"PASS", "BLOCKED"}:
         raise media_info.MediaInfoError(
             "FRAME_PTS_ORACLE_FAILED",
@@ -374,13 +374,62 @@ def _build_evidence(
             details={"exit_code": exit_code},
         )
 
-    status: CertificationStatus = "PASS" if oracle_pass else "BLOCKED"
+    oracle_pass = (
+        exit_code == 0
+        and report.get("status") == "PASS"
+        and report.get("authoritative_frame_timeline") is True
+        and not reason_codes
+    )
+
+    # B' targeted adjudication (2026-08-16): a decode that succeeded and is
+    # clean in every other respect may carry duplicate/non-monotonic PTS only
+    # inside the registered head window.  Anything beyond it keeps BLOCKED.
+    adjudication: dict[str, Any] | None = None
+    if not oracle_pass and normalized_rows is not None:
+        try:
+            facts = media_info.head_anomaly_facts(
+                ((row["n"], row["pts"]) for row in normalized_rows),
+                head_frame_limit=media_info.HEAD_ANOMALY_FRAME_LIMIT,
+            )
+        except media_info.MediaInfoError:
+            facts = None
+            _internal("FRAME_PTS_EVIDENCE_NON_MONOTONIC")
+        if (
+            facts is not None
+            and report.get("status") == "BLOCKED"
+            and oracle_reasons
+            and set(oracle_reasons) <= ADJUDICABLE_ORACLE_REASONS
+            and isinstance(ffmpeg_record, Mapping)
+            and ffmpeg_record.get("returncode") == 0
+            and not internal_reasons
+        ):
+            adjudication = {
+                "policy_version": ADJUDICATION_POLICY_VERSION,
+                "head_frame_limit": facts["head_frame_limit"],
+                "oracle_reason_codes": list(oracle_reasons),
+                "facts": facts,
+                "ruling": (
+                    "duplicate/non-monotonic PTS confined to the recording-start "
+                    "head window; authoritative outside it"
+                ),
+            }
+
+    status: CertificationStatus = (
+        "PASS"
+        if oracle_pass
+        else (
+            media_info.ADJUDICATED_EVIDENCE_STATUS
+            if adjudication is not None
+            else "BLOCKED"
+        )
+    )
+    authoritative = status != "BLOCKED"
     authoritative_rows = normalized_rows if normalized_rows is not None else []
-    frame_status = _classify_frame_pts(authoritative_rows) if oracle_pass else None
-    canonical_rows: Any = authoritative_rows if oracle_pass else rows_value
+    frame_status = _classify_frame_pts(authoritative_rows) if authoritative else None
+    canonical_rows: Any = authoritative_rows if authoritative else rows_value
     table_sha = (
         media_info._canonical_pts_table_sha256(authoritative_rows)
-        if oracle_pass
+        if authoritative
         else None
     )
     oracle_record = dict(report)
@@ -391,11 +440,11 @@ def _build_evidence(
         "kind": EVIDENCE_KIND,
         "created_utc": _utc_now(),
         "status": status,
-        "authoritative_frame_timeline": oracle_pass,
+        "authoritative_frame_timeline": authoritative,
         "scope": "full",
-        "reason_codes": [] if oracle_pass else list(dict.fromkeys(reason_codes)),
+        "reason_codes": [] if authoritative else list(dict.fromkeys(reason_codes)),
         "frame_pts_status": frame_status,
-        "frame_count": len(authoritative_rows) if oracle_pass else parsed_frames,
+        "frame_count": len(authoritative_rows) if authoritative else parsed_frames,
         "time_base": time_base,
         "pts_table_sha256": table_sha,
         "pts_table": canonical_rows,
@@ -420,6 +469,8 @@ def _build_evidence(
             "report": oracle_record,
         },
     }
+    if adjudication is not None:
+        evidence["anomaly_adjudication"] = adjudication
     if retry_of is not None:
         evidence["retry"] = dict(retry_of)
     return evidence
@@ -568,7 +619,11 @@ def load_frame_pts_certification(
             tuple(reasons),
             generated,
         )
-    if status != "PASS" or reasons:
+    head_anomaly_limit = media_info._evidence_head_anomaly_limit(payload, path)
+    allowed_status = (
+        media_info.ADJUDICATED_EVIDENCE_STATUS if head_anomaly_limit else "PASS"
+    )
+    if status != allowed_status or reasons:
         raise media_info.MediaInfoError(
             "FRAME_PTS_EVIDENCE_INVALID",
             "frame PTS evidence status is neither a clean PASS nor BLOCKED",
@@ -589,7 +644,7 @@ def load_frame_pts_certification(
     )
     certified_media = value.certify_frame_pts(certification)
     return FramePtsCertificationOutcome(
-        "PASS",
+        allowed_status,
         certified_media,
         path,
         (),
@@ -602,13 +657,14 @@ def _default_oracle_probe(
     ffmpeg: media_info.ToolInfo,
     *,
     checkpoint: Checkpoint | None,
+    threads: int = 1,
 ) -> tuple[dict[str, Any], int]:
     from scripts import verify_mpv_frames
 
     report, exit_code = verify_mpv_frames.probe_video(
         source,
         verify_mpv_frames.FfmpegExecutable(ffmpeg.path, "media_info"),
-        threads=1,
+        threads=threads,
         max_frames=None,
         cancel_check=checkpoint,
     )
@@ -634,14 +690,26 @@ def produce_frame_pts_certification(
     publish_commit: PublishCommit | None = None,
     oracle_probe: OracleProbe | None = None,
     retry_blocked: bool = False,
+    decode_threads: int = 1,
 ) -> FramePtsCertificationOutcome:
     """Generate or reuse one full, immutable PTS certification evidence file.
 
     Existing evidence remains authoritative for the default cache-first path.
     A caller must explicitly request ``retry_blocked`` to run a new attempt
     after a cached BLOCKED result; the retry is published beside the old file.
+    ``decode_threads`` only speeds up the full decode; the oracle command
+    identity accepts any single positive thread count.
     """
     _require_media_prerequisites(value)
+    if (
+        isinstance(decode_threads, bool)
+        or not isinstance(decode_threads, int)
+        or decode_threads < 1
+    ):
+        raise media_info.MediaInfoError(
+            "FRAME_PTS_THREADS_INVALID",
+            "decode_threads must be a positive integer",
+        )
     path = (
         Path(evidence_path).expanduser().resolve()
         if evidence_path is not None
@@ -670,6 +738,7 @@ def produce_frame_pts_certification(
             value.source_path,
             value.ffmpeg,
             checkpoint=checkpoint,
+            threads=decode_threads,
         )
     else:
         report, exit_code = probe(

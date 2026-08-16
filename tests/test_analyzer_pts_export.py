@@ -184,10 +184,22 @@ class AnalyzerPtsExportTests(unittest.TestCase):
             self.assertEqual(command[command.index("-frames:v") + 1], "4")
             filter_text = captured["filter"]
             assert isinstance(filter_text, str)
-            self.assertIn("select='between(pts,0,99)+between(pts,180,259)'", filter_text)
+            # One flat select (OR of between ranges) plus a flat gap-sum
+            # setpts: both depth-1 formulations scale to thousands of ranges,
+            # unlike per-range trim chains (O(ranges x frames)) or nested
+            # piecewise if-chains (parser depth limit ~100).  The terminal
+            # clone guard keeps the last real frame's muxed duration positive.
+            self.assertIn(
+                "select='between(pts,0,99)+between(pts,180,259)'", filter_text
+            )
+            self.assertIn(
+                "setpts='PTS-0-if(gte(PTS,180),80,0)'", filter_text
+            )
             self.assertIn("tpad=stop_mode=clone:stop=1", filter_text)
-            self.assertNotIn("concat=n=2:v=1:a=0", filter_text)
             self.assertTrue(metadata["pts_terminal_guard"])
+            self.assertEqual(
+                metadata["pts_consumer"], "ffmpeg_select_pts_setpts_flat"
+            )
 
 
 if __name__ == "__main__":

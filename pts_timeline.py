@@ -17,6 +17,7 @@ from media_info import (
     MediaInfo,
     MediaInfoError,
     ToolInfo,
+    _check_pts_monotonic_head_tolerant,
     _load_certification_evidence,
 )
 from timeline_plan import TimelinePlan
@@ -139,6 +140,7 @@ class CertifiedPtsTimeline:
     pts_table_sha256: str
     evidence_sha256: str
     rows: tuple[FramePtsRow, ...]
+    head_anomaly_limit: int = 0
 
     def __post_init__(self) -> None:
         if self.status not in {"cfr", "vfr"}:
@@ -148,6 +150,13 @@ class CertifiedPtsTimeline:
                 "FRAME_PTS_TIME_BASE_INVALID",
                 "timeline time_base must be a positive Fraction",
             )
+        limit = self.head_anomaly_limit
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise MediaInfoError(
+                "FRAME_PTS_EVIDENCE_INVALID",
+                "head_anomaly_limit must be a non-negative integer",
+            )
+        object.__setattr__(self, "head_anomaly_limit", int(limit))
         for field_name in ("source_sha256", "pts_table_sha256", "evidence_sha256"):
             value = str(getattr(self, field_name)).lower()
             if not re.fullmatch(r"[0-9a-f]{64}", value):
@@ -162,7 +171,6 @@ class CertifiedPtsTimeline:
                 "FRAME_PTS_EVIDENCE_INCOMPLETE",
                 "certified PTS timeline requires at least one frame row",
             )
-        previous_pts: int | None = None
         for expected, row in enumerate(self.rows):
             if not isinstance(row, FramePtsRow) or row.n != expected:
                 raise MediaInfoError(
@@ -170,13 +178,10 @@ class CertifiedPtsTimeline:
                     "certified PTS timeline rows must be contiguous FramePtsRow values",
                     details={"row": expected},
                 )
-            if previous_pts is not None and row.pts <= previous_pts:
-                raise MediaInfoError(
-                    "FRAME_PTS_EVIDENCE_NON_MONOTONIC",
-                    "certified PTS timeline rows must be strictly increasing",
-                    details={"row": expected, "previous_pts": previous_pts, "pts": row.pts},
-                )
-            previous_pts = row.pts
+        _check_pts_monotonic_head_tolerant(
+            ((row.n, row.pts) for row in self.rows),
+            head_anomaly_limit=self.head_anomaly_limit,
+        )
 
     @classmethod
     def from_certification(
@@ -205,7 +210,7 @@ class CertifiedPtsTimeline:
                 },
             )
 
-        raw_rows = _load_certification_evidence(
+        raw_rows, head_anomaly_limit = _load_certification_evidence(
             certification,
             expected_ffmpeg=expected_ffmpeg,
             expected_ffprobe=expected_ffprobe,
@@ -234,6 +239,7 @@ class CertifiedPtsTimeline:
             pts_table_sha256=certification.pts_table_sha256,
             evidence_sha256=certification.evidence_sha256,
             rows=rows,
+            head_anomaly_limit=head_anomaly_limit,
         )
 
     @classmethod

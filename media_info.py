@@ -140,6 +140,121 @@ def _tool_binding_from_evidence(
     return value
 
 
+HEAD_ANOMALY_FRAME_LIMIT = 32
+"""B' targeted-adjudication ceiling (2026-08-16 owner ruling).
+
+Recording-start artifacts may produce duplicate or non-monotonic PTS confined
+to the first frames of a stream.  Evidence may adjudicate them only when every
+involved decode index stays below this limit; anything beyond it, or any other
+anomaly shape, keeps the certification BLOCKED.
+"""
+
+ADJUDICATED_EVIDENCE_STATUS = "PASS_WITH_HEAD_ANOMALIES"
+
+
+def _evidence_head_anomaly_limit(payload: Mapping[str, Any], path: Path) -> int:
+    """Return the adjudicated head window, or 0 when evidence is strictly clean."""
+    adjudication = payload.get("anomaly_adjudication")
+    if adjudication is None:
+        if payload.get("status") == ADJUDICATED_EVIDENCE_STATUS:
+            raise MediaInfoError(
+                "FRAME_PTS_EVIDENCE_INVALID",
+                "adjudicated frame PTS evidence has no anomaly_adjudication block",
+                details={"path": str(path)},
+            )
+        return 0
+    if not isinstance(adjudication, Mapping) or payload.get("status") != ADJUDICATED_EVIDENCE_STATUS:
+        raise MediaInfoError(
+            "FRAME_PTS_EVIDENCE_INVALID",
+            "anomaly_adjudication requires the adjudicated evidence status",
+            details={"path": str(path), "status": payload.get("status")},
+        )
+    raw_limit = adjudication.get("head_frame_limit")
+    if (
+        isinstance(raw_limit, bool)
+        or not isinstance(raw_limit, int)
+        or raw_limit <= 0
+        or raw_limit > HEAD_ANOMALY_FRAME_LIMIT
+    ):
+        raise MediaInfoError(
+            "FRAME_PTS_EVIDENCE_INVALID",
+            "anomaly_adjudication head_frame_limit exceeds the registered policy ceiling",
+            details={"path": str(path), "head_frame_limit": raw_limit},
+        )
+    return raw_limit
+
+
+def _check_pts_monotonic_head_tolerant(
+    pairs,
+    *,
+    head_anomaly_limit: int,
+    path: Path | None = None,
+) -> None:
+    """Require strictly increasing PTS outside the adjudicated head window."""
+    previous_pts: int | None = None
+    for expected, (number, pts) in enumerate(pairs):
+        if previous_pts is not None and pts <= previous_pts:
+            if head_anomaly_limit <= 0 or expected >= head_anomaly_limit:
+                raise MediaInfoError(
+                    "FRAME_PTS_EVIDENCE_NON_MONOTONIC",
+                    "frame PTS table must be strictly increasing",
+                    details={
+                        "path": str(path) if path is not None else None,
+                        "row": expected,
+                        "previous_pts": previous_pts,
+                        "pts": pts,
+                    },
+                )
+        previous_pts = pts
+
+
+def head_anomaly_facts(pairs, *, head_frame_limit: int) -> dict[str, Any] | None:
+    """Recompute duplicate/non-monotonic facts for adjudication decisions.
+
+    Returns ``None`` when the table is strictly increasing.  Raises
+    ``MediaInfoError`` when any anomaly involves a frame at or beyond
+    ``head_frame_limit`` (not adjudicable).  Callers receive the exact
+    monotonic breaks and duplicate tick groups confined to the head window.
+    """
+    breaks: list[dict[str, int]] = []
+    ticks: dict[int, list[int]] = {}
+    previous_pts: int | None = None
+    for number, pts in pairs:
+        ticks.setdefault(pts, []).append(number)
+        if previous_pts is not None and pts <= previous_pts:
+            breaks.append(
+                {"n": number, "previous_pts": previous_pts, "pts": pts}
+            )
+        previous_pts = pts
+    duplicates = [
+        {"pts": pts, "frames": sorted(numbers)}
+        for pts, numbers in sorted(ticks.items())
+        if len(numbers) > 1
+    ]
+    if not breaks and not duplicates:
+        return None
+    involved = sorted(
+        {
+            index
+            for break_ in breaks
+            for index in (break_["n"], break_["n"] - 1)
+        }
+        | {index for group in duplicates for index in group["frames"]}
+    )
+    if any(index >= head_frame_limit for index in involved):
+        raise MediaInfoError(
+            "FRAME_PTS_ANOMALY_BEYOND_HEAD",
+            "PTS anomalies extend beyond the adjudicable head window",
+            details={"involved_frames": involved, "head_frame_limit": head_frame_limit},
+        )
+    return {
+        "head_frame_limit": head_frame_limit,
+        "monotonic_breaks": breaks,
+        "duplicate_ticks": duplicates,
+        "involved_frames": involved,
+    }
+
+
 def _load_certification_evidence(
     certification: "FramePtsCertification",
     *,
@@ -147,7 +262,7 @@ def _load_certification_evidence(
     expected_source_size: int | None = None,
     expected_ffmpeg: "ToolInfo | None" = None,
     expected_ffprobe: "ToolInfo | None" = None,
-) -> list[Mapping[str, Any]]:
+) -> tuple[list[Mapping[str, Any]], int]:
     path = certification.evidence_path
     if not path.is_file():
         raise MediaInfoError(
@@ -180,11 +295,13 @@ def _load_certification_evidence(
             "frame PTS evidence kind or schema is not production certification",
             details={"path": str(path)},
         )
-    if payload.get("status") != "PASS" or payload.get("authoritative_frame_timeline") is not True:
+    head_anomaly_limit = _evidence_head_anomaly_limit(payload, path)
+    allowed_status = "PASS_WITH_HEAD_ANOMALIES" if head_anomaly_limit else "PASS"
+    if payload.get("status") != allowed_status or payload.get("authoritative_frame_timeline") is not True:
         raise MediaInfoError(
             "FRAME_PTS_EVIDENCE_NOT_AUTHORITATIVE",
             "frame PTS evidence is not an authoritative PASS",
-            details={"path": str(path)},
+            details={"path": str(path), "status": payload.get("status")},
         )
     reason_codes = payload.get("reason_codes", [])
     if reason_codes != [] or payload.get("scope") != "full":
@@ -270,7 +387,6 @@ def _load_certification_evidence(
             "frame PTS evidence frame_count does not match pts_table",
             details={"path": str(path)},
         )
-    previous_pts: int | None = None
     for expected, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise MediaInfoError("FRAME_PTS_EVIDENCE_INVALID", "frame PTS table row must be an object")
@@ -292,13 +408,11 @@ def _load_certification_evidence(
                 "frame PTS table must contain contiguous integer n/pts and positive duration ticks",
                 details={"path": str(path), "row": expected},
             )
-        if previous_pts is not None and pts <= previous_pts:
-            raise MediaInfoError(
-                "FRAME_PTS_EVIDENCE_NON_MONOTONIC",
-                "frame PTS table must be strictly increasing",
-                details={"path": str(path), "row": expected, "previous_pts": previous_pts, "pts": pts},
-            )
-        previous_pts = pts
+    _check_pts_monotonic_head_tolerant(
+        ((row["n"], row["pts"]) for row in rows),
+        head_anomaly_limit=head_anomaly_limit,
+        path=path,
+    )
     if _canonical_pts_table_sha256(rows) != certification.pts_table_sha256.lower():
         raise MediaInfoError(
             "FRAME_PTS_EVIDENCE_CHANGED",
@@ -318,7 +432,7 @@ def _load_certification_evidence(
             "frame PTS table length does not match the certification",
             details={"expected": certification.frame_count, "actual": len(rows)},
         )
-    return rows
+    return rows, head_anomaly_limit
 
 
 @dataclass(frozen=True)

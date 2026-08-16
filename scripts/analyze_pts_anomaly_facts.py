@@ -54,7 +54,7 @@ def analyze_sample(stem: int) -> dict:
     meta_path = FLUENCY_DIR / f"{stem}_meta.json"
 
     oracle = _load_json(oracle_path)
-    skip = _load_json(skip_path)  # list of inclusive [start, end]
+    skip = _load_json(skip_path)  # list of half-open [start, end) segments
     meta = _load_json(meta_path)
 
     table = oracle["pts_table"]
@@ -91,8 +91,8 @@ def analyze_sample(stem: int) -> dict:
         "recomputed_non_monotonic_steps": len(non_monotonic),
     }
 
-    # Business cut boundaries in half-open terms: segment start and end+1.
-    boundaries = sorted({int(s) for s, _e in skip} | {int(e) + 1 for _s, e in skip})
+    # Business cut boundaries in half-open terms: each segment's start and end.
+    boundaries = sorted({int(s) for s, _e in skip} | {int(e) for _s, e in skip})
     boundary_ticks = sorted({pts_by_n[b]["pts"] for b in boundaries if b in pts_by_n})
 
     fps = float(meta.get("fps") or 0.0) or 60.0
@@ -101,7 +101,7 @@ def analyze_sample(stem: int) -> dict:
 
     def region_of(n: int):
         for s, e in skip:
-            if int(s) <= n <= int(e):
+            if int(s) <= n < int(e):
                 return {"region": "deleted", "skip_segment": [int(s), int(e)]}
         return {"region": "kept"}
 
@@ -136,9 +136,7 @@ def analyze_sample(stem: int) -> dict:
         )
 
     max_anomaly_n = max(anomaly_frames)
-    first_kept = min(
-        (int(e) + 1 for _s, e in skip), default=0
-    )
+    first_kept = min((int(e) for _s, e in skip), default=0)
     all_in_first_skip = all(fact["region"] == "deleted" for fact in frame_facts)
 
     # Direct export-impact test: kept frames whose own pts falls outside
@@ -149,7 +147,7 @@ def analyze_sample(stem: int) -> dict:
     for s, e in sorted((int(s), int(e)) for s, e in skip):
         if cursor < s:
             kept_intervals.append((cursor, s))
-        cursor = max(cursor, e + 1)
+        cursor = max(cursor, e)
     if cursor < frames:
         kept_intervals.append((cursor, frames))
     tick_dropped_kept_frames = []

@@ -16,6 +16,7 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 
 from media_info import (
     FramePtsCertification,
+    HEAD_ANOMALY_FRAME_LIMIT,
     MediaInfo,
     MediaInfoError,
     ToolInfo,
@@ -29,6 +30,54 @@ ExportMode = Literal["full", "ranges"]
 ProgressCallback = Callable[..., Any]
 CancelCallback = Callable[[], Any]
 CommitCallback = Callable[[str, str], Any]
+
+HEAD_TICK_COLLISION_MAX_DROPS = 1
+
+
+def _head_tick_collision_drops(
+    pts_timeline: CertifiedPtsTimeline,
+    effective_ranges: Sequence[Range],
+    pts_intervals: Sequence[PtsTickInterval],
+) -> tuple[Mapping[str, int], ...]:
+    """Kept frames that pure tick-based trimming provably cannot represent.
+
+    A kept frame whose pts falls outside its own interval's tick span shares
+    that tick with content on the other side of the cut, so FFmpeg
+    ``trim``/``select`` addressing by PTS cannot keep it while dropping the
+    neighbour.  The B' ruling tolerates this only inside the registered head
+    window and at most ``HEAD_TICK_COLLISION_MAX_DROPS`` times per export;
+    anything else fails closed.
+    """
+    drops: list[dict[str, int]] = []
+    for (start, end), interval in zip(effective_ranges, pts_intervals):
+        for frame in range(start, end):
+            row = pts_timeline.rows[frame]
+            if row.pts < interval.start_tick or row.pts >= interval.end_tick:
+                drops.append(
+                    {
+                        "n": row.n,
+                        "pts": row.pts,
+                        "interval_start_frame": start,
+                        "interval_end_frame": end,
+                        "interval_start_tick": interval.start_tick,
+                        "interval_end_tick": interval.end_tick,
+                    }
+                )
+    for drop in drops:
+        if drop["n"] >= HEAD_ANOMALY_FRAME_LIMIT:
+            raise MediaInfoError(
+                "FRAME_PTS_TICK_COLLISION_UNADJUDICATED",
+                "a kept frame outside the head window is unrepresentable by tick trimming",
+                details=dict(drop),
+            )
+    if len(drops) > HEAD_TICK_COLLISION_MAX_DROPS:
+        raise MediaInfoError(
+            "FRAME_PTS_TICK_COLLISION_UNADJUDICATED",
+            "more kept frames than the adjudication policy allows are "
+            "unrepresentable by tick trimming",
+            details={"drops": [dict(drop) for drop in drops]},
+        )
+    return tuple(drops)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,11 +192,13 @@ class ExportValidationSnapshot:
     effective_ranges: tuple[Range, ...]
     pts_intervals: tuple[PtsTickInterval, ...]
     expected_written: int
+    tick_collision_drops: tuple[Mapping[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path).resolve())
         object.__setattr__(self, "effective_ranges", tuple(self.effective_ranges))
         object.__setattr__(self, "pts_intervals", tuple(self.pts_intervals))
+        object.__setattr__(self, "tick_collision_drops", tuple(self.tick_collision_drops))
         if self.expected_written <= 0:
             raise ValueError("an export validation snapshot requires kept frames")
         if self.expected_written != sum(
@@ -234,6 +285,14 @@ class ExportValidationSnapshot:
             "ffprobe_path": str(self.ffprobe.path),
             "ffmpeg_sha256": self.ffmpeg.sha256,
             "ffprobe_sha256": self.ffprobe.sha256,
+            "head_anomaly_adjudication": {
+                "policy": "head-restricted-2026-08-16",
+                "head_frame_limit": HEAD_ANOMALY_FRAME_LIMIT,
+                "head_anomaly_limit_ticks": self.pts_timeline.head_anomaly_limit,
+                "tick_collision_drops": [dict(drop) for drop in self.tick_collision_drops],
+                "expected_on_disk_frames": self.expected_written
+                - len(self.tick_collision_drops),
+            },
         }
 
 
@@ -317,6 +376,9 @@ class MediaExporter:
                 "EXPORT_EMPTY_TIMELINE",
                 "certified export requires at least one kept frame",
             )
+        tick_collision_drops = _head_tick_collision_drops(
+            pts_timeline, effective_ranges, pts_intervals
+        )
         assert media.ffmpeg is not None and media.ffprobe is not None
         return ExportValidationSnapshot(
             source_path=media.source_path,
@@ -330,6 +392,7 @@ class MediaExporter:
             effective_ranges=tuple(effective_ranges),
             pts_intervals=pts_intervals,
             expected_written=expected_written,
+            tick_collision_drops=tick_collision_drops,
         )
 
     def export(
