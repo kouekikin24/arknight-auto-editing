@@ -35,6 +35,16 @@ logs/
 ArknightsAutoEditor_v1.0.zip
 ArknightsAutoEditor.spec
 
+# Phase 0 gate / production evidence (kept on disk, deliberately untracked)
+PRODUCTION_*/
+MPV_GATE_DECISION_*.json
+arknight-preview-pack.zip
+_wf_plan.json
+explanation-simple.md
+
+# Bundled FFmpeg runtimes (see tools/opencv-runtime-manifest.json for provenance)
+tools/ffmpeg-*/
+
 # Environment / secrets / certificates
 .env
 .env.*
