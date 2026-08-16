@@ -7,6 +7,7 @@ import PIL.Image
 import PIL.ImageTk
 
 from frame_types import FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X
+from edit_commands import SetClipBounds, SetPauseMaskRun
 
 # ---------- 布局常量 ----------
 _CLIP_HANDLE_Y1 = 32
@@ -37,15 +38,30 @@ class TimelineWidget(tk.Frame):
         self.on_seek_cb = None
         self.on_handle_end_cb = None
         self.on_pause_select_cb = None
+        # Emitted only after an edit changes the underlying segment data.
+        # Selection and pointer movement are deliberately not edits.
+        self.on_edit_cb = None
 
         self._tl_static_photo = None
         self._tl_dirty = True
         self.selected_pause_id = None
 
+        # 增量绘制：红线/三角持久 item，像素未变则零开销
+        self._bg_item = None
+        self._line_item = None
+        self._poly_item = None
+        self._last_px = None
+        self._tick_sig = None  # (w, zoom, scroll) 变化时重画刻度
+
         self.active_handle: object = None
         self._pending_candidates: list = []
         self._mousedown_x: int = 0
         self._pan_x: int = 0
+        self._edit_changed: bool = False
+        # Optimistic UI state; the owner applies immutable commands and then
+        # publishes a fresh segment snapshot through ``redraw``.
+        self._clip_preview_bounds: dict[int, tuple[int, int]] = {}
+        self._pause_mask_preview: dict[int, np.ndarray] = {}
 
         self._build()
 
@@ -76,14 +92,22 @@ class TimelineWidget(tk.Frame):
     def mark_dirty(self):
         self._tl_dirty = True
         self._tl_static_photo = None
+        # 强制下次全量重建（背景/刻度/红线 item）
+        self._bg_item = None
+        self._line_item = None
+        self._poly_item = None
+        self._last_px = None
+        self._tick_sig = None
 
     def redraw(self):
+        self._clip_preview_bounds.clear()
+        self._pause_mask_preview.clear()
         self.mark_dirty()
         self._rebuild_static()
-        self._draw_dynamic()
+        self._draw_dynamic(full=True)
 
     def update_pointer(self):
-        self._draw_dynamic()
+        self._draw_dynamic(full=False)
 
     # ------------------------------------------------------------------
     # 静态层
@@ -148,7 +172,7 @@ class TimelineWidget(tk.Frame):
             elif mode == 'keep':
                 pfill(xs, xe, col_map[0])
             else:
-                mask = seg.get('local_del_mask')
+                mask = self._display_pause_mask(seg)
                 if mask is None:
                     pfill(xs, xe, col_map[0])
                 else:
@@ -185,8 +209,9 @@ class TimelineWidget(tk.Frame):
         for seg in self.clip_segments:
             xs = self._f2x(seg['start'], w)
             xe = self._f2x(seg['end'] + 1, w)
-            xki = self._f2x(seg['keep_in'], w)
-            xko = self._f2x(seg['keep_out'] + 1, w)
+            keep_in, keep_end = self._display_clip_bounds(seg)
+            xki = self._f2x(keep_in, w)
+            xko = self._f2x(keep_end, w)
             if xe < 0 or xs > w: continue
 
             cfill(xs, xki, clip_del)
@@ -205,26 +230,60 @@ class TimelineWidget(tk.Frame):
         self._tl_dirty = False
 
     # ------------------------------------------------------------------
-    # 动态层（刻度 + 红条）
+    # 动态层（刻度 + 红条）— 增量：像素未变则 return；仅 full/脏时重建
     # ------------------------------------------------------------------
 
-    def _draw_dynamic(self):
-        if self._tl_dirty or self._tl_static_photo is None: self._rebuild_static()
+    def _draw_dynamic(self, full: bool = False):
+        if self._tl_dirty or self._tl_static_photo is None:
+            self._rebuild_static()
 
         w = self.canvas.winfo_width()
-        if w <= 1: w = 600
+        if w <= 1:
+            w = 600
         h = self.TL_HEIGHT
 
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._tl_static_photo)
-        self._draw_ticks(w, h)
+        tick_sig = (w, float(self.zoom_level), float(self.scroll_offset), int(self.total_frames))
+        need_full = (
+            full
+            or self._bg_item is None
+            or self._line_item is None
+            or self._poly_item is None
+            or self._tick_sig != tick_sig
+        )
 
-        if self.total_frames > 0:
-            px = self._f2x(self.current_frame_idx, w)
-            if 0 <= px <= w:
-                self.canvas.create_line(px, 14, px, h, fill="#FF4444", width=2)
-                self.canvas.create_polygon(
-                    [px - 7, 0, px + 7, 0, px, 14], fill="#FF4444", outline="#CC2222", width=1)
+        if need_full:
+            self.canvas.delete("all")
+            self._bg_item = self.canvas.create_image(
+                0, 0, anchor=tk.NW, image=self._tl_static_photo
+            )
+            self._draw_ticks(w, h)
+            # 先建在画外，随后 coords 移动；避免每 tick 销毁重建
+            self._line_item = self.canvas.create_line(
+                -10, 14, -10, h, fill="#FF4444", width=2
+            )
+            self._poly_item = self.canvas.create_polygon(
+                -17, 0, -3, 0, -10, 14,
+                fill="#FF4444", outline="#CC2222", width=1,
+            )
+            self._last_px = None
+            self._tick_sig = tick_sig
+
+        if self.total_frames <= 0:
+            return
+
+        px = int(self._f2x(self.current_frame_idx, w))
+        if px == self._last_px:
+            return
+        self._last_px = px
+
+        if 0 <= px <= w:
+            self.canvas.coords(self._line_item, px, 14, px, h)
+            self.canvas.coords(self._poly_item, px - 7, 0, px + 7, 0, px, 14)
+            self.canvas.itemconfigure(self._line_item, state="normal")
+            self.canvas.itemconfigure(self._poly_item, state="normal")
+        else:
+            self.canvas.itemconfigure(self._line_item, state="hidden")
+            self.canvas.itemconfigure(self._poly_item, state="hidden")
 
     def _draw_ticks(self, w: int, h: int):
         if self.total_frames <= 0 or self.fps <= 0: return
@@ -288,8 +347,9 @@ class TimelineWidget(tk.Frame):
         cands = []
         RADIUS = 12
         for seg in self.clip_segments:
-            ix = self._f2x(seg['keep_in'], canvas_w)
-            ox = self._f2x(seg['keep_out'] + 1, canvas_w)
+            keep_in, keep_end = self._display_clip_bounds(seg)
+            ix = self._f2x(keep_in, canvas_w)
+            ox = self._f2x(keep_end, canvas_w)
             if abs(event_x - ix) < RADIUS:
                 cands.append((abs(event_x - ix), 'clip_in', seg['id']))
             if abs(event_x - ox) < RADIUS:
@@ -356,8 +416,8 @@ class TimelineWidget(tk.Frame):
             tf = self._x2f(event.x, w)
             for seg in self.pause_segments:
                 if seg['start'] <= tf <= seg['end']:
-                    if seg.get('mode', 'auto') == 'auto' and 'local_del_mask' in seg:
-                        mask = seg['local_del_mask']
+                    mask = self._display_pause_mask(seg)
+                    if seg.get('mode', 'auto') == 'auto' and mask is not None:
                         local_idx = tf - seg['start']
                         if 0 <= local_idx < len(mask):
                             curr_val = mask[local_idx]
@@ -373,9 +433,20 @@ class TimelineWidget(tk.Frame):
                             while e_i < len(mask) - 1 and mask[e_i + 1] == curr_val:
                                 e_i += 1
 
-                            mask[s_i:e_i + 1] = target_val
+                            preview = np.array(mask, copy=True)
+                            preview[s_i:e_i + 1] = target_val
+                            self._pause_mask_preview[int(seg['id'])] = preview
                             self.mark_dirty()
                             self._draw_dynamic()
+                            if self.on_edit_cb:
+                                self.on_edit_cb(
+                                    SetPauseMaskRun(
+                                        int(seg['id']),
+                                        int(s_i),
+                                        int(e_i + 1),
+                                        int(target_val),
+                                    )
+                                )
                     break
 
     def _on_mousemove(self, event):
@@ -392,6 +463,7 @@ class TimelineWidget(tk.Frame):
             dx = event.x - self._mousedown_x
             self.active_handle = self._resolve_handle(dx)
             self._pending_candidates = []
+            self._begin_clip_preview(self.active_handle[1])
 
         if not self.active_handle: return
 
@@ -403,6 +475,7 @@ class TimelineWidget(tk.Frame):
         elif kind == 'clip_out':
             self._move_clip_handle(self.active_handle[1], 'out', tf)
 
+        self._edit_changed = True
         self.mark_dirty()
         self._draw_dynamic()
 
@@ -418,24 +491,69 @@ class TimelineWidget(tk.Frame):
             if htype in prefer: return (htype, hid)
         return (self._pending_candidates[0][1], self._pending_candidates[0][2])
 
+    def _display_pause_mask(self, seg: dict):
+        preview = self._pause_mask_preview.get(int(seg['id']))
+        if preview is not None:
+            return preview
+        return seg.get('local_del_mask')
+
+    def _display_clip_bounds(self, seg: dict) -> tuple[int, int]:
+        preview = self._clip_preview_bounds.get(int(seg['id']))
+        if preview is not None:
+            return preview
+        return int(seg['keep_in']), int(seg['keep_out']) + 1
+
+    def _canonical_clip_bounds(self, seg_id: int) -> tuple[int, int] | None:
+        for seg in self.clip_segments:
+            if int(seg['id']) == int(seg_id):
+                return int(seg['keep_in']), int(seg['keep_out']) + 1
+        return None
+
+    def _begin_clip_preview(self, seg_id: int) -> None:
+        for seg in self.clip_segments:
+            if int(seg['id']) == int(seg_id):
+                self._clip_preview_bounds[int(seg_id)] = self._display_clip_bounds(seg)
+                return
+
     def _move_clip_handle(self, seg_id: int, side: str, tf: int):
         for seg in self.clip_segments:
-            if seg['id'] != seg_id: continue
-            s0, s1 = seg['start'], seg['end']
+            if int(seg['id']) != int(seg_id): continue
+            s0, s1 = int(seg['start']), int(seg['end']) + 1
+            keep_in, keep_end = self._clip_preview_bounds.get(
+                int(seg_id), self._display_clip_bounds(seg)
+            )
             if side == 'in':
-                seg['keep_in'] = max(s0, min(tf, s1 + 1))
-                if seg['keep_in'] > seg['keep_out']:
-                    seg['keep_out'] = min(seg['keep_in'] - 1, s1)
+                keep_in = max(s0, min(int(tf), s1))
+                if keep_in > keep_end:
+                    keep_end = keep_in
             else:
-                seg['keep_out'] = min(s1, max(tf, s0 - 1))
-                if seg['keep_out'] < seg['keep_in']:
-                    seg['keep_in'] = max(seg['keep_out'] + 1, s0)
+                # The right handle is drawn at the half-open end boundary, so
+                # the inverse coordinate maps to that boundary directly.
+                keep_end = min(s1, max(int(tf), s0))
+                if keep_end < keep_in:
+                    keep_in = keep_end
+            self._clip_preview_bounds[int(seg_id)] = (keep_in, keep_end)
             break
 
     def _on_mouseup(self, event):
+        changed = self._edit_changed
+        handle = self.active_handle
+        bounds = None
+        if changed and handle and handle[0] in ('clip_in', 'clip_out'):
+            bounds = self._clip_preview_bounds.get(int(handle[1]))
         self.active_handle = None
         self._pending_candidates = []
         self._mousedown_x = 0
+        self._edit_changed = False
+        canonical = (
+            self._canonical_clip_bounds(int(handle[1]))
+            if handle and handle[0] in ('clip_in', 'clip_out')
+            else None
+        )
+        if changed and bounds is not None and bounds != canonical and self.on_edit_cb:
+            self.on_edit_cb(SetClipBounds(int(handle[1]), bounds[0], bounds[1]))
+        if handle and handle[0] in ('clip_in', 'clip_out'):
+            self._clip_preview_bounds.pop(int(handle[1]), None)
         if self.on_handle_end_cb: self.on_handle_end_cb()
 
     def _on_scroll(self, event):

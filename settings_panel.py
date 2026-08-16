@@ -3,15 +3,40 @@
 import tkinter as tk
 from tkinter import ttk, filedialog
 import os
-import threading
-from queue import Empty, Queue
+
+from task_manager import TaskContext, TaskHandle, TaskManager
+
+
+_GPU_PROBE_TASK = "settings.gpu_encoder_probe"
+
+
+def _probe_gpu_encoders(
+    ffmpeg_path: str | None,
+    context: TaskContext,
+) -> tuple[list[str], list[str]]:
+    """Probe GPU encoders without reading or updating Tk state."""
+    import analyzer
+
+    context.checkpoint()
+    listed = list(analyzer.list_ffmpeg_gpu_encoders(ffmpeg_path))
+    context.checkpoint()
+    working: list[str] = []
+    for encoder in listed:
+        context.checkpoint()
+        if analyzer._gpu_encoder_works(encoder, ffmpeg_path=ffmpeg_path):
+            working.append(encoder)
+        context.checkpoint()
+    return listed, working
 
 
 class SettingsPanel(ttk.LabelFrame):
     """包含全部参数设置的面板（与 VideoPreviewPlayer 解耦）"""
 
-    def __init__(self, parent, **kw):
+    def __init__(self, parent, *, task_manager: TaskManager | None = None, **kw):
         super().__init__(parent, text="处理参数", padding=8, **kw)
+        self._owns_task_manager = task_manager is None
+        self.task_manager = task_manager or TaskManager(self)
+        self._gpu_probe_handle: TaskHandle | None = None
         self.export_callback = None
         self.segment_export_callback = None
         self.selected_pause_id = None
@@ -93,13 +118,24 @@ class SettingsPanel(ttk.LabelFrame):
             foreground="#666666",
         ).grid(row=sep_r + 7, column=0, columnspan=2, sticky=tk.W)
 
+        self.ffprobe_path_var = tk.StringVar(value="auto")
+        ttk.Label(tab_basic, text="FFprobe 路径:").grid(row=sep_r + 8, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(tab_basic, textvariable=self.ffprobe_path_var, width=18).grid(
+            row=sep_r + 8, column=1, sticky=tk.W, padx=4
+        )
+        ttk.Label(
+            tab_basic,
+            text="auto=FFmpeg 同目录；未指定时才查 PATH",
+            foreground="#666666",
+        ).grid(row=sep_r + 9, column=0, columnspan=2, sticky=tk.W)
+
         ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
-            row=sep_r + 8, column=0, columnspan=2, sticky=tk.EW, pady=4)
+            row=sep_r + 10, column=0, columnspan=2, sticky=tk.EW, pady=4)
 
         self.key_repeat_speed_var = tk.IntVar(value=30)
-        ttk.Label(tab_basic, text="←→ 连续移动速度\n(帧/秒):").grid(row=sep_r + 9, column=0, sticky=tk.W, pady=2)
+        ttk.Label(tab_basic, text="←→ 连续移动速度\n(帧/秒):").grid(row=sep_r + 11, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(tab_basic, from_=1, to=120, textvariable=self.key_repeat_speed_var, width=7).grid(
-            row=sep_r + 9, column=1, sticky=tk.W, padx=4)
+            row=sep_r + 11, column=1, sticky=tk.W, padx=4)
 
         # ---- 匹配阈值 ----
         self.thr_pause_var = tk.DoubleVar(value=0.7)
@@ -263,6 +299,13 @@ class SettingsPanel(ttk.LabelFrame):
             row=r, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
         r += 1
 
+        self.export_keep_audio_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            tab_export,
+            text="导出时保留音频（段过多时自动跳过精混音，仍出画面）",
+            variable=self.export_keep_audio_var,
+        ).grid(row=r + 1, column=0, columnspan=3, sticky=tk.W, pady=(2, 2))
+
         self._detect_gpu_encoder()
 
     # ----------------------------------------------------------
@@ -305,71 +348,67 @@ class SettingsPanel(ttk.LabelFrame):
     def _detect_gpu_encoder(self):
         self.gpu_encoder_hint.set("正在实际测试 GPU 编码器...")
         self.export_use_gpu_var.set(False)
-        result_queue = Queue(maxsize=1)
+        # Snapshot Tk state on the owner thread. The worker closure contains
+        # only a plain string/None and TaskContext.
+        ffmpeg_raw = (self.ffmpeg_path_var.get() or "auto").strip()
+        ffmpeg_path = None if ffmpeg_raw.lower() in ("", "auto") else ffmpeg_raw
 
-        def apply_result(listed: list[str], working: list[str], error: str = ""):
-            if error:
-                self.gpu_encoder_combo['values'] = ["未找到 FFmpeg"]
-                self.gpu_encoder_combo.current(0)
-                self.gpu_encoder_combo.config(state=tk.DISABLED)
-                self.gpu_encoder_hint.set(error)
-                self.export_use_gpu_var.set(False)
-                return
+        self._gpu_probe_handle = self.task_manager.submit(
+            _GPU_PROBE_TASK,
+            lambda context: _probe_gpu_encoders(ffmpeg_path, context),
+            on_success=self._apply_gpu_encoder_result,
+            on_error=self._apply_gpu_encoder_error,
+            on_done=lambda _status: setattr(self, "_gpu_probe_handle", None),
+            replace=True,
+        )
+        return self._gpu_probe_handle
 
-            if not listed:
-                self.gpu_encoder_combo['values'] = ["无可用编码器"]
-                self.gpu_encoder_combo.current(0)
-                self.gpu_encoder_combo.config(state=tk.DISABLED)
-                self.gpu_encoder_hint.set("FFmpeg 未提供支持的 GPU 编码器，将使用 CPU 编码")
-                self.export_use_gpu_var.set(False)
-                return
+    def _apply_gpu_encoder_result(
+        self,
+        result: tuple[list[str], list[str]],
+    ) -> None:
+        listed, working = result
+        if not listed:
+            self.gpu_encoder_combo['values'] = ["无可用编码器"]
+            self.gpu_encoder_combo.current(0)
+            self.gpu_encoder_combo.config(state=tk.DISABLED)
+            self.gpu_encoder_hint.set("FFmpeg 未提供支持的 GPU 编码器，将使用 CPU 编码")
+            self.export_use_gpu_var.set(False)
+            return
 
-            # 下拉框优先展示实测可用的编码器，未通过测试的列出项附在后面供手动尝试，
-            # 保证用户对编码器的完全控制权。
-            unverified = [enc for enc in listed if enc not in working]
-            self.gpu_encoder_combo.config(state="readonly")
-            self.gpu_encoder_combo['values'] = working + unverified
-            selected = working[0] if working else (listed[0] if listed else "")
-            self.gpu_encoder_var.set(selected)
-            if working:
-                hint = "实际测试可用: " + ", ".join(working)
-                if unverified:
-                    hint += "\n未通过测试: " + ", ".join(unverified)
-                hint += "\n未通过测试的手动选择将回退到 CPU"
-                self.gpu_encoder_hint.set(hint)
-                self.export_use_gpu_var.set(True)
-            else:
-                self.gpu_encoder_hint.set("列出的 GPU 编码器均未通过测试，默认使用 CPU 编码")
-                self.export_use_gpu_var.set(False)
+        # Prefer encoders that passed a real encode probe; keep listed but
+        # unverified choices visible for explicit manual selection.
+        unverified = [enc for enc in listed if enc not in working]
+        self.gpu_encoder_combo.config(state="readonly")
+        self.gpu_encoder_combo['values'] = working + unverified
+        selected = working[0] if working else listed[0]
+        self.gpu_encoder_var.set(selected)
+        if working:
+            hint = "实际测试可用: " + ", ".join(working)
+            if unverified:
+                hint += "\n未通过测试: " + ", ".join(unverified)
+            hint += "\n未通过测试的手动选择将回退到 CPU"
+            self.gpu_encoder_hint.set(hint)
+            self.export_use_gpu_var.set(True)
+        else:
+            self.gpu_encoder_hint.set("列出的 GPU 编码器均未通过测试，默认使用 CPU 编码")
+            self.export_use_gpu_var.set(False)
 
-        def worker():
-            try:
-                import analyzer
-                # 与分析/导出一致：PATH → imageio_ffmpeg → 设置里的路径
-                ffmpeg_raw = (self.ffmpeg_path_var.get() or "auto").strip()
-                ffmpeg_path = None if ffmpeg_raw.lower() in ("", "auto") else ffmpeg_raw
-                listed = analyzer.list_ffmpeg_gpu_encoders(ffmpeg_path)
-                working = [
-                    enc for enc in listed
-                    if analyzer._gpu_encoder_works(enc, ffmpeg_path=ffmpeg_path)
-                ]
-                result_queue.put((listed, working, ""))
-            except Exception as exc:
-                result_queue.put(
-                    ([], [], f"未找到可用 FFmpeg（{type(exc).__name__}: {exc}）；"
-                             f"可在「基本」页填写 FFmpeg 路径或安装 imageio-ffmpeg")
-                )
+    def _apply_gpu_encoder_error(self, exc: BaseException) -> None:
+        self.gpu_encoder_combo['values'] = ["未找到 FFmpeg"]
+        self.gpu_encoder_combo.current(0)
+        self.gpu_encoder_combo.config(state=tk.DISABLED)
+        self.gpu_encoder_hint.set(
+            f"未找到可用 FFmpeg（{type(exc).__name__}: {exc}）；"
+            f"可在「基本」页填写 FFmpeg 路径或安装 imageio-ffmpeg"
+        )
+        self.export_use_gpu_var.set(False)
 
-        def poll_result():
-            try:
-                listed, working, error = result_queue.get_nowait()
-            except Empty:
-                self.after(100, poll_result)
-                return
-            apply_result(listed, working, error)
-
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(100, poll_result)
+    def close(self) -> None:
+        self.task_manager.invalidate(_GPU_PROBE_TASK)
+        self._gpu_probe_handle = None
+        if self._owns_task_manager:
+            self.task_manager.close(timeout=2.0)
 
     def _decode_backend_key(self) -> str:
         label = (self.decode_backend_var.get() or "").strip()
@@ -380,6 +419,8 @@ class SettingsPanel(ttk.LabelFrame):
     def get_params(self) -> dict:
         ffmpeg_raw = (self.ffmpeg_path_var.get() or "auto").strip()
         ffmpeg_path = None if ffmpeg_raw.lower() in ("", "auto") else ffmpeg_raw
+        ffprobe_raw = (self.ffprobe_path_var.get() or "auto").strip()
+        ffprobe_path = None if ffprobe_raw.lower() in ("", "auto") else ffprobe_raw
         return {
             'batch': self.batch_size_var.get(),
             'proc_res': (self.proc_w_var.get(), self.proc_h_var.get()),
@@ -390,6 +431,7 @@ class SettingsPanel(ttk.LabelFrame):
             'key_repeat_speed': self.key_repeat_speed_var.get(),
             'decode_backend': self._decode_backend_key(),
             'ffmpeg_path': ffmpeg_path,
+            'ffprobe_path': ffprobe_path,
             'thresholds': {
                 'pause': self.thr_pause_var.get(),
                 'speed_1x': self.thr_1x_var.get(),
@@ -405,5 +447,9 @@ class SettingsPanel(ttk.LabelFrame):
             'quality': self.quality_var.get(),
             'export_use_gpu': self.export_use_gpu_var.get(),
             'gpu_encoder': self.gpu_encoder_var.get(),
+            'export_keep_audio': self.export_keep_audio_var.get(),
+            # Production exports require a source-bound FramePtsCertification.
+            # Isolated legacy orchestration tests may omit this key explicitly.
+            'enforce_media_certification': True,
             'merge_pause_ops': self.merge_pause_ops_var.get(),
         }

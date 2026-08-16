@@ -12,13 +12,24 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from decimal import Decimal, localcontext
+from fractions import Fraction
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+import media_info
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
                          FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
+from task_manager import TaskCancelled
+from timeline_plan import TimelinePlan
 
 _NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
 _GPU_PROBE_CACHE: dict[str, bool] = {}
 _GPU_PROBE_LOCK = threading.Lock()
+
+# 快速滤镜路径：段过多时 filter_complex 会极慢且进度长期停在 ~1%
+# 超过阈值则跳过，改走有帧进度的稳妥逐帧路径（不改变删帧语义）
+_MAX_FILTER_EXPORT_RANGES = 120
+_MAX_FILTER_EXPORT_RANGES_AUDIO = 80
 
 
 @dataclass
@@ -352,33 +363,18 @@ def normalize_decode_backend(decode_backend: str | None) -> str:
 
 
 def resolve_ffmpeg_path(ffmpeg_path: str | None = None) -> str:
-    """Resolve FFmpeg binary: explicit path → PATH → imageio_ffmpeg (if installed)."""
-    if ffmpeg_path:
-        p = os.path.expanduser(str(ffmpeg_path).strip())
-        if p and os.path.isfile(p):
-            return os.path.abspath(p)
-        found = shutil.which(p) if p else None
-        if found:
-            return found
-        raise FileNotFoundError(f"FFmpeg not found: {ffmpeg_path}")
-
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-
     try:
-        import imageio_ffmpeg  # type: ignore
+        return str(media_info.resolve_ffmpeg_path(ffmpeg_path))
+    except media_info.MediaInfoError as exc:
+        raise FileNotFoundError(str(exc)) from exc
 
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe and os.path.isfile(exe):
-            return exe
-    except Exception:
-        pass
 
-    raise FileNotFoundError(
-        "FFmpeg not found on PATH and imageio_ffmpeg is unavailable; "
-        "set an explicit ffmpeg path in settings."
-    )
+def resolve_ffprobe_path(ffprobe_path: str | None = None,
+                         *, ffmpeg_path: str | None = None) -> str:
+    try:
+        return str(media_info.resolve_ffprobe_path(ffprobe_path, ffmpeg_path=ffmpeg_path))
+    except media_info.MediaInfoError as exc:
+        raise FileNotFoundError(str(exc)) from exc
 
 
 def _read_exact(stream, n: int) -> bytes:
@@ -925,32 +921,32 @@ def build_segments(states: np.ndarray, diffs: np.ndarray, video_path: str, proc_
 def _speedup_mask(states: np.ndarray, frame_type: int, factor: int,
                   exclude_mask: np.ndarray) -> np.ndarray:
     total = len(states)
+    if factor < 1:
+        raise ValueError("speedup factor must be at least 1")
     type_mask = (states == frame_type) & ~exclude_mask
 
     if not type_mask.any(): return np.zeros(total, dtype=bool)
 
-    cumsum = np.cumsum(type_mask)
-    shifted = np.empty(total, dtype=bool)
-    shifted[0] = False
-    shifted[1:] = type_mask[:-1]
-    seg_starts = np.where(type_mask & ~shifted)[0]
-
-    offsets = np.zeros(total, dtype=np.int64)
-    for s in seg_starts:
-        offsets[s:] = cumsum[s - 1] if s > 0 else 0
-
-    local_cnt = np.where(type_mask, cumsum - offsets, 0)
+    # Compute the one-based position inside each contiguous type run in one
+    # linear pass.  The previous implementation rewrote ``offsets[s:]`` for
+    # every run, which made many short speed segments quadratic in total
+    # frame count.
+    indices = np.arange(total, dtype=np.int64)
+    starts = type_mask & ~np.r_[False, type_mask[:-1]]
+    run_start = np.where(starts, indices, 0)
+    last_start = np.maximum.accumulate(run_start)
+    local_cnt = np.where(type_mask, indices - last_start + 1, 0)
 
     if factor == 2:
         return type_mask & (local_cnt % 2 == 0)
     return type_mask & (local_cnt % factor != 1)
 
 
-def build_delete_set(total: int, states: np.ndarray,
-                     pause_segments: list, speed_segments: list,
-                     clip_segments: list,
-                     speedup_1x: bool, speedup_02: bool,
-                     speedup_02_factor: int) -> np.ndarray:
+def _build_delete_mask(total: int, states: np.ndarray,
+                       pause_segments: list, speed_segments: list,
+                       clip_segments: list,
+                       speedup_1x: bool, speedup_02: bool,
+                       speedup_02_factor: int) -> np.ndarray:
     del_mask = np.zeros(total, dtype=bool)
 
     for seg in pause_segments:
@@ -981,24 +977,135 @@ def build_delete_set(total: int, states: np.ndarray,
     return del_mask
 
 
+def _plan_delete_mask(plan: TimelinePlan) -> np.ndarray:
+    mask = np.zeros(plan.total_frames, dtype=bool)
+    for start, end in plan.deleted_ranges:
+        mask[start:end] = True
+    return mask
+
+
+def build_timeline_plan(total: int, states: np.ndarray,
+                        pause_segments: list, speed_segments: list,
+                        clip_segments: list,
+                        speedup_1x: bool, speedup_02: bool,
+                        speedup_02_factor: int) -> TimelinePlan:
+    """Resolve legacy edit dictionaries into one validated frame timeline."""
+    mask = _build_delete_mask(
+        total,
+        states,
+        pause_segments,
+        speed_segments,
+        clip_segments,
+        speedup_1x,
+        speedup_02,
+        speedup_02_factor,
+    )
+    return TimelinePlan.from_delete_mask(mask)
+
+
+def build_delete_set(total: int, states: np.ndarray,
+                     pause_segments: list, speed_segments: list,
+                     clip_segments: list,
+                     speedup_1x: bool, speedup_02: bool,
+                     speedup_02_factor: int) -> np.ndarray:
+    """Compatibility wrapper; new consumers should keep the TimelinePlan."""
+    return _plan_delete_mask(
+        build_timeline_plan(
+            total,
+            states,
+            pause_segments,
+            speed_segments,
+            clip_segments,
+            speedup_1x,
+            speedup_02,
+            speedup_02_factor,
+        )
+    )
+
+
 def _kept_frame_ranges(to_del: np.ndarray) -> list[tuple[int, int]]:
     """将删除掩码转换为左闭右开的保留帧区间。"""
-    ranges = []
-    i = 0
-    total = len(to_del)
-    while i < total:
-        if to_del[i]:
-            i += 1
-            continue
-        start = i
-        while i < total and not to_del[i]:
-            i += 1
-        ranges.append((start, i))
-    return ranges
+    return list(TimelinePlan.from_delete_mask(to_del).kept_ranges)
 
 
-def _has_audio_stream(video_path: str, ffmpeg_path: str | None = None) -> bool:
-    ffprobe = shutil.which("ffprobe")
+def inspect_export_plan(to_del, include_audio: bool = True, *,
+                        video_path: str | None = None,
+                        ffmpeg_path: str | None = None,
+                        ffprobe_path: str | None = None) -> dict:
+    """Return a preflight plan without conflating probe failure with no audio."""
+    if isinstance(to_del, TimelinePlan):
+        plan = to_del
+    else:
+        mask = np.asarray(to_del, dtype=bool)
+        if mask.ndim != 1:
+            raise ValueError("to_del must be a one-dimensional frame mask")
+        plan = TimelinePlan.from_delete_mask(mask)
+    n_ranges = len(plan.kept_ranges)
+    audio_limit = _MAX_FILTER_EXPORT_RANGES_AUDIO
+    drop_reasons = []
+    block_reasons = []
+    audio_probe = None
+    resolved_ffmpeg = None
+    if video_path is not None:
+        try:
+            resolved_ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+        except FileNotFoundError:
+            block_reasons.append("ffmpeg_unavailable")
+    if include_audio and n_ranges > audio_limit:
+        drop_reasons.append("too_many_ranges")
+    if include_audio and video_path is not None:
+        if resolved_ffmpeg is None:
+            audio_probe = {
+                "status": "unavailable",
+                "present": None,
+                "method": None,
+                "errors": ["FFmpeg unavailable"],
+            }
+        else:
+            audio_probe = _probe_audio_stream(
+                video_path,
+                ffmpeg_path=resolved_ffmpeg,
+                ffprobe_path=ffprobe_path,
+            )
+            if audio_probe["present"] is None:
+                drop_reasons.append("audio_probe_inconclusive")
+    return {
+        "n_ranges": n_ranges,
+        "kept_frames": plan.kept_frames,
+        "timeline_fingerprint": plan.fingerprint,
+        "include_audio": bool(include_audio),
+        "video_path": (
+            os.path.normcase(os.path.abspath(video_path))
+            if video_path is not None
+            else None
+        ),
+        "audio_limit": audio_limit,
+        "ffmpeg_path": resolved_ffmpeg,
+        "ffprobe_path": (
+            os.path.normcase(os.path.abspath(ffprobe_path))
+            if ffprobe_path is not None
+            else None
+        ),
+        "audio_probe": audio_probe,
+        "export_block_reasons": list(dict.fromkeys(block_reasons)),
+        "export_blocked": bool(block_reasons),
+        "audio_drop_reasons": list(dict.fromkeys(drop_reasons)),
+        "audio_drop_requires_confirmation": bool(drop_reasons),
+    }
+
+
+def _probe_audio_stream(video_path: str,
+                        ffmpeg_path: str | None = None,
+                        ffprobe_path: str | None = None) -> dict:
+    errors = []
+    try:
+        ffprobe = resolve_ffprobe_path(
+            ffprobe_path,
+            ffmpeg_path=ffmpeg_path,
+        )
+    except FileNotFoundError as exc:
+        ffprobe = None
+        errors.append(str(exc))
     if ffprobe:
         try:
             result = subprocess.run(
@@ -1006,23 +1113,76 @@ def _has_audio_stream(video_path: str, ffmpeg_path: str | None = None) -> bool:
                  "-show_entries", "stream=index", "-of", "csv=p=0", video_path],
                 check=False, capture_output=True, text=True, timeout=15,
                 creationflags=_NO_WINDOW)
-            return bool(result.stdout.strip())
-        except Exception:
-            pass
+            if result.returncode == 0:
+                return {
+                    "status": "pass",
+                    "present": bool(result.stdout.strip()),
+                    "method": "ffprobe",
+                    "errors": errors,
+                }
+            errors.append(
+                f"ffprobe rc={result.returncode}: {(result.stderr or '').strip()[:500]}"
+            )
+        except Exception as exc:
+            errors.append(f"ffprobe: {type(exc).__name__}: {exc}")
 
     try:
         ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
-    except FileNotFoundError:
-        return False
+    except FileNotFoundError as exc:
+        errors.append(str(exc))
+        return {
+            "status": "unavailable",
+            "present": None,
+            "method": None,
+            "errors": errors,
+        }
     try:
         result = subprocess.run(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", video_path,
              "-map", "0:a:0", "-frames:a", "1", "-f", "null", "-"],
-            check=False, capture_output=True, timeout=15,
+            check=False, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=15,
             creationflags=_NO_WINDOW)
-        return result.returncode == 0
-    except Exception:
-        return False
+        if result.returncode == 0:
+            return {
+                "status": "pass",
+                "present": True,
+                "method": "ffmpeg_decode",
+                "errors": errors,
+            }
+        stderr = (result.stderr or "").strip()
+        no_stream_markers = (
+            "matches no streams",
+            "does not contain any stream",
+            "stream map '0:a:0' matches no streams",
+        )
+        if any(marker in stderr.lower() for marker in no_stream_markers):
+            return {
+                "status": "pass",
+                "present": False,
+                "method": "ffmpeg_decode",
+                "errors": errors,
+            }
+        errors.append(f"ffmpeg rc={result.returncode}: {stderr[:500]}")
+        return {
+            "status": "error",
+            "present": None,
+            "method": "ffmpeg_decode",
+            "errors": errors,
+        }
+    except Exception as exc:
+        errors.append(f"ffmpeg: {type(exc).__name__}: {exc}")
+        return {
+            "status": "error",
+            "present": None,
+            "method": "ffmpeg_decode",
+            "errors": errors,
+        }
+
+
+def _has_audio_stream(video_path: str, ffmpeg_path: str | None = None) -> bool:
+    """Compatibility helper for callers that only need a conservative bool."""
+    return _probe_audio_stream(video_path, ffmpeg_path=ffmpeg_path)["present"] is True
 
 
 def _gpu_encoder_probe_args(enc: str) -> list[str]:
@@ -1145,11 +1305,96 @@ def _video_encoder_args(
             "-pix_fmt", "yuv420p", "-threads", "0"]
 
 
+
+def _export_progress(progress_cb, ratio, written=0, status: str | None = None) -> None:
+    """Call UI progress callback; support optional status string (3rd arg)."""
+    if not progress_cb:
+        return
+    try:
+        if status is not None:
+            progress_cb(float(ratio), int(written), status)
+        else:
+            progress_cb(float(ratio), int(written))
+    except TypeError:
+        # older callback: (ratio, written) only
+        progress_cb(float(ratio), int(written))
+
+
+def _check_export_cancel(cancel_cb) -> None:
+    if cancel_cb is not None:
+        cancel_cb()
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    """Best-effort bounded termination used by cancellable FFmpeg paths."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=2.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_ffmpeg_interruptible(
+    cmd: list[str],
+    *,
+    timeout: float,
+    cancel_cb=None,
+) -> None:
+    """Run FFmpeg while polling cooperative cancellation and a hard deadline."""
+    stderr_file = tempfile.TemporaryFile()
+    process: subprocess.Popen | None = None
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            stderr=stderr_file,
+            creationflags=_NO_WINDOW,
+        )
+        while True:
+            _check_export_cancel(cancel_cb)
+            try:
+                returncode = process.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() - started >= timeout:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+        # Cancellation may arrive after the last polling checkpoint but just
+        # as the child exits.  Do not report success without one final check.
+        _check_export_cancel(cancel_cb)
+        stderr_file.seek(0)
+        stderr = stderr_file.read()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, cmd, stderr=stderr)
+    except BaseException:
+        if process is not None:
+            _terminate_process(process)
+        raise
+    finally:
+        stderr_file.close()
+
+
 def _export_ranges_with_ffmpeg_filters(
         video_path: str, output_path: str, ranges: list[tuple[int, int]],
         fps: float, quality: int, use_gpu: bool, gpu_encoder: str,
         include_audio: bool, progress_cb=None,
-        ffmpeg_path: str | None = None) -> bool:
+        ffmpeg_path: str | None = None,
+        cancel_cb=None) -> bool:
     """使用 FFmpeg trim/concat 快速导出左闭右开的帧区间。
 
     滤镜图通过 -filter_complex_script 写入文件（不走命令行），ffmpeg concat
@@ -1157,18 +1402,39 @@ def _export_ranges_with_ffmpeg_filters(
     """
     if not ranges:
         return False
+    _check_export_cancel(cancel_cb)
 
     try:
         ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
     except FileNotFoundError:
         return False
 
-    has_audio = include_audio and _has_audio_stream(video_path, ffmpeg_path=ffmpeg)
+    # include_audio is already the result of export preflight.  Do not probe a
+    # second time and silently turn a transient probe error into a silent file.
+    has_audio = bool(include_audio)
+    limit = (
+        _MAX_FILTER_EXPORT_RANGES_AUDIO if has_audio else _MAX_FILTER_EXPORT_RANGES
+    )
+    n_ranges = len(ranges)
+    if n_ranges > limit:
+        # 不建巨型滤镜；由 export_video 改走稳妥路径
+        print(
+            f"[analyzer] 保留段 {n_ranges} > {limit}，跳过快速滤镜，改用稳妥逐帧导出"
+        )
+        _export_progress(
+            progress_cb,
+            0.02,
+            0,
+            f"保留段过多({n_ranges}>{limit})，改用稳妥逐帧…",
+        )
+        return False
+
     with tempfile.TemporaryDirectory() as tmpdir:
         filter_file = os.path.join(tmpdir, "filter.txt")
         lines = []
         concat_inputs = []
         for idx, (start, end) in enumerate(ranges):
+            _check_export_cancel(cancel_cb)
             lines.append(
                 f"[0:v]trim=start_frame={start}:end_frame={end},"
                 f"setpts=PTS-STARTPTS[v{idx}]")
@@ -1203,13 +1469,29 @@ def _export_ranges_with_ffmpeg_filters(
         cmd.append(output_path)
 
         try:
-            if progress_cb:
-                progress_cb(0.01, 0)
-            subprocess.run(cmd, check=True, capture_output=True,
-                           timeout=1800, creationflags=_NO_WINDOW)
-            if progress_cb:
-                progress_cb(1.0, sum(end - start for start, end in ranges))
+            _export_progress(
+                progress_cb,
+                0.01,
+                0,
+                f"FFmpeg 快速导出中（保留段 {n_ranges}，可能较久）…",
+            )
+            _run_ffmpeg_interruptible(
+                cmd, timeout=1800.0, cancel_cb=cancel_cb
+            )
+            kept = sum(end - start for start, end in ranges)
+            _export_progress(progress_cb, 1.0, kept, "快速导出完成")
             return True
+        except TaskCancelled:
+            # Cancellation is a control-flow result, not a reason to fall
+            # back to the slower OpenCV path.  The caller owns the atomic
+            # staging policy, but remove this path's partial output now so a
+            # direct low-level caller cannot mistake it for a valid file.
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            raise
         except subprocess.CalledProcessError as exc:
             # 快速滤镜路径失败：删除 ffmpeg 写了一半的输出，回退到逐帧路径。
             # 同时打印 ffmpeg 的真实 stderr，避免“静默变慢 + 无诊断”。
@@ -1220,6 +1502,8 @@ def _export_ranges_with_ffmpeg_filters(
                 os.remove(output_path)
             return False
         except Exception as exc:
+            if cancel_cb is not None:
+                _check_export_cancel(cancel_cb)
             # 超时/其它异常同样回退，但打印原因，不再完全静默。
             print(f"[analyzer] 快速滤镜导出异常，回退逐帧路径: {exc}")
             if os.path.isfile(output_path):
@@ -1227,12 +1511,300 @@ def _export_ranges_with_ffmpeg_filters(
             return False
 
 
+def _fraction_filter_seconds(value: Fraction) -> str:
+    """Render an exact Fraction as a non-exponential FFmpeg duration."""
+    if not isinstance(value, Fraction) or value.denominator <= 0:
+        raise ValueError("filter duration must be a Fraction")
+    with localcontext() as context:
+        context.prec = 40
+        rendered = format(
+            Decimal(value.numerator) / Decimal(value.denominator), "f"
+        )
+    # Only trim fractional trailing zeroes.  Stripping an integer such as
+    # ``10`` would silently turn a valid FFmpeg boundary into ``1``.
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
+def _normalize_pts_schedule(
+    intervals: Sequence[Mapping[str, Any]],
+    *,
+    time_base: Fraction,
+) -> list[tuple[int, int, int, int]]:
+    """Validate the immutable frame->tick schedule used by the PTS consumer."""
+    if not isinstance(time_base, Fraction) or time_base <= 0:
+        raise ValueError("PTS export requires a positive Fraction time_base")
+    normalized: list[tuple[int, int, int, int]] = []
+    previous_end_tick: int | None = None
+    for index, value in enumerate(intervals):
+        if not isinstance(value, Mapping):
+            raise ValueError(f"PTS interval {index} must be an object")
+        frame_range = value.get("source_frame_range")
+        tick_range = value.get("pts_tick_range")
+        if (
+            not isinstance(frame_range, (list, tuple))
+            or len(frame_range) != 2
+            or not isinstance(tick_range, (list, tuple))
+            or len(tick_range) != 2
+        ):
+            raise ValueError(f"PTS interval {index} has invalid ranges")
+        start_frame, end_frame = frame_range
+        start_tick, end_tick = tick_range
+        values = (start_frame, end_frame, start_tick, end_tick)
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in values):
+            raise ValueError(f"PTS interval {index} requires integer frame/tick values")
+        if start_frame < 0 or end_frame <= start_frame or end_tick <= start_tick:
+            raise ValueError(f"PTS interval {index} is empty or reversed")
+        if previous_end_tick is not None and start_tick < previous_end_tick:
+            raise ValueError("PTS intervals must be ordered and non-overlapping")
+        normalized.append((start_frame, end_frame, start_tick, end_tick))
+        previous_end_tick = end_tick
+    if not normalized:
+        raise ValueError("PTS export requires at least one interval")
+    return normalized
+
+
+def _vfr_pts_video_filter(
+    schedule: Sequence[tuple[int, int, int, int]],
+    *,
+    time_base: Fraction,
+) -> str:
+    """Build a VFR select/setpts filter without frame-rate arithmetic.
+
+    ``trim`` followed by ``concat`` can shorten the last frame of each VFR
+    segment.  Selecting source PTS directly and subtracting only the removed
+    tick spans preserves each certified frame duration.  A terminal ``tpad``
+    guard is added by the caller so the last real frame receives a positive
+    muxed duration.
+    """
+    time_base_text = f"{time_base.numerator}/{time_base.denominator}"
+    conditions = "+".join(
+        f"between(pts,{start_tick},{end_tick - 1})"
+        for _start_frame, _end_frame, start_tick, end_tick in schedule
+    )
+    offsets: list[int] = []
+    output_offset = 0
+    for _start_frame, _end_frame, start_tick, end_tick in schedule:
+        offsets.append(output_offset)
+        output_offset += end_tick - start_tick
+
+    expression = (
+        f"PTS-{schedule[-1][2]}+{offsets[-1]}"
+    )
+    for index in range(len(schedule) - 2, -1, -1):
+        start_tick = schedule[index][2]
+        expression = (
+            f"if(lt(PTS,{schedule[index + 1][2]}),"
+            f"PTS-{start_tick}+{offsets[index]},{expression})"
+        )
+    return (
+        f"[0:v:0]settb={time_base_text},"
+        f"select='{conditions}',setpts='{expression}',"
+        "tpad=stop_mode=clone:stop=1[outv]"
+    )
+
+
+def export_pts_schedule(
+    video_path: str,
+    output_path: str,
+    intervals: Sequence[Mapping[str, Any]],
+    *,
+    time_base: Fraction,
+    source_frame_count: int,
+    reported_total_frames: int,
+    quality: int,
+    use_gpu: bool = False,
+    gpu_encoder: str = "",
+    ffmpeg_path: str | None = None,
+    include_audio: bool = False,
+    source_has_audio: bool = False,
+    frame_pts_status: str | None = None,
+    progress_cb=None,
+    cancel_cb=None,
+) -> tuple[int, int, dict[str, Any]]:
+    """Export an immutable PTS schedule without falling back to FPS arithmetic.
+
+    ``trim=start_pts/end_pts`` addresses video in the certified stream time
+    base.  Audio boundaries are derived from the same integer ticks as exact
+    ``Fraction`` seconds.  Every segment is reset before concat.  A certified
+    CFR source uses FFmpeg's CFR muxing mode so encoded packets retain positive
+    durations; a VFR source keeps passthrough mode so no frame clock is
+    invented.  The default remains passthrough for legacy direct callers.
+    """
+    if (
+        isinstance(source_frame_count, bool)
+        or not isinstance(source_frame_count, int)
+        or source_frame_count <= 0
+    ):
+        raise ValueError("source_frame_count must be a positive integer")
+    if (
+        isinstance(reported_total_frames, bool)
+        or not isinstance(reported_total_frames, int)
+        or reported_total_frames <= 0
+    ):
+        raise ValueError("reported_total_frames must be a positive integer")
+    schedule = _normalize_pts_schedule(intervals, time_base=time_base)
+    if schedule[-1][1] > source_frame_count:
+        raise ValueError("PTS interval exceeds the certified source frame count")
+    if len(schedule) > _MAX_FILTER_EXPORT_RANGES:
+        raise RuntimeError(
+            "认证 PTS 时间表段数超过 FFmpeg 滤镜安全上限，拒绝回退到 FPS 导出"
+        )
+    if frame_pts_status not in {None, "cfr", "vfr"}:
+        raise ValueError("frame_pts_status must be cfr, vfr, or None")
+    output_fps_mode = "cfr" if frame_pts_status == "cfr" else "passthrough"
+    scheduled_written = sum(
+        end - start for start, end, _start_tick, _end_tick in schedule
+    )
+    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+    has_audio = bool(include_audio and source_has_audio)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filter_file = os.path.join(tmpdir, "pts-filter.txt")
+        lines: list[str] = []
+        concat_inputs: list[str] = []
+        if frame_pts_status == "vfr":
+            lines.append(_vfr_pts_video_filter(schedule, time_base=time_base))
+            if has_audio:
+                audio_inputs: list[str] = []
+                for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
+                    start_seconds = _fraction_filter_seconds(start_tick * time_base)
+                    end_seconds = _fraction_filter_seconds(end_tick * time_base)
+                    lines.append(
+                        f"[0:a:0]atrim=start={start_seconds}:end={end_seconds},"
+                        f"asetpts=PTS-STARTPTS[a{index}]"
+                    )
+                    audio_inputs.append(f"[a{index}]")
+                lines.append(
+                    "".join(audio_inputs)
+                    + f"concat=n={len(schedule)}:v=0:a=1[outa]"
+                )
+        else:
+            for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
+                lines.append(
+                    f"[0:v:0]trim=start_pts={start_tick}:end_pts={end_tick},"
+                    f"setpts=PTS-STARTPTS[v{index}]"
+                )
+                concat_inputs.append(f"[v{index}]")
+                if has_audio:
+                    start_seconds = _fraction_filter_seconds(start_tick * time_base)
+                    end_seconds = _fraction_filter_seconds(end_tick * time_base)
+                    lines.append(
+                        f"[0:a:0]atrim=start={start_seconds}:end={end_seconds},"
+                        f"asetpts=PTS-STARTPTS[a{index}]"
+                    )
+                    concat_inputs.append(f"[a{index}]")
+            if has_audio:
+                lines.append(
+                    "".join(concat_inputs)
+                    + f"concat=n={len(schedule)}:v=1:a=1[outv][outa]"
+                )
+            else:
+                lines.append(
+                    "".join(concat_inputs)
+                    + f"concat=n={len(schedule)}:v=1:a=0[outv]"
+                )
+        Path(filter_file).write_text(";\n".join(lines), encoding="utf-8")
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-copyts",
+            "-i",
+            video_path,
+            "-filter_complex_script",
+            filter_file,
+            "-map",
+            "[outv]",
+        ]
+        if has_audio:
+            cmd += ["-map", "[outa]"]
+        cmd += ["-fps_mode:v", output_fps_mode]
+        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
+        if frame_pts_status == "vfr":
+            cmd += [
+                "-bf",
+                "0",
+                "-enc_time_base:v",
+                f"{time_base.numerator}/{time_base.denominator}",
+                "-video_track_timescale",
+                str(time_base.denominator),
+                "-frames:v",
+                str(scheduled_written + 1),
+            ]
+        cmd += ["-c:a", "aac"] if has_audio else ["-an"]
+        cmd += ["-movflags", "+faststart", output_path]
+
+        _check_export_cancel(cancel_cb)
+        _export_progress(
+            progress_cb,
+            0.01,
+            0,
+            f"按认证 PTS 时间表导出（{len(schedule)} 段）…",
+        )
+        try:
+            _run_ffmpeg_interruptible(cmd, timeout=1800.0, cancel_cb=cancel_cb)
+        except BaseException:
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            raise
+
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+        raise RuntimeError("PTS 导出器未生成有效输出文件")
+    written = scheduled_written
+    _export_progress(progress_cb, 1.0, written, "认证 PTS 导出完成")
+    return written, reported_total_frames, {
+        "audio_mode": "muxed" if has_audio else ("no_stream" if include_audio else "disabled"),
+        "pts_table_consumed": True,
+        "pts_consumer": (
+            "ffmpeg_select_pts_setpts"
+            if frame_pts_status == "vfr"
+            else "ffmpeg_trim_pts_concat"
+        ),
+        "pts_consumer_command_scope": (
+            (
+                "video_select_pts_setpts_terminal_guard_vfr"
+                if frame_pts_status == "vfr"
+                else f"video_start_pts_end_pts_{output_fps_mode}"
+            )
+        ),
+        "pts_output_fps_mode": output_fps_mode,
+        "pts_terminal_guard": frame_pts_status == "vfr",
+        "pts_schedule_segment_count": len(schedule),
+        "pts_schedule_frame_count": written,
+        "pts_time_base": f"{time_base.numerator}/{time_base.denominator}",
+        "source_frame_count": source_frame_count,
+    }
 def _mux_audio_for_ranges(video_path: str, video_only_path: str,
                           output_path: str, ranges: list[tuple[int, int]],
-                          fps: float, ffmpeg_path: str | None = None):
-    if not _has_audio_stream(video_path, ffmpeg_path=ffmpeg_path):
+                          fps: float, ffmpeg_path: str | None = None,
+                          progress_cb=None,
+                          source_has_audio: bool | None = None,
+                          cancel_cb=None) -> str:
+    """Mux range-trimmed audio onto video-only file.
+
+    Returns audio_mode: 'muxed' | 'no_stream'.
+    Caller must decide segment-limit / user-disable before calling.
+    """
+    if source_has_audio is None:
+        _check_export_cancel(cancel_cb)
+        probe = _probe_audio_stream(video_path, ffmpeg_path=ffmpeg_path)
+        source_has_audio = probe["present"]
+        if source_has_audio is None:
+            raise RuntimeError(
+                "无法确认源片音轨，拒绝把探测失败当作无音轨: "
+                + "; ".join(probe.get("errors") or [])
+            )
+    if source_has_audio is False:
         os.replace(video_only_path, output_path)
-        return
+        return "no_stream"
 
     ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1240,6 +1812,7 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
         lines = []
         labels = []
         for idx, (start, end) in enumerate(ranges):
+            _check_export_cancel(cancel_cb)
             lines.append(
                 f"[0:a]atrim=start={start / fps:.9f}:end={end / fps:.9f},"
                 f"asetpts=PTS-STARTPTS[a{idx}]")
@@ -1249,13 +1822,27 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
             handle.write(";\n".join(lines))
 
         try:
-            subprocess.run(
+            _export_progress(
+                progress_cb, 0.98, 0,
+                f"混音编码中…（共 {len(ranges)} 段）",
+            )
+            _run_ffmpeg_interruptible(
                 [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
                  "-i", video_path, "-i", video_only_path,
                  "-filter_complex_script", filter_file,
                  "-map", "1:v:0", "-map", "[outa]",
                  "-c:v", "copy", "-c:a", "aac", "-shortest", output_path],
-                check=True, capture_output=True, timeout=1800, creationflags=_NO_WINDOW)
+                timeout=1800.0,
+                cancel_cb=cancel_cb,
+            )
+            return "muxed"
+        except TaskCancelled:
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            raise
         except Exception as exc:
             # 混流失败：删除可能被 ffmpeg 截断/写半的损坏输出，避免残留假成品。
             if os.path.isfile(output_path):
@@ -1270,73 +1857,211 @@ def _mux_audio_for_ranges(video_path: str, video_only_path: str,
                 raise RuntimeError(
                     f"音频混流失败: {stderr.decode('utf-8', errors='ignore')}"
                 ) from exc
+            if cancel_cb is not None:
+                _check_export_cancel(cancel_cb)
             raise
 
 
-def export_video(video_path: str, output_path: str, to_del,
+def _export_video_impl(video_path: str, output_path: str, to_del,
                  fps: float, quality: int, progress_cb=None,
-                 use_gpu: bool = False, gpu_encoder: str = "",
-                 ffmpeg_path: str | None = None):
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                  use_gpu: bool = False, gpu_encoder: str = "",
+                  ffmpeg_path: str | None = None,
+                  ffprobe_path: str | None = None,
+                  include_audio: bool = True,
+                 allow_audio_drop: bool = False,
+                 cancel_cb=None,
+                 preflight: dict | None = None):
+    """导出整段剪辑。
 
-    if isinstance(to_del, set):
+    优先 FFmpeg trim/concat 快速路径；段数过多或失败时回退到
+    OpenCV 解码 + FFmpeg pipe 编码的稳妥逐帧路径。
+    快速路径成功时不打开 OpenCV VideoCapture。
+    include_audio=False 时不混音、快速路径也不映射音轨。
+    保留段过多时跳过「精密切音」(atrim×N)，直接输出无音画面（M2a）。
+
+    返回 (written, total, meta)，meta['audio_mode'] 为
+    muxed | no_stream | disabled | skipped_segments | skipped_unavailable |
+    skipped_probe。
+    progress_cb 可为 (ratio, written) 或 (ratio, written, status)。
+    """
+    _check_export_cancel(cancel_cb)
+    if isinstance(to_del, TimelinePlan):
+        timeline_plan = to_del
+        total = timeline_plan.total_frames
+        to_del = _plan_delete_mask(timeline_plan)
+    elif isinstance(to_del, set):
+        cap0 = cv2.VideoCapture(video_path)
+        try:
+            total = int(cap0.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            cap0.release()
         mask = np.zeros(total, dtype=bool)
         for idx in to_del:
             if 0 <= idx < total:
                 mask[idx] = True
         to_del = mask
+        timeline_plan = TimelinePlan.from_delete_mask(to_del)
+    else:
+        to_del = np.asarray(to_del, dtype=bool)
+        if to_del.ndim != 1:
+            raise ValueError("to_del must be a one-dimensional frame mask")
+        total = int(to_del.shape[0])
+        timeline_plan = TimelinePlan.from_delete_mask(to_del)
 
-    ranges = _kept_frame_ranges(to_del)
-    written_fast = sum(end - start for start, end in ranges)
-    if not ranges:
-        cap.release()
+    if total <= 0:
         raise RuntimeError("没有可导出的帧")
 
-    try:
-        ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
-    except FileNotFoundError:
-        ffmpeg_bin = None
+    ranges = list(timeline_plan.kept_ranges)
+    written_fast = timeline_plan.kept_frames
+    if not ranges:
+        raise RuntimeError("没有可导出的帧")
+    _check_export_cancel(cancel_cb)
 
-    if ffmpeg_bin and _export_ranges_with_ffmpeg_filters(
-            video_path, output_path, ranges, fps, quality,
-            use_gpu, gpu_encoder, True, progress_cb, ffmpeg_path=ffmpeg_bin):
-        cap.release()
-        return written_fast, total
+    if preflight is None:
+        plan = inspect_export_plan(
+            timeline_plan,
+            include_audio=include_audio,
+            video_path=video_path,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+        )
+    else:
+        plan = dict(preflight)
+        expected_source = os.path.normcase(os.path.abspath(video_path))
+        if plan.get("timeline_fingerprint") != timeline_plan.fingerprint:
+            raise ValueError("preflight timeline does not match export timeline")
+        if int(plan.get("n_ranges", -1)) != len(timeline_plan.kept_ranges):
+            raise ValueError("preflight range count does not match export timeline")
+        if bool(plan.get("include_audio")) != bool(include_audio):
+            raise ValueError("preflight audio policy does not match export request")
+        if plan.get("video_path") != expected_source:
+            raise ValueError("preflight source path does not match export source")
+    n_ranges = int(plan["n_ranges"])
+    audio_limit = int(plan["audio_limit"])
+    want_audio = bool(include_audio)
+    audio_probe = plan.get("audio_probe") or {}
+    source_has_audio = audio_probe.get("present")
+    block_reasons = list(plan.get("export_block_reasons") or [])
+    drop_reasons = list(plan.get("audio_drop_reasons") or [])
+    if block_reasons:
+        labels = {
+            "ffmpeg_unavailable": "FFmpeg 不可用",
+        }
+        reason_text = "；".join(
+            labels.get(value, value) for value in block_reasons
+        )
+        raise RuntimeError(
+            f"当前导出不可用（{reason_text}）。"
+            "请在设置中填写 FFmpeg 路径或安装 imageio-ffmpeg。"
+        )
+    # 精混音仅在段数可控时进行（与带音快速滤镜门槛一致）
+    precise_audio_ok = bool(
+        want_audio
+        and n_ranges <= audio_limit
+        and source_has_audio is True
+        and plan.get("ffmpeg_path")
+    )
+    if plan["audio_drop_requires_confirmation"] and not allow_audio_drop:
+        labels = {
+            "too_many_ranges": f"保留段 {n_ranges} 超过安全上限 {audio_limit}",
+            "ffmpeg_unavailable": "FFmpeg 不可用",
+            "audio_probe_inconclusive": "无法确认源片音轨",
+        }
+        reason_text = "；".join(labels.get(value, value) for value in drop_reasons)
+        raise RuntimeError(
+            f"当前导出不能保证保留音频（{reason_text}），只能生成无声视频。"
+            "请关闭“保留音频”，"
+            "或在明确确认后允许无声导出。"
+        )
 
+    _export_progress(
+        progress_cb, 0.0, 0,
+        f"准备导出… 保留 {written_fast}/{total} 帧，{n_ranges} 段"
+        + ("" if want_audio else "，按设置无音"),
+    )
+
+    ffmpeg_bin = plan.get("ffmpeg_path")
+    if not ffmpeg_bin:
+        try:
+            ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "导出需要 FFmpeg；请在设置中填写 FFmpeg 路径或安装 imageio-ffmpeg。"
+            ) from exc
+
+    def _audio_mode_without_mux() -> str:
+        if not want_audio:
+            return "disabled"
+        if source_has_audio is False:
+            return "no_stream"
+        if "too_many_ranges" in drop_reasons:
+            return "skipped_segments"
+        if "ffmpeg_unavailable" in drop_reasons:
+            return "skipped_unavailable"
+        return "skipped_probe"
+
+    def _meta(mode: str) -> dict:
+        return {
+            "audio_mode": mode,
+            "n_ranges": n_ranges,
+            "audio_limit": audio_limit,
+            "timeline_fingerprint": timeline_plan.fingerprint,
+            "audio_drop_reasons": drop_reasons,
+            "audio_probe_status": audio_probe.get("status"),
+            "ffmpeg_path": plan.get("ffmpeg_path"),
+            "ffprobe_path": plan.get("ffprobe_path"),
+        }
+
+    # ---- 路径 A：FFmpeg 滤镜（不占 OpenCV cap）----
+    # 要精混音才带音进 filter；段过多或用户关音频 → 仅视频滤镜 / 或不走 filter
+    if ffmpeg_bin:
+        filter_with_audio = precise_audio_ok
+        reason = (
+            f"尝试 FFmpeg 快速导出（{n_ranges} 段"
+            + ("，含音" if filter_with_audio else "，无精混音")
+            + "）…"
+        )
+        _export_progress(progress_cb, 0.01, 0, reason)
+        if _export_ranges_with_ffmpeg_filters(
+                video_path, output_path, ranges, fps, quality,
+                use_gpu, gpu_encoder, filter_with_audio, progress_cb,
+                ffmpeg_path=ffmpeg_bin, cancel_cb=cancel_cb):
+            mode = "muxed" if precise_audio_ok else _audio_mode_without_mux()
+            return written_fast, total, _meta(mode)
+        _export_progress(
+            progress_cb, 0.05, 0,
+            f"快速路径未用，稳妥逐帧导出中（{n_ranges} 段）…",
+        )
+    # ---- 路径 B：OpenCV 解码 + FFmpeg pipe 编码 ----
+    cap = cv2.VideoCapture(video_path)
     ret, sample = cap.read()
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     if not ret:
         cap.release()
         raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    use_ffmpeg = bool(ffmpeg_bin)
-    video_only_path = output_path + ".video-only.tmp.mp4" if use_ffmpeg else output_path
-    writer_kind = None
+    video_only_path = output_path + ".video-only.tmp.mp4"
+    writer_kind = "ffmpeg"
     ffmpeg_proc = None
-    writer = None
 
-    if use_ffmpeg:
+    try:
+        _export_progress(progress_cb, 0.06, 0, "启动 FFmpeg 编码器（逐帧）…")
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
             video_only_path, fps, w, h, quality,
             use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_bin)
-        writer_kind = "ffmpeg"
-    else:
-        try:
-            import imageio
-            writer = imageio.get_writer(video_only_path, fps=fps, codec='libx264',
-                                        quality=quality, pixelformat='yuv420p')
-            writer_kind = "imageio"
-        except ImportError:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(video_only_path, fourcc, fps, (w, h))
-            writer_kind = "cv2"
+    except BaseException:
+        _cleanup_failed_writer_start(
+            cap, video_only_path, writer_kind, None, ffmpeg_proc
+        )
+        raise
 
     written = 0
+    video_writer_completed = False
     try:
         idx = 0
         while idx < total:
+            _check_export_cancel(cancel_cb)
             if to_del[idx]:
                 next_keep = idx + 1
                 while next_keep < total and to_del[next_keep]:
@@ -1352,124 +2077,264 @@ def export_video(video_path: str, output_path: str, to_del,
 
             ret, frame = cap.read()
             if not ret:
-                break
-            if writer_kind == "ffmpeg":
-                if ffmpeg_proc is None:
-                    raise RuntimeError("FFmpeg 写入器未初始化")
-                ffmpeg_proc.stdin.write(frame.tobytes())
-            elif writer_kind == "imageio":
-                if writer is None:
-                    raise RuntimeError("imageio 写入器未初始化")
-                writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            else:
-                if writer is None:
-                    raise RuntimeError("OpenCV 写入器未初始化")
-                writer.write(frame)
+                raise RuntimeError(
+                    f"视频在源帧 {idx} 处提前结束，"
+                    f"时间线仍需读取到源帧 {total - 1}"
+                )
+            if ffmpeg_proc is None:
+                raise RuntimeError("FFmpeg 写入器未初始化")
+            ffmpeg_proc.stdin.write(frame.tobytes())
             written += 1
             idx += 1
             if progress_cb and written % 60 == 0:
-                progress_cb(idx / total, written)
+                _export_progress(
+                    progress_cb,
+                    min(0.95, idx / max(1, total)),
+                    written,
+                    f"逐帧写入 {written} 帧（源进度 {int(100 * idx / max(1, total))}%）…",
+                )
+        _close_video_writer(
+            writer_kind, None, ffmpeg_proc, cancel_cb=cancel_cb
+        )
+        video_writer_completed = True
     finally:
         cap.release()
-        try:
-            _close_video_writer(writer_kind, writer, ffmpeg_proc)
-        except Exception:
-            # 编码器关闭失败（ffmpeg 非零退出/超时）：仍需清理临时文件再向上抛错。
-            if use_ffmpeg and video_only_path != output_path and os.path.isfile(video_only_path):
+        if not video_writer_completed:
+            try:
+                _abort_video_writer(writer_kind, None, ffmpeg_proc)
+            except BaseException:
+                # Preserve the export/cancellation error; cleanup is best effort.
+                pass
+            if os.path.isfile(video_only_path):
                 try:
                     os.remove(video_only_path)
                 except OSError:
                     pass
-            raise
 
-    if use_ffmpeg:
-        try:
-            _mux_audio_for_ranges(
+    audio_mode = "none"
+    try:
+        if not want_audio:
+            _export_progress(
+                progress_cb, 0.97, written,
+                "按设置跳过音频，封装无音视频…",
+            )
+            os.replace(video_only_path, output_path)
+            audio_mode = "disabled"
+        elif not precise_audio_ok:
+            audio_mode = _audio_mode_without_mux()
+            status = {
+                "no_stream": "源片无音轨，封装无音视频…",
+                "skipped_segments": (
+                    f"保留段过多({n_ranges}>{audio_limit})，跳过精混音…"
+                ),
+                "skipped_probe": "音轨探测未通过，按确认结果导出无音视频…",
+            }.get(audio_mode, "按确认结果导出无音视频…")
+            _export_progress(progress_cb, 0.97, written, status)
+            print(
+                f"[analyzer] skip precise audio mux: mode={audio_mode}; "
+                f"reasons={drop_reasons}",
+                flush=True,
+            )
+            _check_export_cancel(cancel_cb)
+            os.replace(video_only_path, output_path)
+        else:
+            _export_progress(
+                progress_cb, 0.97, written,
+                f"混音中…（共 {n_ranges} 段）",
+            )
+            audio_mode = _mux_audio_for_ranges(
                 video_path, video_only_path, output_path, ranges, fps,
-                ffmpeg_path=ffmpeg_bin)
-        finally:
-            # 混流结束（无论成功失败）都要回收 video-only 临时文件。
-            if video_only_path != output_path and os.path.isfile(video_only_path):
+                ffmpeg_path=ffmpeg_bin, progress_cb=progress_cb,
+                source_has_audio=True, cancel_cb=cancel_cb,
+            )
+    finally:
+        if os.path.isfile(video_only_path):
+            try:
+                os.remove(video_only_path)
+            except OSError:
+                pass
+
+    _export_progress(progress_cb, 1.0, written, f"完成 {written}/{total} 帧")
+    return written, total, _meta(audio_mode)
+
+
+def export_video(video_path: str, output_path: str, to_del,
+                 fps: float, quality: int, progress_cb=None,
+                 use_gpu: bool = False, gpu_encoder: str = "",
+                 ffmpeg_path: str | None = None,
+                 ffprobe_path: str | None = None,
+                 include_audio: bool = True,
+                 allow_audio_drop: bool = False,
+                 cancel_cb=None,
+                 commit_cb=None,
+                 preflight: dict | None = None):
+    """Export atomically, preserving an existing destination on failure."""
+    if os.path.normcase(os.path.realpath(video_path)) == os.path.normcase(
+        os.path.realpath(output_path)
+    ):
+        raise ValueError("export destination must not replace the source video")
+    if preflight is not None and preflight.get("ffmpeg_path"):
+        ffmpeg_bin = str(preflight["ffmpeg_path"])
+    else:
+        try:
+            ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "导出需要 FFmpeg；请在设置中填写 FFmpeg 路径或安装 imageio-ffmpeg。"
+            ) from exc
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    prefix = f".{os.path.basename(output_path)}."
+    output_ext = os.path.splitext(output_path)[1] or ".mp4"
+    fd, staging_path = tempfile.mkstemp(
+        prefix=prefix,
+        suffix=f".partial{output_ext}",
+        dir=output_dir,
+    )
+    os.close(fd)
+    video_only_staging = staging_path + ".video-only.tmp.mp4"
+    try:
+        try:
+            os.remove(staging_path)
+        except OSError:
+            pass
+        result = _export_video_impl(
+            video_path,
+            staging_path,
+            to_del,
+            fps,
+            quality,
+            progress_cb,
+            use_gpu=use_gpu,
+            gpu_encoder=gpu_encoder,
+            ffmpeg_path=ffmpeg_bin,
+            ffprobe_path=(
+                str(preflight["ffprobe_path"])
+                if preflight is not None and preflight.get("ffprobe_path")
+                else ffprobe_path
+            ),
+            include_audio=include_audio,
+            allow_audio_drop=allow_audio_drop,
+            cancel_cb=cancel_cb,
+            preflight=preflight,
+        )
+        _check_export_cancel(cancel_cb)
+        if not os.path.isfile(staging_path) or os.path.getsize(staging_path) <= 0:
+            raise RuntimeError("导出器未生成有效的临时输出文件")
+        if commit_cb is None:
+            os.replace(staging_path, output_path)
+        else:
+            commit_cb(staging_path, output_path)
+        return result
+    finally:
+        for candidate in (staging_path, video_only_staging):
+            if os.path.isfile(candidate):
                 try:
-                    os.remove(video_only_path)
+                    os.remove(candidate)
                 except OSError:
                     pass
-    return written, total
 
 
 def export_ranges(video_path: str, output_path: str, ranges: list,
                   fps: float, quality: int, progress_cb=None,
-                  use_gpu: bool = False, gpu_encoder: str = "",
-                  ffmpeg_path: str | None = None):
+                   use_gpu: bool = False, gpu_encoder: str = "",
+                   ffmpeg_path: str | None = None,
+                   ffprobe_path: str | None = None,
+                   cancel_cb=None):
+    """Export source-frame ranges using strict half-open intervals.
+
+    ``ranges`` is normalized through :class:`TimelinePlan` so callers cannot
+    accidentally mix the historical inclusive ``end`` convention with the
+    rest of the application.  Adjacent/overlapping ranges are equivalent to
+    their union and are emitted once.
+    """
     if not ranges:
         return 0, 0
+    _check_export_cancel(cancel_cb)
 
-    exclusive_ranges = [(start, end + 1) for start, end in ranges]
-    total_frames_to_export = sum(end - start for start, end in exclusive_ranges)
+    try:
+        max_end = max(int(pair[1]) for pair in ranges)
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError("ranges must contain half-open (start, end) pairs") from exc
+    if max_end <= 0:
+        return 0, 0
+    range_plan = TimelinePlan.from_kept_ranges(max_end, ranges)
+    exclusive_ranges = list(range_plan.kept_ranges)
+    total_frames_to_export = range_plan.kept_frames
+    if not exclusive_ranges or total_frames_to_export <= 0:
+        return 0, 0
     try:
         ffmpeg_bin = resolve_ffmpeg_path(ffmpeg_path)
-    except FileNotFoundError:
-        ffmpeg_bin = None
-    if ffmpeg_bin and _export_ranges_with_ffmpeg_filters(
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "分段导出需要 FFmpeg；请在设置中填写 FFmpeg 路径或安装 imageio-ffmpeg。"
+        ) from exc
+    if _export_ranges_with_ffmpeg_filters(
             video_path, output_path, exclusive_ranges, fps, quality,
-            use_gpu, gpu_encoder, False, progress_cb, ffmpeg_path=ffmpeg_bin):
+            use_gpu, gpu_encoder, False, progress_cb,
+            ffmpeg_path=ffmpeg_bin, cancel_cb=cancel_cb):
         return total_frames_to_export, total_frames_to_export
 
     cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, ranges[0][0])
+    first_start = exclusive_ranges[0][0]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, first_start)
     ret, sample = cap.read()
     if not ret:
         cap.release()
         raise RuntimeError("无法读取视频帧")
     h, w = sample.shape[:2]
-    cap.set(cv2.CAP_PROP_POS_FRAMES, ranges[0][0])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, first_start)
 
-    writer_kind = None
+    writer_kind = "ffmpeg"
     ffmpeg_proc = None
-    writer = None
-    if ffmpeg_bin:
+    try:
         ffmpeg_proc = _open_ffmpeg_pipe_writer(
             output_path, fps, w, h, quality,
             use_gpu=use_gpu, gpu_encoder=gpu_encoder, ffmpeg_path=ffmpeg_bin)
-        writer_kind = "ffmpeg"
-    else:
-        try:
-            import imageio
-            writer = imageio.get_writer(output_path, fps=fps, codec='libx264',
-                                        quality=quality, pixelformat='yuv420p')
-            writer_kind = "imageio"
-        except ImportError:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-            writer_kind = "cv2"
+    except BaseException:
+        _cleanup_failed_writer_start(
+            cap, output_path, writer_kind, None, ffmpeg_proc
+        )
+        raise
 
     written = 0
+    completed = False
     try:
-        for start, end in ranges:
+        for start, end in exclusive_ranges:
+            _check_export_cancel(cancel_cb)
             if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) != start:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            for _ in range(start, end + 1):
+            for offset in range(end - start):
+                _check_export_cancel(cancel_cb)
                 ret, frame = cap.read()
                 if not ret:
-                    break
-                if writer_kind == "ffmpeg":
-                    if ffmpeg_proc is None:
-                        raise RuntimeError("FFmpeg 写入器未初始化")
-                    ffmpeg_proc.stdin.write(frame.tobytes())
-                elif writer_kind == "imageio":
-                    if writer is None:
-                        raise RuntimeError("imageio 写入器未初始化")
-                    writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                else:
-                    if writer is None:
-                        raise RuntimeError("OpenCV 写入器未初始化")
-                    writer.write(frame)
+                    raise RuntimeError(
+                        f"视频在源帧 {start + offset} 处提前结束，"
+                        f"需要读取区间 [{start}, {end})"
+                    )
+                if ffmpeg_proc is None:
+                    raise RuntimeError("FFmpeg 写入器未初始化")
+                ffmpeg_proc.stdin.write(frame.tobytes())
                 written += 1
                 if progress_cb and written % 30 == 0:
                     progress_cb(written / total_frames_to_export, written)
+                _check_export_cancel(cancel_cb)
+        _close_video_writer(
+            writer_kind, None, ffmpeg_proc, cancel_cb=cancel_cb
+        )
+        completed = True
     finally:
         cap.release()
-        _close_video_writer(writer_kind, writer, ffmpeg_proc)
+        if not completed:
+            try:
+                _abort_video_writer(writer_kind, None, ffmpeg_proc)
+            except BaseException:
+                # Preserve the export/cancellation error; cleanup is best effort.
+                pass
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
     return written, total_frames_to_export
 
 
@@ -1506,26 +2371,72 @@ def _spawn_ffmpeg_pipe(cmd: list[str]):
     return _FFmpegPipe(process, stderr_file)
 
 
-def _close_video_writer(writer_kind, writer, ffmpeg_proc):
+def _abort_video_writer(writer_kind, writer, ffmpeg_proc) -> None:
+    """Abort a partially initialized/active writer without blocking on flush."""
     if writer_kind == "ffmpeg" and ffmpeg_proc:
+        # A buffered stdin.close() may flush and block while FFmpeg is still
+        # alive.  Stop the consumer first, then discard the pipe resources.
+        _terminate_process(ffmpeg_proc.process)
+        try:
+            ffmpeg_proc.stdin.close()
+        except (OSError, RuntimeError, ValueError):
+            pass
+        try:
+            ffmpeg_proc.stderr_file.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _cleanup_failed_writer_start(
+    cap, output_path: str, writer_kind, writer, ffmpeg_proc
+) -> None:
+    """Release startup resources and discard an encoder's partial artifact."""
+    try:
+        _abort_video_writer(writer_kind, writer, ffmpeg_proc)
+    except BaseException:
+        # Preserve the writer-start exception; cleanup is best effort.
+        pass
+    try:
+        cap.release()
+    except BaseException:
+        pass
+    if os.path.isfile(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+
+
+def _close_video_writer(writer_kind, writer, ffmpeg_proc, cancel_cb=None):
+    if writer_kind == "ffmpeg" and ffmpeg_proc:
+        stderr_file = ffmpeg_proc.stderr_file
+        try:
+            _check_export_cancel(cancel_cb)
+        except BaseException:
+            _abort_video_writer(writer_kind, writer, ffmpeg_proc)
+            raise
         try:
             ffmpeg_proc.stdin.close()
         except OSError:
             pass
-        stderr_file = ffmpeg_proc.stderr_file
         timed_out = False
         try:
-            returncode = ffmpeg_proc.process.wait(timeout=1800)
-        except subprocess.TimeoutExpired:
-            # 超时：发 kill 后再限时回收，避免 kill 仍不返回时无限阻塞。
-            ffmpeg_proc.process.kill()
-            try:
-                returncode = ffmpeg_proc.process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                # 进程拒绝退出：不再死等，按超时处理并尽量回收 stderr。
-                returncode = -1
-            timed_out = True
-        try:
+            deadline = time.monotonic() + 1800.0
+            while True:
+                try:
+                    _check_export_cancel(cancel_cb)
+                except BaseException:
+                    _abort_video_writer(writer_kind, writer, ffmpeg_proc)
+                    raise
+                try:
+                    returncode = ffmpeg_proc.process.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        _terminate_process(ffmpeg_proc.process)
+                        returncode = -1
+                        timed_out = True
+                        break
             stderr_file.seek(0)
             err = stderr_file.read()
         finally:
@@ -1534,7 +2445,3 @@ def _close_video_writer(writer_kind, writer, ffmpeg_proc):
             raise RuntimeError("ffmpeg 编码超时")
         if returncode != 0:
             raise RuntimeError(f"ffmpeg 编码失败: {err.decode('utf-8', errors='ignore')}")
-    elif writer_kind == "imageio" and writer:
-        writer.close()
-    elif writer_kind == "cv2" and writer:
-        writer.release()

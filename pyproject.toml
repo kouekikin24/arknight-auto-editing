@@ -7,7 +7,7 @@ dependencies = [
     "numpy",
     "opencv-python",
     "pillow",
-    "imageio",
+    "imageio-ffmpeg",
 ]
 
 [project.optional-dependencies]

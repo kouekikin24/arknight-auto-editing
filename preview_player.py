@@ -6,24 +6,171 @@ import cv2
 import numpy as np
 import PIL.Image
 import PIL.ImageTk
-import threading
-import subprocess
-import shutil
 import os
-import concurrent.futures
+import tempfile
+import time
+from pathlib import Path
 from queue import Queue, Empty
 
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
                          FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
 from video_io import VideoIOThread, CMD_SEEK, CMD_SEEK_LATEST, CMD_PLAY, CMD_STOP
 from timeline_widget import TimelineWidget
+from timeline_plan import TimelinePlan
+from media_exporter import ExportRequest, ExportResult, MediaExporter
+from task_manager import TaskCancelled, TaskContext, TaskHandle, TaskManager
+from project_state import ProjectState
+from edit_commands import SetClipBounds, SetPauseMaskRun, SetPauseMode
+
+
+_ANALYSIS_TASK = "player.analysis"
+_MEDIA_INFO_TASK = "player.media_info"
+_FRAME_PTS_TASK = "player.frame_pts_certification"
+_EXPORT_TASK = "player.export.full"
+_SEGMENT_EXPORT_TASK = "player.export.segments"
+
+
+def _run_analysis_task(context: TaskContext, snapshot: dict) -> tuple:
+    """Run video analysis without touching Tk or mutable player state."""
+    import analyzer
+
+    video_path = snapshot["video_path"]
+    proc_res = list(snapshot["proc_res"])
+    context.checkpoint()
+
+    cap_tmp = cv2.VideoCapture(video_path)
+    try:
+        ret, first_frame = cap_tmp.read()
+    finally:
+        cap_tmp.release()
+    if ret and proc_res[1] == 225:
+        height, width = first_frame.shape[:2]
+        proc_res[1] = int(proc_res[0] * height / width)
+    proc_res = tuple(proc_res)
+
+    context.checkpoint()
+    configs, loaded = analyzer.load_templates(proc_res)
+    context.checkpoint()
+
+    backend_key = snapshot["backend_key"]
+    backend_label = snapshot["backend_label"]
+    ffmpeg_path = snapshot.get("ffmpeg_path")
+
+    def progress(ratio):
+        context.checkpoint()
+        context.report((backend_label, float(ratio)))
+
+    print(
+        f"[analyze] decode_backend={backend_key} "
+        f"ffmpeg_path={ffmpeg_path or 'auto'} "
+        f"proc_res={proc_res} video={video_path}"
+    )
+    backend_note = snapshot.get("backend_note") or ""
+    if backend_note:
+        print(f"[analyze] {backend_note}", flush=True)
+
+    states, diffs, analysis_context = analyzer.analyze_video_with_context(
+        video_path,
+        configs,
+        snapshot["thresholds"],
+        proc_res,
+        snapshot["batch"],
+        snapshot["threads"],
+        progress,
+        decode_backend=backend_key,
+        ffmpeg_path=ffmpeg_path,
+    )
+    context.checkpoint()
+    pauses, speeds = analyzer.build_segments(
+        states,
+        diffs,
+        video_path,
+        proc_res,
+        snapshot["compare"],
+        snapshot["fps"],
+        progress,
+        analysis_context=analysis_context,
+    )
+    context.checkpoint()
+    used_context = analyzer.analysis_context_skips_second_scan(
+        analysis_context, pauses, len(states)
+    )
+    print(
+        f"[analyze] context complete="
+        f"{analysis_context.get('complete') if isinstance(analysis_context, dict) else None} "
+        f"L={len(states)} pause_boundary_records="
+        f"{len(analysis_context.get('pause_boundary_diffs') or []) if isinstance(analysis_context, dict) else 0} "
+        f"skip_second_scan={used_context}",
+        flush=True,
+    )
+    return (
+        states,
+        diffs,
+        pauses,
+        speeds,
+        backend_label,
+        used_context,
+        loaded == 0,
+    )
+
+
+def _run_media_info_task(context: TaskContext, snapshot: dict):
+    """Probe one immutable source snapshot without touching Tk state."""
+    import media_info
+
+    context.checkpoint()
+    result = media_info.probe_media(
+        snapshot["video_path"],
+        ffprobe_path=snapshot.get("ffprobe_path"),
+        ffmpeg_path=snapshot.get("ffmpeg_path"),
+    )
+    context.checkpoint()
+    return result
+
+
+def _run_frame_pts_certification_task(context: TaskContext, snapshot: dict):
+    """Build a source-scoped certification without touching Tk state."""
+    import frame_pts_certifier
+
+    context.checkpoint()
+    result = frame_pts_certifier.produce_frame_pts_certification(
+        snapshot["media_info"],
+        evidence_path=snapshot.get("evidence_path"),
+        cache_root=snapshot.get("cache_root"),
+        checkpoint=context.checkpoint,
+        publish_commit=context.commit,
+    )
+    context.checkpoint()
+    return result
 
 
 class VideoPreviewPlayer(tk.Frame):
-    def __init__(self, parent, settings, video_path=None, width=800, height=450):
+    def __init__(
+        self,
+        parent,
+        settings,
+        video_path=None,
+        width=800,
+        height=450,
+        *,
+        task_manager: TaskManager | None = None,
+    ):
         super().__init__(parent)
         self.settings = settings
+        inherited_tasks = getattr(settings, "task_manager", None)
+        self._owns_task_manager = task_manager is None and inherited_tasks is None
+        self.task_manager = task_manager or inherited_tasks or TaskManager(self)
+        self._analysis_handle: TaskHandle | None = None
+        self._media_info_handle: TaskHandle | None = None
+        self._frame_pts_handle: TaskHandle | None = None
+        self._export_handle: TaskHandle | None = None
+        self._segment_export_handle: TaskHandle | None = None
+        self._closing = False
         self.video_path = video_path
+        self.media_info = None
+        self.media_info_error: Exception | None = None
+        self.frame_pts_error: Exception | None = None
+        self.frame_pts_status: str | None = None
 
         self.total_frames: int = 0
         self.fps: float = 30.0
@@ -35,19 +182,61 @@ class VideoPreviewPlayer(tk.Frame):
         self.pause_segments: list = []
         self.speed_segments: list = []
         self.clip_segments: list = []
+        self.project_state = ProjectState()
+        self.task_manager.invalidate_scope(
+            project_generation=self.project_state.project_generation,
+            timeline_revision=self.project_state.timeline_revision,
+        )
         self.states_array = None
         self.diffs_array = None  # 新增：持久化保存帧差异，用于随时根据新参数重算裁剪区
 
+        # Edits are mutable dictionaries for legacy UI compatibility, so keep
+        # an explicit revision and cache only the immutable cut-only plan used
+        # by frequent seek/play commands.  Export plans with speed policies
+        # are built separately from their explicit settings snapshot.
+        self._timeline_revision: int = self.project_state.timeline_revision
+        self._cut_plan_cache: tuple[int, TimelinePlan] | None = None
+
         self.is_playing = False
         self._io: VideoIOThread | None = None
-        self._frame_q: Queue = Queue(maxsize=2)
+        # 略大于 2：解码偶发尖峰时少丢帧；渲染侧仍只取最新一帧
+        self._frame_q: Queue = Queue(maxsize=4)
         self._canvas_img_id = None
+        # T1-3：复用同一个 PhotoImage，避免每帧 Tcl 分配/释放
+        self._photo = None
+        self._photo_size: tuple[int, int] = (0, 0)
 
         self._key_held: str | None = None
         self._key_after_id: str | None = None
         self._key_hold_fired: bool = False
         self._key_preview_id: str | None = None
+        self._render_after_id: str | None = None
+        self._bind_after_id: str | None = None
+        self._perf_after_id: str | None = None
         self._is_dragging: bool = False
+        # 预览流畅度量化：最近一次完整播放段的快照（停播时冻结，便于抄数对比）
+        self._perf_last: dict | None = None
+        self._perf_ui_tick: int = 0
+        self._last_display_mono: float | None = None
+        self._ui_gap_ms_max: float = 0.0
+        self._ui_frames: int = 0
+        self._ui_gap_ms_sum: float = 0.0
+        self._ui_stutter_n: int = 0  # 显示间隔 > 1.8×理想间隔
+        # 倍率标定 V1/V2
+        self._calib_after_id: str | None = None
+        self._calib_active: bool = False
+        self._calib_t0: float | None = None
+        self._calib_f0: int = 0
+        self._calib_ignore: bool = False
+        self._calib_mode: str = ""  # single | pair_a | pair_b
+        self._calib_pair_anchor: int = 0
+        self._calib_last_line: str = ""
+        self._calib_pair_lines: list[str] = []
+        # scheme B: auto rate on normal stop
+        self._auto_rate_t0: float | None = None
+        self._auto_rate_f0: int = 0
+        self._auto_rate_ignore: bool = False
+        self._AUTO_RATE_MIN_S = 3.0
 
         self._setup_ui()
         if video_path: self.load_video(video_path)
@@ -69,6 +258,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline.pack(fill=tk.X, padx=10)
         self.timeline.on_seek_cb = self._on_tl_seek
         self.timeline.on_handle_end_cb = self._on_tl_drag_end
+        self.timeline.on_edit_cb = self._on_timeline_edit
         self.timeline.canvas.bind("<Button-1>", lambda e: self.video_canvas.focus_set(), add='+')
 
         ctrl = ttk.Frame(self)
@@ -83,12 +273,30 @@ class VideoPreviewPlayer(tk.Frame):
             ctrl, textvariable=self.preview_speed_var,
             values=["0.1x", "0.25x", "0.5x", "1x", "2x", "4x"], width=6, state="readonly")
         speed_combo.pack(side=tk.LEFT, padx=2)
+        speed_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_preview_option_change())
 
         self.btn_analyze = ttk.Button(ctrl, text="自动模板分析", command=self._start_analysis)
         self.btn_analyze.pack(side=tk.LEFT, padx=10)
 
         self.skip_trimmed = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctrl, text="预览时跳过裁剪区", variable=self.skip_trimmed).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            ctrl, text="预览时跳过裁剪区", variable=self.skip_trimmed,
+            command=self._on_preview_option_change,
+        ).pack(side=tk.LEFT, padx=5)
+
+        # 关闭后预览仍按设置对 1x/0.2x 区抽帧加速；勾选后预览只跟上方「倍速」，便于排查卡顿
+        self.preview_ignore_speedup_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ctrl, text="预览忽略业务加速", variable=self.preview_ignore_speedup_var,
+            command=self._on_preview_option_change,
+        ).pack(side=tk.LEFT, padx=5)
+
+        # 默认开优化；取消勾选 / 按 O = #9 式基线（只统计，不追帧软锚）
+        self.preview_opt_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ctrl, text="预览优化", variable=self.preview_opt_var,
+            command=self._on_preview_opt_change,
+        ).pack(side=tk.LEFT, padx=5)
 
         self.lbl_time = ttk.Label(ctrl, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.RIGHT, padx=10)
@@ -96,19 +304,155 @@ class VideoPreviewPlayer(tk.Frame):
         self.lbl_info = ttk.Label(self, text="就绪", foreground="#00CED1", font=("Consolas", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 
-        hint = "← → 逐帧移动  |  空格 播放  |  时间轴：右键点击黄色块手动删除操作，鼠标中键平移"
+        perf_row = ttk.Frame(self)
+        perf_row.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self.lbl_perf = ttk.Label(
+            perf_row,
+            text="流畅度: 播放后显示（迟到率 / 追帧 / 单帧耗时）",
+            foreground="#888888",
+            font=("Consolas", 9),
+        )
+        self.lbl_perf.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(perf_row, text="复制流畅度", width=10, command=self._copy_perf_stats).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(perf_row, text="清零统计", width=8, command=self._reset_perf_stats_ui).pack(
+            side=tk.RIGHT
+        )
+        ttk.Button(perf_row, text="标定10s", width=8, command=self._calib_start_single).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(perf_row, text="对比标定", width=8, command=self._calib_start_pair).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(perf_row, text="复制标定", width=8, command=self._calib_copy).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+
+        calib_row = ttk.Frame(self)
+        calib_row.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self.lbl_calib = ttk.Label(
+            calib_row,
+            text="倍率: 播≥3秒停即显示(跳裁剪不虚高)；也可标定10s/对比",
+            foreground="#888888",
+            font=("Consolas", 9),
+        )
+        self.lbl_calib.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        hint = "← → 逐帧  |  空格 播放  |  O 切换预览优化  |  时间轴：右键黄块 / 中键平移"
         ttk.Label(self, text=hint, foreground="#555555", font=("Consolas", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
 
         self._render_loop()
-        self.after_idle(self._bind_keys)
+        self._bind_after_id = self.after_idle(self._bind_keys)
 
     # ==========================================================
     #  视频加载
     # ==========================================================
+    def close(self, timeout: float = 1.0) -> bool:
+        """Stop UI timers, invalidate analysis, and close the decoder."""
+        if self._closing:
+            io_closed = True
+            if self._io is not None:
+                io_closed = self._io.close(timeout=timeout)
+                if io_closed:
+                    self._io = None
+            survivors = (
+                self.task_manager.close(timeout=timeout)
+                if getattr(self, "_owns_task_manager", False)
+                else []
+            )
+            return io_closed and not survivors
+        self._closing = True
+        self.task_manager.invalidate(_ANALYSIS_TASK)
+        self.task_manager.invalidate(_MEDIA_INFO_TASK)
+        self.task_manager.invalidate(_FRAME_PTS_TASK)
+        self.task_manager.invalidate(_EXPORT_TASK)
+        self.task_manager.invalidate(_SEGMENT_EXPORT_TASK)
+        self._analysis_handle = None
+        self._media_info_handle = None
+        self._frame_pts_handle = None
+        self._export_handle = None
+        self._segment_export_handle = None
+        self.is_playing = False
+        self._key_held = None
+        self._calib_active = False
+
+        for attr in (
+            "_render_after_id",
+            "_bind_after_id",
+            "_key_after_id",
+            "_key_preview_id",
+            "_calib_after_id",
+            "_perf_after_id",
+        ):
+            after_id = getattr(self, attr, None)
+            if after_id is not None:
+                try:
+                    self.after_cancel(after_id)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+        io_thread = self._io
+        if io_thread is None:
+            io_closed = True
+        else:
+            io_closed = io_thread.close(timeout=timeout)
+            if io_closed:
+                self._io = None
+        while True:
+            try:
+                self._frame_q.get_nowait()
+            except Empty:
+                break
+
+        if getattr(self, "_owns_task_manager", False):
+            survivors = self.task_manager.close(timeout=timeout)
+            return io_closed and not survivors
+        return io_closed
+
+    def destroy(self):
+        self.close(timeout=1.0)
+        super().destroy()
+
+    def _invalidate_analysis_for_reload(self) -> None:
+        """Make every result from the previous source video stale."""
+        self.task_manager.invalidate(_ANALYSIS_TASK)
+        self.task_manager.invalidate(_MEDIA_INFO_TASK)
+        self.task_manager.invalidate(_FRAME_PTS_TASK)
+        self.task_manager.invalidate(_EXPORT_TASK)
+        self.task_manager.invalidate(_SEGMENT_EXPORT_TASK)
+        self._analysis_handle = None
+        self._media_info_handle = None
+        self._frame_pts_handle = None
+        self._export_handle = None
+        self._segment_export_handle = None
+        try:
+            self.btn_analyze.config(state=tk.NORMAL, text="鑷姩妯℃澘鍒嗘瀽")
+        except Exception:
+            pass
+        for attr in ("export_btn", "segment_export_btn"):
+            button = getattr(self.settings, attr, None)
+            if button is not None:
+                try:
+                    button.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+
     def load_video(self, path: str):
-        if self._io and self._io.is_alive():
-            self._io.stop_and_quit()
+        if self._closing:
+            return
+        self._invalidate_analysis_for_reload()
+        if self._io is not None:
+            old_io = self._io
             self._io = None
+            if not old_io.close(timeout=1.0):
+                self._io = old_io
+                print(
+                    f"[video-io] close timeout while replacing {old_io.path!r}",
+                    flush=True,
+                )
+                return False
         while True:
             try:
                 self._frame_q.get_nowait()
@@ -116,17 +460,30 @@ class VideoPreviewPlayer(tk.Frame):
                 break
 
         self.video_path = path
+        self.media_info = None
+        self.media_info_error = None
+        self.frame_pts_error = None
+        self.frame_pts_status = None
         self.total_frames = 0
         self.fps = 30.0
         self.current_frame_idx = 0
-        self.pause_segments.clear()
-        self.speed_segments.clear()
-        self.clip_segments.clear()
+        # A new source starts a new project generation.  Publish fresh lists
+        # instead of clearing the lists still referenced by the old timeline.
+        with self.task_manager.scope_transition():
+            project_snapshot = self.project_state.replace_project()
+            self.task_manager.invalidate_scope(
+                project_generation=project_snapshot.project_generation,
+                timeline_revision=project_snapshot.timeline_revision,
+            )
+        self._publish_project_snapshot(project_snapshot)
         self.states_array = None
         self.diffs_array = None
+        self._cut_plan_cache = None
         self.is_playing = False
         self.btn_play.config(text="▶ 播放")
         self._canvas_img_id = None
+        self._photo = None
+        self._photo_size = (0, 0)
         self.timeline.selected_pause_id = None
         self.settings.set_selected_pause(None, "")
 
@@ -139,9 +496,6 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline.fps = self.fps
         self.timeline.zoom_level = 1.0
         self.timeline.scroll_offset = 0.0
-        self.timeline.pause_segments = self.pause_segments
-        self.timeline.speed_segments = self.speed_segments
-        self.timeline.clip_segments = self.clip_segments
         self.timeline.current_frame_idx = 0
         self.timeline.mark_dirty()
 
@@ -151,6 +505,128 @@ class VideoPreviewPlayer(tk.Frame):
 
         self._seek(0)
         self.timeline.redraw()
+        self._start_media_info_probe()
+        return True
+
+    def _start_media_info_probe(self) -> None:
+        """Probe the current source; missing PTS certification remains blocking."""
+        if self._closing or not self.video_path:
+            return
+
+        try:
+            params = self.settings.get_params()
+        except Exception:
+            params = {}
+        source_path = str(Path(self.video_path).expanduser().resolve())
+        project_generation, _timeline_revision = self._task_scope()
+        snapshot = {
+            "video_path": source_path,
+            "ffprobe_path": params.get("ffprobe_path"),
+            "ffmpeg_path": params.get("ffmpeg_path"),
+            "frame_pts_evidence_path": params.get("frame_pts_evidence_path"),
+            "frame_pts_cache_root": params.get("frame_pts_cache_root"),
+        }
+
+        def on_success(result) -> None:
+            if self._closing:
+                return
+            if Path(result.source_path).resolve() != Path(source_path):
+                return
+            source_is_current = getattr(result, "source_is_current", None)
+            if callable(source_is_current) and not source_is_current():
+                return
+            self.media_info = result
+            self.media_info_error = None
+            self.frame_pts_error = None
+            self.frame_pts_status = "PENDING"
+            self._start_frame_pts_certification(result, snapshot)
+
+        def on_error(exc: BaseException) -> None:
+            if self._closing:
+                return
+            self.media_info = None
+            self.media_info_error = exc
+            self.frame_pts_error = None
+            self.frame_pts_status = None
+            print(
+                f"[media-info] probe blocked for {source_path}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+        def on_done(_status) -> None:
+            self._media_info_handle = None
+
+        try:
+            self._media_info_handle = self.task_manager.submit(
+                _MEDIA_INFO_TASK,
+                lambda context: _run_media_info_task(context, snapshot),
+                on_success=on_success,
+                on_error=on_error,
+                on_done=on_done,
+                project_generation=project_generation,
+                timeline_revision=None,
+                replace=True,
+            )
+        except RuntimeError as exc:
+            self.media_info_error = exc
+            self._media_info_handle = None
+
+    def _start_frame_pts_certification(
+        self,
+        media_snapshot,
+        probe_snapshot: dict | None = None,
+    ) -> None:
+        """Certify the current source; timeline edits do not cancel this task."""
+        if self._closing or not self.video_path:
+            return
+        source_path = str(Path(self.video_path).expanduser().resolve())
+        if Path(getattr(media_snapshot, "source_path", "")).resolve() != Path(source_path):
+            return
+        project_generation, _timeline_revision = self._task_scope()
+        params = probe_snapshot or {}
+        snapshot = {
+            "media_info": media_snapshot,
+            "evidence_path": params.get("frame_pts_evidence_path"),
+            "cache_root": params.get("frame_pts_cache_root"),
+        }
+
+        def on_success(result) -> None:
+            if self._closing or Path(self.video_path).resolve() != Path(source_path):
+                return
+            self.media_info = result.media_info
+            self.frame_pts_status = result.status
+            if result.status == "PASS":
+                self.frame_pts_error = None
+            else:
+                self.frame_pts_error = RuntimeError(
+                    "frame PTS certification blocked: "
+                    + ", ".join(result.reason_codes)
+                )
+
+        def on_error(exc: BaseException) -> None:
+            if self._closing or Path(self.video_path).resolve() != Path(source_path):
+                return
+            self.frame_pts_status = "ERROR"
+            self.frame_pts_error = exc
+
+        def on_done(_status) -> None:
+            self._frame_pts_handle = None
+
+        try:
+            self._frame_pts_handle = self.task_manager.submit(
+                _FRAME_PTS_TASK,
+                lambda context: _run_frame_pts_certification_task(context, snapshot),
+                on_success=on_success,
+                on_error=on_error,
+                on_done=on_done,
+                project_generation=project_generation,
+                timeline_revision=None,
+                replace=True,
+            )
+        except RuntimeError as exc:
+            self.frame_pts_status = "ERROR"
+            self.frame_pts_error = exc
 
     # ==========================================================
     #  IO 线程命令封装
@@ -163,44 +639,128 @@ class VideoPreviewPlayer(tk.Frame):
     def _speed_segs_snap(self) -> list:
         return [(s['start'], s['end'], s['type']) for s in self.speed_segments]
 
-    def _all_skip_segs_snap(self) -> list:
-        segs = []
-        for s in self.pause_segments:
-            mode = s.get('mode', 'auto')
-            start = s['start']
-            if mode == 'all':
-                segs.append((start, s['end'] + 1))
-            elif mode == 'auto' and 'local_del_mask' in s:
-                mask = s['local_del_mask']
-                is_del = False
-                del_start = 0
-                for i in range(len(mask)):
-                    delete_this = (mask[i] == 1 or mask[i] == 2)
-                    if delete_this and not is_del:
-                        is_del = True
-                        del_start = start + i
-                    elif not delete_this and is_del:
-                        is_del = False
-                        segs.append((del_start, start + i))
-                if is_del:
-                    segs.append((del_start, start + len(mask)))
+    def _task_scope(self) -> tuple[int, int]:
+        state = getattr(self, "project_state", None)
+        if state is None:
+            # Some isolated integration tests construct a legacy player stub.
+            # Real player instances always initialize ProjectState in __init__.
+            return 0, int(getattr(self, "_timeline_revision", 0))
+        snapshot = state.snapshot()
+        return snapshot.project_generation, snapshot.timeline_revision
 
-        for s in self.clip_segments:
-            ki, ko = s['keep_in'], s['keep_out']
-            if ki > ko:
-                segs.append((s['start'], s['end'] + 1))
-            else:
-                if ki > s['start']: segs.append((s['start'], ki))
-                if ko < s['end']: segs.append((ko + 1, s['end'] + 1))
-        return segs
+    def _invalidate_derived_timeline_plan(self) -> None:
+        """Discard derived plan data without changing the edit revision."""
+        self._cut_plan_cache = None
+
+    def _publish_project_snapshot(self, snapshot) -> None:
+        """Publish detached compatibility views from the authoritative owner."""
+        self.pause_segments, self.speed_segments, self.clip_segments = (
+            snapshot.mutable_segments()
+        )
+        self._timeline_revision = snapshot.timeline_revision
+        self._cut_plan_cache = None
+        timeline = getattr(self, "timeline", None)
+        if timeline is not None:
+            (
+                timeline.pause_segments,
+                timeline.speed_segments,
+                timeline.clip_segments,
+            ) = snapshot.mutable_segments()
+
+    def _apply_project_command(self, command) -> None:
+        """Apply an immutable edit command and refresh all legacy render views."""
+        self._apply_project_commands((command,))
+
+    def _apply_project_commands(self, commands) -> None:
+        """Apply a batch of owner-side commands, then publish one snapshot."""
+        pending = tuple(commands)
+        if not pending:
+            return
+        with self.task_manager.scope_transition():
+            snapshot = self.project_state.apply_many(pending)
+            self.task_manager.invalidate_scope(
+                project_generation=snapshot.project_generation,
+                timeline_revision=snapshot.timeline_revision,
+            )
+        self._publish_project_snapshot(snapshot)
+        self.timeline.mark_dirty()
+        self.timeline.redraw()
+
+    def _on_timeline_edit(self, command) -> None:
+        """Apply the immutable command emitted by TimelineWidget."""
+        if not isinstance(command, (SetPauseMaskRun, SetClipBounds, SetPauseMode)):
+            raise TypeError("timeline edits must be immutable EditCommand values")
+        self._apply_project_command(command)
+        # Clip drag completion already routes through _on_tl_drag_end, while
+        # right-click mask edits have no separate mouse-up command.
+        if isinstance(command, SetPauseMaskRun) and self.is_playing:
+            self._send_play(self.current_frame_idx)
+
+    def _build_timeline_plan(self, *, states=None,
+                             speedup_1x: bool = False,
+                             speedup_02: bool = False,
+                             speedup_02_factor: int = 1):
+        """Snapshot all mutable edit dictionaries into a validated plan."""
+        import analyzer
+
+        cacheable = (
+            states is None
+            and not speedup_1x
+            and not speedup_02
+            and speedup_02_factor == 1
+        )
+        if cacheable and self._cut_plan_cache is not None:
+            cached_revision, cached_plan = self._cut_plan_cache
+            if cached_revision == self._timeline_revision:
+                return cached_plan
+
+        state = getattr(self, "project_state", None)
+        if state is None:
+            pause_segments = self.pause_segments
+            speed_segments = self.speed_segments
+            clip_segments = self.clip_segments
+        else:
+            owner_snapshot = state.snapshot()
+            pause_segments, speed_segments, clip_segments = (
+                owner_snapshot.mutable_segments()
+            )
+            self._timeline_revision = owner_snapshot.timeline_revision
+
+        if states is None:
+            states = (
+                self.states_array
+                if self.states_array is not None
+                else np.zeros(self.total_frames, dtype=np.int8)
+            )
+        plan = analyzer.build_timeline_plan(
+            self.total_frames,
+            states,
+            pause_segments,
+            speed_segments,
+            clip_segments,
+            speedup_1x,
+            speedup_02,
+            speedup_02_factor,
+        )
+        if cacheable:
+            self._cut_plan_cache = (self._timeline_revision, plan)
+        return plan
+
+    def _all_skip_segs_snap(self) -> list:
+        # VideoIO consumes half-open, globally sorted delete ranges.  Speed
+        # policy stays separate in the current CV engine and is not duplicated
+        # into this cut-only plan.
+        return list(self._build_timeline_plan().deleted_ranges)
 
     def _seek(self, frame_idx: int, skip_trim: bool = False):
+        self._auto_rate_clear()
         if not self._io: return
         self.current_frame_idx = frame_idx
         self.timeline.current_frame_idx = frame_idx
         self._io.send({
             'type': CMD_SEEK_LATEST,
             'frame': frame_idx,
+            'timeline_revision': self._timeline_revision,
             'canvas_wh': self._canvas_wh(),
             'pause_segs': self._all_skip_segs_snap(),
             'skip_trimmed': skip_trim,
@@ -208,6 +768,7 @@ class VideoPreviewPlayer(tk.Frame):
 
     def _send_play(self, start: int):
         if not self._io: return
+        self._apply_pace_mode_to_io()
         p = self.settings.get_params()
 
         speed_str = self.preview_speed_var.get().rstrip('x')
@@ -216,12 +777,14 @@ class VideoPreviewPlayer(tk.Frame):
         except ValueError:
             speed = 1.0
         if speed >= 1.0:
+            # ≥1x：用跳帧实现快进（2x→隔帧，4x→每 4 帧一显）
             preview_step = max(1, int(speed))
             speed_multiplier = 1.0
         else:
             preview_step = 1
             speed_multiplier = 1.0 / max(speed, 0.01)
 
+        ignore_biz = bool(self.preview_ignore_speedup_var.get())
         self._io.send({
             'type': CMD_PLAY,
             'params': {
@@ -229,14 +792,508 @@ class VideoPreviewPlayer(tk.Frame):
                 'preview_step': preview_step,
                 'speed_multiplier': speed_multiplier,
                 'skip_trimmed': self.skip_trimmed.get(),
-                'speedup_1x': p['speedup_1x'],
-                'speedup_02': p['speedup_02'],
+                'speedup_1x': False if ignore_biz else p['speedup_1x'],
+                'speedup_02': False if ignore_biz else p['speedup_02'],
                 'speedup_02_factor': p['speedup_02_factor'],
                 'pause_segs': self._all_skip_segs_snap(),
+                'timeline_revision': self._timeline_revision,
                 'speed_segs': self._speed_segs_snap(),
                 'canvas_wh': self._canvas_wh(),
+                # S1: preview step cap (same as VideoIOThread._PREVIEW_STEP_CAP)
+                'preview_step_cap': 3,
+                # 吸收小裁剪段：>0 会把被裁掉的帧真的播出来（暂停闪屏来源），
+                # 故默认 0 关闭；消除 seek 尖峰改由 _GRAB_SEEK_THRESHOLD 承担。
+                'skip_trim_min_span': 0,
             }
         })
+    def _on_preview_option_change(self):
+        """倍速 / 跳裁剪 / 忽略业务加速 变更时，播放中立刻按新参数续播。"""
+        if self.is_playing:
+            self._auto_rate_mark_start()
+            self._send_play(self.current_frame_idx)
+        self._update_labels()
+
+    def _pace_mode_str(self) -> str:
+        return "opt" if bool(self.preview_opt_var.get()) else "base"
+
+    def _apply_pace_mode_to_io(self) -> None:
+        if not self._io:
+            return
+        try:
+            self._io.set_pace_mode(self._pace_mode_str())
+        except Exception:
+            pass
+
+    def _on_preview_opt_change(self):
+        """勾选「预览优化」：opt=当前优化；关=base #9 式（仍统计）。"""
+        if self._closing:
+            return
+        self._apply_pace_mode_to_io()
+        if self.is_playing:
+            # 换模式后重发 PLAY（内部 begin_perf_segment 会清零本段统计）
+            self._reset_ui_gap_stats()
+            self._send_play(self.current_frame_idx)
+        self._refresh_perf_label(force=True)
+        mode = "优化ON" if self.preview_opt_var.get() else "基线#9"
+        try:
+            self.lbl_info.config(text=f"预览节奏: {mode}（O 键切换）")
+        except Exception:
+            pass
+
+    def _toggle_preview_opt(self, _event=None):
+        if self._closing:
+            return "break"
+        focused = None
+        try:
+            focused = self.focus_get()
+        except Exception:
+            pass
+        if isinstance(focused, (ttk.Entry, tk.Entry, ttk.Combobox)):
+            return  # 输入框打字时不要切换 A/B
+        self.preview_opt_var.set(not bool(self.preview_opt_var.get()))
+        self._on_preview_opt_change()
+        return "break"
+
+    def _stop_playback_ui(self, from_user: bool = False) -> None:
+        """UI 侧停播；from_user 时向 IO 发 STOP。片尾自动停时 IO 已 halt。"""
+        if self._calib_active:
+            if from_user:
+                self._calib_cancel_timer()
+                self._calib_active = False
+                self._calib_set_label("倍率标定: 已取消（播放被手动停止）", "#cc4444")
+        else:
+            try:
+                self._auto_rate_on_stop()
+            except Exception:
+                pass
+        self.is_playing = False
+        try:
+            self.btn_play.config(text="▶ 播放")
+        except Exception:
+            pass
+        if from_user:
+            self._send_stop()
+        if self._io:
+            try:
+                self._perf_last = self._io.snapshot_perf()
+            except Exception:
+                pass
+        self._refresh_perf_label(force=True)
+
+    def _sync_eof_stop(self) -> None:
+        """片尾 IO 已停但按钮仍显示暂停时，自动对齐 UI 并冻结统计展示。"""
+        if not self.is_playing or not self._io or self._is_dragging:
+            return
+        try:
+            snap = self._io.snapshot_perf()
+        except Exception:
+            return
+        # 仅片尾自动停；seek/用户暂停不要误触（拖进度条时 IO 也会短暂 inactive）
+        if snap.get("playback_active"):
+            return
+        if snap.get("play_end_reason") != "eof":
+            return
+        self._stop_playback_ui(from_user=False)
+
+    def _ideal_display_gap_ms(self) -> float:
+        """当前预览倍速下，理想的显示间隔（ms）。≥1x 抽帧时仍按 1/fps 一拍。"""
+        fps = float(self.fps) if self.fps else 30.0
+        speed_str = self.preview_speed_var.get().rstrip('x')
+        try:
+            speed = float(speed_str)
+        except ValueError:
+            speed = 1.0
+        if speed >= 1.0:
+            return 1000.0 / max(fps, 1e-3)
+        return 1000.0 / max(fps * max(speed, 0.01), 1e-3)
+
+    def _reset_ui_gap_stats(self) -> None:
+        self._last_display_mono = None
+        self._ui_gap_ms_max = 0.0
+        self._ui_frames = 0
+        self._ui_gap_ms_sum = 0.0
+        self._ui_stutter_n = 0
+
+    def _note_ui_display(self) -> None:
+        now = time.monotonic()
+        if self._last_display_mono is not None:
+            gap = (now - self._last_display_mono) * 1000.0
+            self._ui_frames += 1
+            self._ui_gap_ms_sum += gap
+            if gap > self._ui_gap_ms_max:
+                self._ui_gap_ms_max = gap
+            if gap > self._ideal_display_gap_ms() * 1.8:
+                self._ui_stutter_n += 1
+        self._last_display_mono = now
+
+    def _compose_perf_text(self) -> str:
+        snap = None
+        if self._io and self.is_playing:
+            try:
+                snap = self._io.snapshot_perf()
+            except Exception:
+                snap = self._perf_last
+        elif self._perf_last is not None:
+            snap = self._perf_last
+        elif self._io:
+            try:
+                snap = self._io.snapshot_perf()
+            except Exception:
+                snap = None
+
+        if not snap or int(snap.get("presented", 0)) <= 0:
+            return "流畅度: 播放≥3秒 | 看 >1帧迟到% / 追帧 / p95解码 / seek / 尖峰"
+
+        late_pct = float(snap.get("late_pct", 0.0))
+        late1_pct = float(snap.get("late1_pct", 0.0))
+        late2_pct = float(snap.get("late2_pct", 0.0))
+        drop_pct = float(snap.get("drop_pct", 0.0))
+        presented = int(snap.get("presented", 0))
+        discarded = int(snap.get("discarded", 0))
+        catchups = int(snap.get("catchup_events", 0))
+        soft_r = int(snap.get("pace_resets", 0))
+        hard_r = int(snap.get("hard_resets", 0))
+        seeks = int(snap.get("seek_count", 0))
+        q_drop = int(snap.get("q_drop", 0))
+        absorbed = int(snap.get("skip_trim_absorbed", 0) or 0)
+        cap_threads = int(snap.get("cap_threads", 0) or 0)
+        avg_ms = float(snap.get("present_ms_avg", 0.0))
+        max_ms = float(snap.get("present_ms_max", 0.0))
+        p95_ms = float(snap.get("present_ms_p95", 0.0))
+        lag_max = float(snap.get("lag_ms_max", 0.0))
+        lag_p95 = float(snap.get("lag_ms_p95", 0.0))
+        wall_s = float(snap.get("wall_s", 0.0))
+        io_active = bool(snap.get("playback_active", False))
+        spikes = snap.get("spikes") or []
+
+        ideal_gap = self._ideal_display_gap_ms() / 1000.0
+        media_s = presented * ideal_gap if ideal_gap > 0 else 0.0
+        media_s += discarded * ideal_gap
+        rt = (wall_s / media_s) if media_s > 1e-3 else 0.0
+
+        ui_avg = (self._ui_gap_ms_sum / self._ui_frames) if self._ui_frames else 0.0
+        ui_st = self._ui_stutter_n
+        # 分档以 >1帧迟到为主（微抖 late 仅作参考）
+        grade = self._grade_smoothness(late1_pct, drop_pct, avg_ms, rt)
+
+        if self.is_playing and io_active:
+            state = "播"
+        elif self.is_playing and not io_active:
+            state = "片尾"
+        else:
+            state = "停"
+
+        pace_mode = str(snap.get("pace_mode") or self._pace_mode_str())
+        mode_tag = "优化" if pace_mode == "opt" else "基线"
+
+        spike_hint = ""
+        if spikes:
+            last = spikes[-1]
+            rs = ",".join(last.get("reasons") or [])
+            spike_hint = f" | 末尖峰f{last.get('frame')} {last.get('present_ms')}ms[{rs}]"
+
+        return (
+            f"流畅度[{state}/{mode_tag}]{grade} | "
+            f"微抖{late_pct:.0f}% >1帧{late1_pct:.0f}% >2帧{late2_pct:.0f}% | "
+            f"追帧{discarded}拍/{catchups}次 | "
+            f"seek{seeks} 软锚{soft_r} 硬重置{hard_r} | "
+            f"解码{avg_ms:.0f}/p95 {p95_ms:.0f}/max{max_ms:.0f}ms | "
+            f"落后p95 {lag_p95:.0f}/max{lag_max:.0f}ms | "
+            f"实时比{rt:.2f} | "
+            f"UI{ui_avg:.0f}/{self._ui_gap_ms_max:.0f}ms 顿{ui_st} q丢{q_drop} | "
+            f"吸收{absorbed} 线程{cap_threads} | "
+            f"{wall_s:.1f}s"
+            f"{spike_hint}"
+        )
+
+    def export_video(self):
+        from tkinter import messagebox
+        import analyzer
+
+        if self._closing:
+            return
+        if (
+            getattr(self, "_export_handle", None) is not None
+            or getattr(self, "_segment_export_handle", None) is not None
+            or getattr(self, "_analysis_handle", None) is not None
+        ):
+            return messagebox.showwarning("导出进行中", "请等待当前导出任务结束。")
+        if not self.video_path:
+            return messagebox.showerror("错误", "请先加载视频")
+
+        video_path = str(self.video_path)
+        fps = float(self.fps or 30.0)
+        project_generation, timeline_revision = self._task_scope()
+        p = self.settings.get_params()
+        output_path = str(p["output"])
+        quality = int(p["quality"])
+        use_gpu = bool(p.get("export_use_gpu", False))
+        gpu_encoder = str(p.get("gpu_encoder", ""))
+        ffmpeg_path = p.get("ffmpeg_path")
+        ffprobe_path = p.get("ffprobe_path")
+        include_audio = bool(p.get("export_keep_audio", True))
+        enforce_media_certification = bool(
+            p.get("enforce_media_certification", False)
+        )
+        if not p["output"]:
+            return messagebox.showerror("错误", "请先设置输出路径")
+        if enforce_media_certification and (
+            self.media_info is None or not self.media_info.complete_for_export
+        ):
+            return messagebox.showerror(
+                "无法导出",
+                "当前源文件尚未绑定完整的 FramePtsCertification，"
+                "请先完成帧时间戳认证。",
+            )
+
+        try:
+            timeline_plan = self._build_timeline_plan(
+                speedup_1x=p["speedup_1x"],
+                speedup_02=p["speedup_02"],
+                speedup_02_factor=p["speedup_02_factor"],
+            )
+            export_preflight = analyzer.inspect_export_plan(
+                timeline_plan,
+                include_audio=include_audio,
+                video_path=video_path,
+                ffmpeg_path=ffmpeg_path,
+                ffprobe_path=ffprobe_path,
+            )
+        except Exception as exc:
+            return messagebox.showerror("导出准备失败", str(exc))
+
+        if export_preflight.get("export_blocked"):
+            reason_labels = {
+                "ffmpeg_unavailable": (
+                    "没有可用的 FFmpeg。请在设置中填写 FFmpeg 路径，"
+                    "或安装 imageio-ffmpeg。"
+                ),
+            }
+            reasons = "\n".join(
+                "- " + reason_labels.get(value, value)
+                for value in export_preflight.get("export_block_reasons", [])
+            )
+            return messagebox.showerror(
+                "无法导出",
+                reasons or "导出依赖不可用。",
+            )
+
+        allow_audio_drop = False
+        if export_preflight["audio_drop_requires_confirmation"]:
+            reason_labels = {
+                "too_many_ranges": (
+                    f"保留段 {export_preflight['n_ranges']} 个，超过音频安全上限 "
+                    f"{export_preflight['audio_limit']}"
+                ),
+                "audio_probe_inconclusive": "无法确认源片音轨",
+            }
+            reasons = "\n".join(
+                "- " + reason_labels.get(value, value)
+                for value in export_preflight.get("audio_drop_reasons", [])
+            )
+            allow_audio_drop = messagebox.askyesno(
+                "确认导出无声视频",
+                f"当前无法保证保留音频：\n{reasons}\n\n继续会生成无声视频，是否继续？",
+            )
+            if not allow_audio_drop:
+                self.settings.export_status_var.set(
+                    "已取消：当前剪辑无法安全保留音频"
+                )
+                return
+
+        export_request = ExportRequest.full(
+            video_path,
+            output_path,
+            timeline_plan,
+            fps=fps,
+            quality=quality,
+            use_gpu=use_gpu,
+            gpu_encoder=gpu_encoder,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+            include_audio=include_audio,
+            allow_audio_drop=allow_audio_drop,
+            media_info=getattr(self, "media_info", None),
+            enforce_media_certification=enforce_media_certification,
+        )
+
+        self.settings.export_btn.config(state=tk.DISABLED)
+        self.settings.export_progress_var.set(0)
+        self.settings.export_status_var.set("导出中：正在关闭预览解码器…")
+        if not self._pause_preview_for_export():
+            self.settings.export_btn.config(state=tk.NORMAL)
+            self.settings.export_status_var.set("无法安全关闭预览，已取消导出")
+            return
+
+        def work(context):
+            def progress(ratio, written, status=None):
+                context.checkpoint()
+                context.report(
+                    (
+                        float(ratio),
+                        int(written),
+                        status or f"写入 {int(float(ratio) * 100)}%",
+                    )
+                )
+
+            context.checkpoint()
+            return MediaExporter().export(
+                export_request,
+                progress_cb=progress,
+                cancel_cb=context.checkpoint,
+                source_path_override=video_path,
+                commit_cb=lambda source, target: context.commit(
+                    os.replace, source, target, final=True
+                ),
+                preflight=export_preflight,
+            )
+
+        def on_progress(value):
+            if self._closing:
+                return
+            ratio, _written, status = value
+            self.settings.export_progress_var.set(
+                max(0.0, min(100.0, float(ratio) * 100.0))
+            )
+            self.settings.export_status_var.set(status)
+
+        def on_success(result):
+            if self._closing:
+                return
+            if isinstance(result, ExportResult):
+                written = result.written_frames
+                total = result.total_frames
+                meta = result.metadata
+            elif isinstance(result, tuple) and len(result) >= 3:
+                written, total, meta = result[0], result[1], result[2] or {}
+            else:
+                written, total = result[0], result[1]
+                meta = {}
+            audio_mode = meta.get("audio_mode", "")
+            audio_line = {
+                "muxed": "音频：已按保留段混音",
+                "skipped_segments": "音频：保留段过多，已按确认导出无声视频",
+                "skipped_unavailable": "音频：FFmpeg 不可用，已按确认导出无声视频",
+                "skipped_probe": "音频：音轨探测失败，已按确认导出无声视频",
+                "disabled": "音频：已按设置关闭",
+                "no_stream": "音频：源片无音轨",
+            }.get(audio_mode, "音频：未混音或本地导出")
+            self.settings.export_status_var.set(f"完成：{written}/{total} 帧")
+            self.settings.export_progress_var.set(100)
+            messagebox.showinfo(
+                "导出完成",
+                f"输出：{output_path}\n总帧：{total}，保留：{written}\n{audio_line}",
+            )
+
+        def on_error(exc):
+            if self._closing:
+                return
+            self.settings.export_status_var.set(f"失败：{str(exc)[:80]}")
+            messagebox.showerror("导出失败", str(exc))
+
+        def on_cancelled():
+            if not self._closing:
+                self.settings.export_status_var.set("导出已取消，未覆盖原有输出")
+
+        def on_done(_status):
+            self._export_handle = None
+            if self._closing:
+                return
+            self.settings.export_btn.config(state=tk.NORMAL)
+            self._resume_preview_after_export()
+
+        try:
+            self._export_handle = self.task_manager.submit(
+                _EXPORT_TASK,
+                work,
+                on_success=on_success,
+                on_error=on_error,
+                on_progress=on_progress,
+                on_cancelled=on_cancelled,
+                on_done=on_done,
+                project_generation=project_generation,
+                timeline_revision=timeline_revision,
+                replace=True,
+            )
+        except RuntimeError as exc:
+            self.settings.export_btn.config(state=tk.NORMAL)
+            self.settings.export_status_var.set(str(exc))
+            self._resume_preview_after_export()
+
+    @staticmethod
+    def _grade_smoothness(late1_pct: float, drop_pct: float, avg_ms: float, rt: float) -> str:
+        """粗分档：用 >1 帧迟到%，比 0.25 帧微抖更贴体感。"""
+        if late1_pct <= 3 and drop_pct <= 1 and avg_ms <= 25 and (rt == 0 or rt <= 1.05):
+            return "优"
+        if late1_pct <= 10 and drop_pct <= 5 and avg_ms <= 40 and (rt == 0 or rt <= 1.15):
+            return "良"
+        if late1_pct <= 25 and drop_pct <= 15:
+            return "中"
+        return "差"
+
+    def _refresh_perf_label(self, force: bool = False) -> None:
+        if not hasattr(self, "lbl_perf"):
+            return
+        try:
+            self.lbl_perf.config(text=self._compose_perf_text())
+        except Exception:
+            pass
+
+    def _reset_perf_stats_ui(self) -> None:
+        if self._io:
+            try:
+                self._io.reset_perf_stats()
+            except Exception:
+                pass
+        self._perf_last = None
+        self._reset_ui_gap_stats()
+        if self.is_playing and self._io:
+            # 播放中清零：从当前重新记墙钟
+            try:
+                self._io.begin_perf_segment()
+            except Exception:
+                pass
+        self._refresh_perf_label(force=True)
+
+    def _copy_perf_stats(self) -> None:
+        text = self._compose_perf_text()
+        detail = text
+        if self._io:
+            try:
+                snap = self._io.snapshot_perf()
+                # spikes 单独多列几条，便于归因 188ms 级尖峰
+                spikes = snap.get("spikes") or []
+                spike_lines = []
+                for s in spikes[-12:]:
+                    spike_lines.append(
+                        f"  f{s.get('frame')} present={s.get('present_ms')}ms "
+                        f"lag={s.get('lag_ms')}ms reasons={s.get('reasons')}"
+                    )
+                detail = text + "\n" + repr({k: v for k, v in snap.items() if k != "spikes"})
+                if spike_lines:
+                    detail += "\nspikes:\n" + "\n".join(spike_lines)
+            except Exception:
+                pass
+        try:
+            root = self.winfo_toplevel()
+            root.clipboard_clear()
+            root.clipboard_append(detail)
+            root.update_idletasks()
+            self.lbl_perf.config(foreground="#2e8b57")
+            if self._perf_after_id is not None:
+                try:
+                    self.after_cancel(self._perf_after_id)
+                except Exception:
+                    pass
+            self._perf_after_id = self.after(800, self._restore_perf_label)
+        except Exception:
+            pass
+
+    def _restore_perf_label(self):
+        self._perf_after_id = None
+        if not self._closing:
+            self.lbl_perf.config(foreground="#888888")
+
 
     def _send_stop(self):
         if self._io: self._io.send({'type': CMD_STOP})
@@ -248,16 +1305,23 @@ class VideoPreviewPlayer(tk.Frame):
     _KEY_PREVIEW_MS = 150
 
     def _bind_keys(self):
+        self._bind_after_id = None
+        if self._closing:
+            return
         root = self.winfo_toplevel()
         root.bind('<Left>', self._on_key_press_left, add='+')
         root.bind('<Right>', self._on_key_press_right, add='+')
         root.bind('<KeyRelease-Left>', self._on_key_release, add='+')
         root.bind('<KeyRelease-Right>', self._on_key_release, add='+')
         root.bind('<space>', self._on_key_space)
+        root.bind('<o>', self._toggle_preview_opt, add='+')
+        root.bind('<O>', self._toggle_preview_opt, add='+')
         for cls in ('TButton', 'Button', 'TCheckbutton', 'TRadiobutton', 'TCombobox', 'TNotebook'):
             root.bind_class(cls, '<space>', lambda e: 'break')
 
     def _on_key_press_left(self, event):
+        if self._closing:
+            return
         if self._key_held == 'Left': return
         self._key_held = 'Left'
         self._key_hold_fired = False
@@ -265,6 +1329,8 @@ class VideoPreviewPlayer(tk.Frame):
         self._key_after_id = self.after(400, self._start_repeat, 'Left')
 
     def _on_key_press_right(self, event):
+        if self._closing:
+            return
         if self._key_held == 'Right': return
         self._key_held = 'Right'
         self._key_hold_fired = False
@@ -272,6 +1338,8 @@ class VideoPreviewPlayer(tk.Frame):
         self._key_after_id = self.after(400, self._start_repeat, 'Right')
 
     def _on_key_release(self, event):
+        if self._closing:
+            return
         direction = event.keysym
         if self._key_held != direction: return
         self._key_held = None
@@ -291,18 +1359,22 @@ class VideoPreviewPlayer(tk.Frame):
         self._key_hold_fired = False
 
     def _on_key_space(self, event):
+        if self._closing:
+            return "break"
         focused = self.focus_get()
         if isinstance(focused, (ttk.Entry, tk.Entry, ttk.Combobox)): return
         self.toggle_play();
         return 'break'
 
     def _start_repeat(self, direction: str):
+        if self._closing:
+            return
         self._key_hold_fired = True
         self._schedule_preview()
         self._repeat_frame(direction)
 
     def _repeat_frame(self, direction: str):
-        if self._key_held != direction: return
+        if self._closing or self._key_held != direction: return
         delta = -1 if direction == 'Left' else +1
         self._step_frame(delta, seek=False)
         speed = self.settings.key_repeat_speed_var.get()
@@ -310,10 +1382,12 @@ class VideoPreviewPlayer(tk.Frame):
         self._key_after_id = self.after(interval, self._repeat_frame, direction)
 
     def _schedule_preview(self):
+        if self._closing:
+            return
         self._key_preview_id = self.after(self._KEY_PREVIEW_MS, self._preview_tick)
 
     def _preview_tick(self):
-        if not self._key_held: return
+        if self._closing or not self._key_held: return
         self._do_preview_seek()
         self._key_preview_id = self.after(self._KEY_PREVIEW_MS, self._preview_tick)
 
@@ -341,14 +1415,346 @@ class VideoPreviewPlayer(tk.Frame):
     # ==========================================================
     #  播放控制
     # ==========================================================
-    def toggle_play(self):
-        if self.is_playing:
-            self.is_playing = False;
-            self.btn_play.config(text="▶ 播放")
-            self._send_stop()
+
+    # ==========================================================
+    #  倍率标定 V1（10s）/ V2（忽略 on/off 对比）
+    # ==========================================================
+    def _calib_cancel_timer(self) -> None:
+        if self._calib_after_id is not None:
+            try:
+                self.after_cancel(self._calib_after_id)
+            except Exception:
+                pass
+            self._calib_after_id = None
+
+    def _calib_zone_label(self, frame_idx: int) -> str:
+        """Rough zone for expectation display."""
+        for seg in self.speed_segments:
+            if seg["start"] <= frame_idx <= seg["end"]:
+                t = seg["type"]
+                name = {
+                    FRAME_TYPE_1X: "1x",
+                    FRAME_TYPE_2X: "2x",
+                    FRAME_TYPE_0_2X: "0.2x",
+                }.get(t, "?")
+                return f"变速{name}"
+        return "普通/其它"
+
+    def _calib_expected_rate(self, frame_idx: int, ignore_biz: bool) -> tuple[float, int, int, str]:
+        """Return (M_exp, raw_step, capped_step, note).
+
+        Matches current preview policy: S1 cap only (no S2 clock scale).
+        Slow UI speeds stretch the display clock, while speeds >=1x advance
+        multiple source frames per display tick.
+        """
+        speed_str = self.preview_speed_var.get().rstrip("x")
+        try:
+            ui_speed = float(speed_str)
+        except ValueError:
+            ui_speed = 1.0
+        if ui_speed >= 1.0:
+            preview_step = max(1, int(ui_speed))
+            clock_rate = 1.0  # >=1x uses frame skip, not a faster clock
         else:
-            self.is_playing = True;
+            preview_step = 1
+            clock_rate = max(ui_speed, 0.01)
+
+        p = self.settings.get_params()
+        if ignore_biz:
+            biz = 1
+        else:
+            biz = 1
+            for seg in self.speed_segments:
+                if seg["start"] <= frame_idx <= seg["end"]:
+                    t = seg["type"]
+                    if t == FRAME_TYPE_1X and p.get("speedup_1x"):
+                        biz = 2
+                    elif t == FRAME_TYPE_0_2X and p.get("speedup_02"):
+                        biz = max(2, int(p.get("speedup_02_factor", 10) or 10))
+                    break
+        raw = max(1, preview_step * biz)
+        cap = 3
+        capped = min(raw, cap)
+        # wall-clock media advance rate under S1-only policy
+        m_exp = clock_rate * float(capped)
+        note = f"raw_step={raw} cap={cap} → 期望按步进{capped}"
+        if raw > capped:
+            note += f"（业务理想约{raw}x，预览封顶后约{capped}x）"
+        return m_exp, raw, capped, note
+
+    def _playback_rate_measurement(
+        self,
+        started_at: float,
+        start_frame: int,
+    ) -> tuple[float, int, int, str, int] | None:
+        """Measure media advance using IO play steps, excluding trim jumps."""
+        current_frame = int(self.current_frame_idx)
+        wall_s = max(1e-6, time.monotonic() - float(started_at))
+        play_frames: int | None = None
+        trim_frames = 0
+        source = "ui-frames"
+        if self._io:
+            try:
+                snapshot = self._io.snapshot_perf()
+                io_wall_s = float(snapshot.get("wall_s") or 0.0)
+                if io_wall_s > 0.0:
+                    wall_s = max(io_wall_s, 1e-6)
+                if snapshot.get("rate_play_frames") is not None:
+                    play_frames = int(snapshot.get("rate_play_frames") or 0)
+                    source = "play-steps"
+                trim_frames = int(snapshot.get("rate_trim_frames") or 0)
+            except Exception:
+                pass
+
+        if play_frames is None:
+            play_frames = current_frame - int(start_frame)
+            if play_frames < 0:
+                return None
+        return wall_s, play_frames, trim_frames, source, current_frame
+
+    def _calib_set_label(self, text: str, color: str = "#888888") -> None:
+        self._calib_last_line = text
+        if hasattr(self, "lbl_calib"):
+            try:
+                self.lbl_calib.config(text=text, foreground=color)
+            except Exception:
+                pass
+
+    def _calib_copy(self) -> None:
+        text = self._calib_last_line or ""
+        if self._calib_pair_lines:
+            text = "\n".join(self._calib_pair_lines)
+        if not text:
+            text = "尚无标定结果"
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self._calib_set_label(text + "  [已复制]", "#2e8b57")
+        except Exception:
+            pass
+
+    def _calib_stop_play_for_measure(self) -> None:
+        if self.is_playing:
+            self._stop_playback_ui(from_user=True)
+
+    def _calib_begin_run(self, mode: str, ignore_biz: bool, anchor_frame: int | None = None) -> None:
+        if self._closing:
+            return
+        if not self._io or self.total_frames <= 0:
+            self._calib_set_label("倍率标定: 请先加载视频", "#cc4444")
+            return
+        self._calib_cancel_timer()
+        self._calib_stop_play_for_measure()
+
+        if anchor_frame is not None:
+            self.current_frame_idx = int(max(0, min(anchor_frame, self.total_frames - 1)))
+            self.timeline.current_frame_idx = self.current_frame_idx
+            try:
+                self._seek(self.current_frame_idx, skip_trim=False)
+            except Exception:
+                pass
+
+        # apply ignore flag for this run
+        self.preview_ignore_speedup_var.set(bool(ignore_biz))
+        self._calib_ignore = bool(ignore_biz)
+        self._calib_mode = mode
+        self._calib_active = True
+        self._calib_f0 = int(self.current_frame_idx)
+        self._calib_t0 = time.monotonic()
+
+        zone = self._calib_zone_label(self._calib_f0)
+        m_exp, raw, capped, note = self._calib_expected_rate(self._calib_f0, ignore_biz)
+        tag = "忽略ON" if ignore_biz else "忽略OFF"
+        self._calib_set_label(
+            f"标定中[{tag}] 10s… f0={self._calib_f0} 区={zone} 期望≈{m_exp:.2f}x ({note})",
+            "#daa520",
+        )
+
+        self.is_playing = True
+        try:
             self.btn_play.config(text="⏸ 暂停")
+        except Exception:
+            pass
+        self._reset_ui_gap_stats()
+        self._send_play(self.current_frame_idx)
+        self._calib_after_id = self.after(10000, self._calib_finish_run)
+
+    def _calib_finish_run(self) -> None:
+        self._calib_after_id = None
+        if self._closing:
+            return
+        if not self._calib_active or self._calib_t0 is None:
+            return
+        f0 = int(self._calib_f0)
+        measurement = self._playback_rate_measurement(self._calib_t0, f0)
+        if measurement is None:
+            self._calib_active = False
+            self._calib_stop_play_for_measure()
+            self._calib_set_label(
+                "倍率标定: 本次含回退/seek，结果已忽略",
+                "#cc4444",
+            )
+            return
+        tw, play_frames, trim_frames, source, f1 = measurement
+        fps = float(self.fps) if self.fps else 30.0
+        ts = play_frames / max(fps, 1e-6)
+        m = ts / tw
+        ignore_biz = bool(self._calib_ignore)
+        m_exp, raw, capped, note = self._calib_expected_rate(f0, ignore_biz)
+        err = (m - m_exp) / m_exp if abs(m_exp) > 1e-6 else 0.0
+        ok = abs(err) <= 0.10 if raw <= capped else abs(err) <= 0.15
+        tag = "忽略ON" if ignore_biz else "忽略OFF"
+        zone = self._calib_zone_label(f0)
+        verdict = "达标" if ok else "未达标"
+        line = (
+            f"标定[{tag}] {verdict} | 墙钟{tw:.2f}s 片源{ts:.2f}s | "
+            f"实测{m:.3f}x 期望{m_exp:.3f}x 误差{err*100:+.1f}% | "
+            f"计{play_frames}帧[{source}] 指针{f0}→{f1} @ {fps:.3g}fps | "
+            f"区={zone} | {note}"
+            + (
+                f" | 跳过裁剪≈{trim_frames}帧(不计入倍率)"
+                if trim_frames > 0
+                else ""
+            )
+        )
+        self._calib_active = False
+        self._calib_stop_play_for_measure()
+
+        color = "#2e8b57" if ok else "#cc4444"
+        if self._calib_mode == "single":
+            self._calib_pair_lines = [line]
+            self._calib_set_label(line, color)
+            return
+
+        if self._calib_mode == "pair_a":
+            self._calib_pair_lines = [line]
+            self._calib_set_label(line + " → 接着测忽略OFF…", "#daa520")
+            # V2 second leg: ignore OFF, same anchor
+            self._calib_after_id = self.after(
+                400,
+                lambda: self._calib_begin_run(
+                    "pair_b", ignore_biz=False, anchor_frame=self._calib_pair_anchor
+                ),
+            )
+            return
+
+        if self._calib_mode == "pair_b":
+            self._calib_pair_lines.append(line)
+            # summary
+            summary = "对比标定完成:\n" + "\n".join(self._calib_pair_lines)
+            self._calib_last_line = summary
+            self._calib_set_label(
+                " | ".join(self._calib_pair_lines),
+                "#2e8b57" if all("达标" in x for x in self._calib_pair_lines) else "#cc4444",
+            )
+            return
+
+
+    def _auto_rate_mark_start(self) -> None:
+        """Mark t0/f0 when user starts normal playback (not V1/V2 timed calib)."""
+        if self._calib_active:
+            return
+        if not self._io or self.total_frames <= 0:
+            self._auto_rate_t0 = None
+            return
+        self._auto_rate_t0 = time.monotonic()
+        self._auto_rate_f0 = int(self.current_frame_idx)
+        self._auto_rate_ignore = bool(self.preview_ignore_speedup_var.get())
+
+    def _auto_rate_clear(self) -> None:
+        self._auto_rate_t0 = None
+
+    def _auto_rate_on_stop(self) -> None:
+        """Stop auto rate: use play-step frame count (excludes skip_trim jumps)."""
+        if self._calib_active:
+            return
+        if self._auto_rate_t0 is None:
+            return
+        t0 = float(self._auto_rate_t0)
+        f0 = int(self._auto_rate_f0)
+        ignore_biz = bool(self._auto_rate_ignore)
+        self._auto_rate_t0 = None
+
+        min_s = float(getattr(self, "_AUTO_RATE_MIN_S", 3.0) or 3.0)
+        measurement = self._playback_rate_measurement(t0, f0)
+        if measurement is None:
+            self._calib_set_label(
+                "倍率: 本次含回退/seek，已忽略（请向前连续播一段）",
+                "#cc4444",
+            )
+            return
+        wall_s, play_frames, trim_frames, src, f1 = measurement
+
+        if wall_s < min_s:
+            self._calib_set_label(
+                f"倍率: 样本过短 {wall_s:.1f}s（请连续播放≥{min_s:.0f}s 再停）",
+                "#888888",
+            )
+            return
+
+        fps = float(self.fps) if self.fps else 30.0
+        ts = play_frames / max(fps, 1e-6)
+        meas = ts / wall_s
+        m_exp, raw, capped, note = self._calib_expected_rate(f0, ignore_biz)
+        err = (meas - m_exp) / m_exp if abs(m_exp) > 1e-6 else 0.0
+        ok = abs(err) <= 0.10 if raw <= capped else abs(err) <= 0.15
+        tag = "忽略ON" if ignore_biz else "忽略OFF"
+        zone = self._calib_zone_label(f0)
+        verdict = "达标" if ok else "未达标"
+        trim_note = ""
+        if trim_frames > 0:
+            trim_note = f" | 跳过裁剪≈{trim_frames}帧(不计入倍率)"
+        line = (
+            f"自动[{tag}] {verdict} | 墙钟{wall_s:.2f}s 播放推进{ts:.2f}s | "
+            f"实测{meas:.3f}x 期望{m_exp:.3f}x 误差{err*100:+.1f}% | "
+            f"计{play_frames}帧[{src}] 指针{f0}→{f1} @ {fps:.3g}fps | "
+            f"区={zone} | {note}{trim_note}"
+        )
+        self._calib_pair_lines = [line]
+        self._calib_set_label(line, "#2e8b57" if ok else "#cc4444")
+
+
+    def _calib_start_single(self) -> None:
+        """V1: 10s calibration with current ignore checkbox."""
+        if self._calib_active:
+            self._calib_set_label("标定进行中…", "#daa520")
+            return
+        self._calib_pair_lines = []
+        ignore = bool(self.preview_ignore_speedup_var.get())
+        self._calib_begin_run("single", ignore_biz=ignore, anchor_frame=None)
+
+    def _calib_start_pair(self) -> None:
+        """V2: same start frame — ignore ON 10s, then ignore OFF 10s."""
+        if self._calib_active:
+            self._calib_set_label("标定进行中…", "#daa520")
+            return
+        if not self._io or self.total_frames <= 0:
+            self._calib_set_label("倍率标定: 请先加载视频", "#cc4444")
+            return
+        self._calib_pair_lines = []
+        self._calib_pair_anchor = int(self.current_frame_idx)
+        self._calib_set_label(
+            f"对比标定: 锚点帧 {self._calib_pair_anchor}，先忽略ON 10s…",
+            "#daa520",
+        )
+        self._calib_begin_run(
+            "pair_a", ignore_biz=True, anchor_frame=self._calib_pair_anchor
+        )
+
+
+    def toggle_play(self):
+        if self._closing:
+            return
+        if self.is_playing:
+            self._stop_playback_ui(from_user=True)
+        else:
+            self.is_playing = True
+            try:
+                self.btn_play.config(text="⏸ 暂停")
+            except Exception:
+                pass
+            self._reset_ui_gap_stats()
+            self._auto_rate_mark_start()
             self._send_play(self.current_frame_idx)
 
     def _on_tl_seek(self, frame_idx: int):
@@ -371,29 +1777,66 @@ class VideoPreviewPlayer(tk.Frame):
                 break
 
     def _render_loop(self):
+        if self._closing:
+            self._render_after_id = None
+            return
+        # 只显示队列里最新一帧，避免积压时「补放旧帧」造成拖影/顿挫
+        latest = None
+        drained = 0
         try:
-            idx, rgb = self._frame_q.get_nowait()
+            while True:
+                latest = self._frame_q.get_nowait()
+                drained += 1
+        except Empty:
+            pass
+        if latest is not None:
+            idx, rgb = latest
+            if drained > 1:
+                # 主线程一次丢掉的中间帧 ≈ UI 侧积压
+                pass
             if not self._key_hold_fired and not self._is_dragging:
                 self.current_frame_idx = idx
                 self.timeline.current_frame_idx = idx
                 self.timeline._ensure_pointer_visible()
+            self._note_ui_display()
             self._display_rgb(rgb)
-        except Empty:
-            pass
         self.timeline.update_pointer()
-        self.after(16, self._render_loop)
+        self._perf_ui_tick += 1
+        # ~4 次/秒：刷新流畅度；并检测片尾自动停播（避免时长一直涨、按钮仍显示暂停）
+        if self._perf_ui_tick % 15 == 0:
+            self._sync_eof_stop()
+            self._refresh_perf_label()
+        self._render_after_id = self.after(16, self._render_loop)
 
     def _display_rgb(self, rgb: np.ndarray):
         img = PIL.Image.fromarray(rgb)
-        photo = PIL.ImageTk.PhotoImage(image=img)
         cw, ch = self._canvas_wh()
-        if self._canvas_img_id is None:
-            self.video_canvas.delete("all")
-            self._canvas_img_id = self.video_canvas.create_image(cw // 2, ch // 2, image=photo)
-        else:
+        size = img.size  # (w, h)
+
+        # T1-3：尺寸不变时就地 paste 像素，省掉每帧 PhotoImage 分配 +
+        # 旧对象析构触发的 Tcl image delete（UI 顿挫与 GC 尖峰的主要来源）。
+        reused = False
+        if self._photo is not None and size == self._photo_size:
+            try:
+                self._photo.paste(img)
+                reused = True
+            except Exception:
+                # paste 失败（Tcl image 已失效等）→ 回退整体重建
+                self._photo = None
+                self._photo_size = (0, 0)
+
+        if not reused:
+            self._photo = PIL.ImageTk.PhotoImage(image=img)
+            self._photo_size = size
+            if self._canvas_img_id is None:
+                self.video_canvas.delete("all")
+                self._canvas_img_id = self.video_canvas.create_image(
+                    cw // 2, ch // 2, image=self._photo)
+            else:
+                self.video_canvas.itemconfig(self._canvas_img_id, image=self._photo)
+
+        if self._canvas_img_id is not None:
             self.video_canvas.coords(self._canvas_img_id, cw // 2, ch // 2)
-            self.video_canvas.itemconfig(self._canvas_img_id, image=photo)
-        self._photo = photo
         self._update_labels()
 
     # ==========================================================
@@ -415,20 +1858,29 @@ class VideoPreviewPlayer(tk.Frame):
                 break
         else:
             p = self.settings.get_params()
+            ignore_biz = bool(self.preview_ignore_speedup_var.get())
             for seg in self.speed_segments:
                 if seg['start'] <= cur <= seg['end']:
                     t = seg['type']
                     name = {FRAME_TYPE_1X: '1x', FRAME_TYPE_2X: '2x', FRAME_TYPE_0_2X: '0.2x'}.get(t, '?')
                     eff = 1
-                    if t == FRAME_TYPE_1X and p.get('speedup_1x'):  eff = 2
-                    if t == FRAME_TYPE_0_2X and p.get('speedup_02'):  eff = p.get('speedup_02_factor', 10)
+                    if not ignore_biz:
+                        if t == FRAME_TYPE_1X and p.get('speedup_1x'):
+                            eff = 2
+                        if t == FRAME_TYPE_0_2X and p.get('speedup_02'):
+                            eff = p.get('speedup_02_factor', 10)
                     speed_str = self.preview_speed_var.get().rstrip('x')
                     try:
                         pspeed = float(speed_str)
                     except ValueError:
                         pspeed = 1.0
                     total_eff = eff * pspeed
-                    info = f"变速 {name}" + (f"（预览 {total_eff:g}x）" if total_eff != 1 else "")
+                    extra = ""
+                    if total_eff != 1:
+                        extra = f"（预览 {total_eff:g}x）"
+                    elif ignore_biz and t in (FRAME_TYPE_1X, FRAME_TYPE_0_2X):
+                        extra = "（已忽略业务加速）"
+                    info = f"变速 {name}" + extra
                     break
         self.lbl_info.config(text=info)
 
@@ -448,20 +1900,29 @@ class VideoPreviewPlayer(tk.Frame):
         still_time = p['compare'].get('still_time_thresh', 0.1)
         still_frames = max(2, int(self.fps * still_time))
 
+        commands = []
         for seg in self.pause_segments:
+            seg_id = int(seg['id'])
             if mode == 'auto':
                 # 只要点击了智能裁剪，就利用保存好的 diffs 取出最新参数重算一次内部掩码
                 if self.diffs_array is not None:
                     new_mask, _ = analyzer._analyze_pause_mask(
                         seg['start'], seg['end'], self.diffs_array, still_frames, motion_thresh)
-                    seg['local_del_mask'] = new_mask
+                    old_mask = np.asarray(seg.get('local_del_mask'), dtype=np.uint8)
+                    commands.extend(
+                        self._mask_delta_commands(seg_id, old_mask, new_mask)
+                    )
 
                 if seg.get('boundary_diff', 0.0) < boundary_thresh:
-                    seg['mode'] = 'all'
+                    next_mode = 'all'
                 else:
-                    seg['mode'] = 'auto'
+                    next_mode = 'auto'
             else:
-                seg['mode'] = mode
+                next_mode = mode
+            if seg.get('mode', 'auto') != next_mode:
+                commands.append(SetPauseMode(seg_id, next_mode))
+
+        self._apply_project_commands(commands)
 
         if self.settings.selected_pause_id is not None:
             for seg in self.pause_segments:
@@ -469,8 +1930,6 @@ class VideoPreviewPlayer(tk.Frame):
                     self.settings.set_selected_pause(self.settings.selected_pause_id, seg['mode'])
                     break
 
-        self.timeline.mark_dirty()
-        self.timeline.redraw()
         if self.is_playing: self._send_play(self.current_frame_idx)
 
     def set_single_pause_mode(self, seg_id: int, mode: str):
@@ -480,131 +1939,169 @@ class VideoPreviewPlayer(tk.Frame):
         still_time = p['compare'].get('still_time_thresh', 0.1)
         still_frames = max(2, int(self.fps * still_time))
 
+        commands = []
         for seg in self.pause_segments:
             if seg['id'] == seg_id:
+                seg_id = int(seg_id)
                 if mode == 'auto':
                     # 针对单段重算内部裁剪掩码（如果用户调了灵敏度参数）
                     if self.diffs_array is not None:
                         new_mask, _ = analyzer._analyze_pause_mask(
                             seg['start'], seg['end'], self.diffs_array, still_frames, motion_thresh)
-                        seg['local_del_mask'] = new_mask
+                        old_mask = np.asarray(seg.get('local_del_mask'), dtype=np.uint8)
+                        commands.extend(
+                            self._mask_delta_commands(seg_id, old_mask, new_mask)
+                        )
 
-                seg['mode'] = mode
+                if seg.get('mode', 'auto') != mode:
+                    commands.append(SetPauseMode(seg_id, mode))
 
-                self.settings.set_selected_pause(seg_id, seg['mode'])
-                self.timeline.mark_dirty()
-                self.timeline.redraw()
-                if self.is_playing: self._send_play(self.current_frame_idx)
+                self._apply_project_commands(commands)
+                self.settings.set_selected_pause(seg_id, mode)
+                if self.is_playing:
+                    self._send_play(self.current_frame_idx)
                 break
+
+    @staticmethod
+    def _mask_delta_commands(seg_id: int, old_mask, new_mask) -> list:
+        """Encode changed mask runs as immutable half-open edit commands."""
+        old = np.asarray(old_mask, dtype=np.uint8).reshape(-1)
+        new = np.asarray(new_mask, dtype=np.uint8).reshape(-1)
+        if old.shape != new.shape:
+            raise ValueError("pause mask length changed during edit")
+        commands = []
+        start = None
+        value = None
+        for index, (before, after) in enumerate(zip(old.tolist(), new.tolist())):
+            if before == after:
+                if start is not None:
+                    commands.append(SetPauseMaskRun(seg_id, start, index, value))
+                    start = None
+                continue
+            if start is None:
+                start, value = index, int(after)
+            elif int(after) != value:
+                commands.append(SetPauseMaskRun(seg_id, start, index, value))
+                start, value = index, int(after)
+        if start is not None:
+            commands.append(SetPauseMaskRun(seg_id, start, len(new), value))
+        return commands
 
     # ==========================================================
     #  模板分析
     # ==========================================================
     def _start_analysis(self):
-        if not self.video_path: return
+        """Submit analysis from an owner-thread snapshot."""
+        if self._closing or not self.video_path:
+            return
         from tkinter import messagebox
         import analyzer
 
-        self.btn_analyze.config(state=tk.DISABLED, text="分析中...")
+        if (
+            getattr(self, "_export_handle", None) is not None
+            or getattr(self, "_segment_export_handle", None) is not None
+        ):
+            return messagebox.showwarning(
+                "任务进行中", "导出任务运行时不能同时开始分析。"
+            )
+
         p = self.settings.get_params()
+        video_path = str(self.video_path)
+        fps = float(self.fps or 30.0)
+        project_generation, timeline_revision = self._task_scope()
+        decode_backend = p.get("decode_backend", "opencv")
+        ffmpeg_path = p.get("ffmpeg_path")
+        ffprobe_path = p.get("ffprobe_path")
+        backend_note = ""
+        try:
+            backend_key = analyzer.normalize_decode_backend(decode_backend)
+        except Exception as norm_exc:
+            backend_key = "opencv"
+            backend_note = f"(invalid setting; using OpenCV: {norm_exc})"
+        backend_label = {
+            "opencv": "OpenCV",
+            "ffmpeg_sw_passthrough": "FFmpeg A_PT",
+        }.get(backend_key, backend_key) + backend_note
 
-        def worker():
-            proc_res = list(p['proc_res'])
-            cap_tmp = cv2.VideoCapture(self.video_path)
-            ret, f = cap_tmp.read()
-            cap_tmp.release()
-            if ret and proc_res[1] == 225:
-                h, ww = f.shape[:2];
-                proc_res[1] = int(proc_res[0] * h / ww)
-            proc_res = tuple(proc_res)
+        snapshot = {
+            "video_path": video_path,
+            "fps": fps,
+            "proc_res": tuple(p["proc_res"]),
+            "thresholds": dict(p["thresholds"]),
+            "compare": dict(p["compare"]),
+            "batch": p["batch"],
+            "threads": p["threads"],
+            "backend_key": backend_key,
+            "backend_label": backend_label,
+            "backend_note": backend_note,
+            "ffmpeg_path": ffmpeg_path,
+            "ffprobe_path": ffprobe_path,
+        }
 
-            configs, loaded = analyzer.load_templates(proc_res)
-            if loaded == 0:
-                self.after(0, lambda: messagebox.showwarning("模板缺失", "未找到可用模板，将标记所有帧为普通帧。"))
+        self.btn_analyze.config(state=tk.DISABLED, text="Analyzing...")
 
-            decode_backend = p.get('decode_backend', 'opencv')
-            ffmpeg_path = p.get('ffmpeg_path')
-            backend_note = ""
-            try:
-                backend_key = analyzer.normalize_decode_backend(decode_backend)
-            except Exception as norm_exc:
-                backend_key = 'opencv'
-                backend_note = f"（设置无效，已回退 OpenCV：{norm_exc}）"
-            backend_label = {
-                'opencv': 'OpenCV',
-                'ffmpeg_sw_passthrough': 'FFmpeg A_PT',
-            }.get(backend_key, backend_key) + backend_note
-
-            def prog(r):
-                label = backend_label.split('（')[0]
-                self.after(
-                    0,
-                    lambda: self.btn_analyze.config(
-                        text=f"{label} 匹配/分析 {int(r * 100)}%"
-                    ),
-                )
-
-            print(
-                f"[analyze] decode_backend={backend_key} "
-                f"ffmpeg_path={ffmpeg_path or 'auto'} "
-                f"proc_res={proc_res} video={self.video_path}"
-            )
-            if backend_note:
-                print(f"[analyze] {backend_note}", flush=True)
-            try:
-                states, diffs, context = analyzer.analyze_video_with_context(
-                    self.video_path, configs, p['thresholds'],
-                    proc_res, p['batch'], p['threads'], prog,
-                    decode_backend=backend_key,
-                    ffmpeg_path=ffmpeg_path,
-                )
-            except Exception as exc:
-                # Bind message now: lambda runs later; bare `exc` is cleared after except.
-                err_msg = (
-                    f"解码后端 {backend_label} 失败:\n"
-                    f"{type(exc).__name__}: {exc}\n\n"
-                    f"可改回 OpenCV（默认）后重试。"
-                )
-                self.after(
-                    0,
-                    lambda msg=err_msg: (
-                        self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析"),
-                        messagebox.showerror("分析失败", msg),
-                    ),
-                )
+        def on_progress(value):
+            if self._closing:
                 return
+            try:
+                label, ratio = value
+                percent = int(float(ratio) * 100)
+            except (TypeError, ValueError):
+                return
+            self.btn_analyze.config(text=f"{label.split('(')[0].strip()} {percent}%")
 
-            pauses, speeds = analyzer.build_segments(
-                states, diffs, self.video_path, proc_res, p['compare'], self.fps, prog,
-                analysis_context=context,
-            )
-            # Same predicate build_segments uses (not a looser complete-only check).
-            used_ctx = analyzer.analysis_context_skips_second_scan(
-                context, pauses, len(states)
-            )
-            print(
-                f"[analyze] context complete={context.get('complete') if isinstance(context, dict) else None} "
-                f"L={len(states)} "
-                f"pause_boundary_records="
-                f"{len(context.get('pause_boundary_diffs') or []) if isinstance(context, dict) else 0} "
-                f"skip_second_scan={used_ctx}",
-                flush=True,
-            )
-
-            # 把 diffs 一并传给完成函数以持久化
-            self.after(
-                0,
-                lambda: self._finish_analysis(
-                    states,
-                    diffs,
-                    pauses,
-                    speeds,
-                    backend_label=backend_label,
-                    context_used=used_ctx,
-                ),
+        def on_success(result):
+            if self._closing:
+                return
+            states, diffs, pauses, speeds, label, used_context, missing_templates = result
+            if missing_templates:
+                messagebox.showwarning(
+                    "Templates missing",
+                    "No usable templates were found; all frames will be treated as normal.",
+                )
+            self._finish_analysis(
+                states,
+                diffs,
+                pauses,
+                speeds,
+                backend_label=label,
+                context_used=used_context,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        def on_error(exc):
+            if self._closing:
+                return
+            self.btn_analyze.config(state=tk.NORMAL, text="Automatic analysis")
+            messagebox.showerror(
+                "Analysis failed",
+                f"Backend {backend_label} failed for {video_path}:\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Try OpenCV (the default decoder) and run it again.",
+            )
+
+        def on_cancelled():
+            if not self._closing:
+                self.btn_analyze.config(state=tk.NORMAL, text="Automatic analysis")
+
+        def on_done(_status):
+            self._analysis_handle = None
+
+        try:
+            self._analysis_handle = self.task_manager.submit(
+                _ANALYSIS_TASK,
+                lambda context: _run_analysis_task(context, snapshot),
+                on_success=on_success,
+                on_error=on_error,
+                on_progress=on_progress,
+                on_cancelled=on_cancelled,
+                on_done=on_done,
+                project_generation=project_generation,
+                timeline_revision=timeline_revision,
+                replace=True,
+            )
+        except RuntimeError:
+            self.btn_analyze.config(state=tk.NORMAL, text="Automatic analysis")
+            raise
 
     def _finish_analysis(
         self,
@@ -616,15 +2113,16 @@ class VideoPreviewPlayer(tk.Frame):
         context_used: bool = False,
     ):
         from tkinter import messagebox
+        clips = self._build_clip_segments(pauses, self.total_frames)
+        with self.task_manager.scope_transition():
+            snapshot = self.project_state.replace_timeline(pauses, speeds, clips)
+            self.task_manager.invalidate_scope(
+                project_generation=snapshot.project_generation,
+                timeline_revision=snapshot.timeline_revision,
+            )
+        self._publish_project_snapshot(snapshot)
         self.states_array = states
         self.diffs_array = diffs  # 储存 diffs
-        self.pause_segments = pauses
-        self.speed_segments = speeds
-        self.clip_segments = self._build_clip_segments(pauses, self.total_frames)
-
-        self.timeline.pause_segments = self.pause_segments
-        self.timeline.speed_segments = self.speed_segments
-        self.timeline.clip_segments = self.clip_segments
 
         self.timeline.selected_pause_id = None
         self.settings.set_selected_pause(None, "")
@@ -667,44 +2165,51 @@ class VideoPreviewPlayer(tk.Frame):
     # ==========================================================
     #  导出
     # ==========================================================
-    def export_video(self):
-        from tkinter import messagebox
-        import analyzer
-
-        if not self.video_path: return messagebox.showerror("错误", "请先加载视频")
-        p = self.settings.get_params()
-        if not p['output']: return messagebox.showerror("错误", "请先设置输出路径")
-
-        states = self.states_array if self.states_array is not None else np.zeros(self.total_frames, dtype=np.int8)
-        self.settings.export_btn.config(state=tk.DISABLED)
-
-        def worker():
-            to_del = analyzer.build_delete_set(
-                self.total_frames, states, self.pause_segments, self.speed_segments,
-                self.clip_segments, p['speedup_1x'], p['speedup_02'], p['speedup_02_factor'])
-
-            def prog(ratio, written):
-                self.after(0, lambda r=ratio: (
-                    self.settings.export_progress_var.set(r * 100),
-                    self.settings.export_status_var.set(f"写入 {int(r * 100)}%")))
-
+    def _pause_preview_for_export(self) -> bool:
+        """导出前停预览并尽量释放 VideoCapture，避免与导出双开同一文件。"""
+        try:
+            if self.is_playing:
+                self._stop_playback_ui(from_user=True)
+            elif self._io:
+                self._send_stop()
+        except Exception:
+            pass
+        # 释放预览 IO 占用的 cap；导完后按当前路径重建
+        old_io = self._io
+        self._io = None
+        if old_io is not None and not old_io.close(timeout=1.0):
+            self._io = old_io
+            return False
+        while True:
             try:
-                written, total = analyzer.export_video(
-                    self.video_path, p['output'], to_del, self.fps, p['quality'], prog,
-                    use_gpu=p.get('export_use_gpu', False),
-                    gpu_encoder=p.get('gpu_encoder', ''),
-                    ffmpeg_path=p.get('ffmpeg_path'))
-                self.after(0, lambda: self.settings.export_status_var.set(f"完成！{written}/{total} 帧"))
-                self.after(0,
-                           lambda: messagebox.showinfo(
-                               "导出完成",
-                               f"输出：{p['output']}\n总帧：{total}，保留：{written}\n已保留原始音频（如有）"))
-            except Exception as e:
-                self.after(0, lambda err=str(e): messagebox.showerror("导出失败", err))
-            finally:
-                self.after(0, lambda: self.settings.export_btn.config(state=tk.NORMAL))
+                self._frame_q.get_nowait()
+            except Empty:
+                break
+        return True
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _resume_preview_after_export(self) -> None:
+        """导出结束后重建预览 IO，停在导出前附近的帧。"""
+        if self._closing or not self.video_path:
+            return
+        try:
+            if self._io and self._io.is_alive():
+                return
+            self._io = VideoIOThread(self.video_path, self._frame_q)
+            self._io.start()
+            # 容器帧数可能与分析长度略有出入，以 IO 为准更新
+            if self._io.total:
+                self.total_frames = int(self._io.total)
+                self.timeline.total_frames = self.total_frames
+            if self._io.fps:
+                self.fps = float(self._io.fps)
+                self.timeline.fps = self.fps
+            # The reopened container may report a different frame count; in
+            # either case discard a plan derived from the pre-export IO.
+            self._invalidate_derived_timeline_plan()
+            idx = int(max(0, min(self.current_frame_idx, max(0, self.total_frames - 1))))
+            self._seek(idx, skip_trim=False)
+        except Exception:
+            pass
 
     @staticmethod
     def _speed_label(state: int) -> str:
@@ -712,15 +2217,14 @@ class VideoPreviewPlayer(tk.Frame):
             state, 'other')
 
     def _build_valid_segments_for_export(self, states: np.ndarray, split_by_speed: bool, merge_pause: bool) -> list:
-        import analyzer
-        to_del = analyzer.build_delete_set(
-            self.total_frames, states, self.pause_segments, self.speed_segments, self.clip_segments,
-            speedup_1x=False, speedup_02=False, speedup_02_factor=1)
+        total_frames = int(self.total_frames)
+        timeline_plan = self._build_timeline_plan(states=states)
+        to_del = np.asarray(timeline_plan.to_delete_mask(), dtype=bool)
         valid = ~to_del
 
         segs = []
         i = 0
-        while i < self.total_frames:
+        while i < total_frames:
             if not valid[i]:
                 i += 1
                 continue
@@ -730,7 +2234,7 @@ class VideoPreviewPlayer(tk.Frame):
             speed_label = self._speed_label(cur_state)
 
             if is_pause and merge_pause:
-                p_end = self.total_frames - 1
+                p_end = total_frames - 1
                 for pseg in self.pause_segments:
                     if pseg['start'] <= i <= pseg['end']:
                         p_end = pseg['end']
@@ -738,12 +2242,12 @@ class VideoPreviewPlayer(tk.Frame):
 
                 ranges = []
                 j = i
-                while j <= p_end and j < self.total_frames:
+                while j <= p_end and j < total_frames:
                     if valid[j] and int(states[j]) == FRAME_TYPE_PAUSE:
                         rs = j
-                        while j <= p_end and j < self.total_frames and valid[j] and int(states[j]) == FRAME_TYPE_PAUSE:
+                        while j <= p_end and j < total_frames and valid[j] and int(states[j]) == FRAME_TYPE_PAUSE:
                             j += 1
-                        ranges.append((rs, j - 1))
+                        ranges.append((rs, j))
                     else:
                         j += 1
 
@@ -751,7 +2255,7 @@ class VideoPreviewPlayer(tk.Frame):
                 i = p_end + 1
             else:
                 s = i
-                while i < self.total_frames and valid[i]:
+                while i < total_frames and valid[i]:
                     st = int(states[i])
                     if is_pause:
                         if st != FRAME_TYPE_PAUSE: break
@@ -759,10 +2263,9 @@ class VideoPreviewPlayer(tk.Frame):
                         if st == FRAME_TYPE_PAUSE: break
                         if split_by_speed and self._speed_label(st) != speed_label: break
                     i += 1
-                e = i - 1
-
                 label = 'pause' if is_pause else (speed_label if split_by_speed else 'normal')
-                segs.append({'ranges': [(s, e)], 'label': label})
+                if s < i:
+                    segs.append({'ranges': [(s, i)], 'label': label})
 
         # 新增：合并因为中间“全删”而导致的连续同类型片段
         merged_segs = []
@@ -781,93 +2284,221 @@ class VideoPreviewPlayer(tk.Frame):
 
     def export_segments(self):
         from tkinter import messagebox
-        import analyzer
 
-        if not self.video_path: return messagebox.showerror("错误", "请先加载视频")
+        if self._closing:
+            return
+        if (
+            getattr(self, "_export_handle", None) is not None
+            or getattr(self, "_segment_export_handle", None) is not None
+            or getattr(self, "_analysis_handle", None) is not None
+        ):
+            return messagebox.showwarning("导出进行中", "请等待当前导出任务结束。")
+        if not self.video_path:
+            return messagebox.showerror("错误", "请先加载视频")
 
+        video_path = str(self.video_path)
+        fps = float(self.fps or 30.0)
+        project_generation, timeline_revision = self._task_scope()
         p = self.settings.get_params()
-        out_path = p.get('output') or ""
-        if not out_path: return messagebox.showerror("错误", "请先设置导出路径（用于确定分段输出目录）")
+        total_frames = int(self.total_frames)
+        quality = int(p["quality"])
+        use_gpu = bool(p.get("export_use_gpu", False))
+        gpu_encoder = str(p.get("gpu_encoder", ""))
+        ffmpeg_path = p.get("ffmpeg_path")
+        ffprobe_path = p.get("ffprobe_path")
+        enforce_media_certification = bool(
+            p.get("enforce_media_certification", False)
+        )
+        out_path = p.get("output") or ""
+        if not out_path:
+            return messagebox.showerror(
+                "错误", "请先设置导出路径（用于确定分段输出目录）"
+            )
+        if enforce_media_certification and (
+            self.media_info is None or not self.media_info.complete_for_export
+        ):
+            return messagebox.showerror(
+                "无法导出",
+                "当前源文件尚未绑定完整的 FramePtsCertification，"
+                "请先完成帧时间戳认证。",
+            )
 
         out_root = os.path.dirname(out_path) or os.getcwd()
         base = os.path.splitext(os.path.basename(out_path))[0] or "segments"
-        out_dir = os.path.join(out_root, f"{base}_segments")
-        os.makedirs(out_dir, exist_ok=True)
-
-        states = self.states_array if self.states_array is not None else np.zeros(self.total_frames, dtype=np.int8)
-
+        out_dir_root = os.path.join(out_root, f"{base}_segments")
+        states = (
+            np.array(self.states_array, copy=True)
+            if self.states_array is not None
+            else np.zeros(total_frames, dtype=np.int8)
+        )
         split = self.settings.segment_split_by_speed_var.get()
         merge_pause = self.settings.merge_pause_ops_var.get()
         segs = self._build_valid_segments_for_export(states, split, merge_pause)
-        if not segs: return messagebox.showwarning("提示", "当前时间轴没有可导出的有效片段。")
+        timeline_plan = TimelinePlan.from_kept_ranges(
+            total_frames,
+            [item for seg in segs for item in seg["ranges"]],
+        )
+        if not segs:
+            return messagebox.showwarning(
+                "提示", "当前时间轴没有可导出的有效片段。"
+            )
 
+        if not self._pause_preview_for_export():
+            self.settings.segment_export_status_var.set(
+                "无法安全关闭预览，已取消分段导出"
+            )
+            return
         self.settings.segment_export_btn.config(state=tk.DISABLED)
+        self.settings.segment_export_progress_var.set(0)
+        self.settings.segment_export_status_var.set("准备分段导出…")
 
-        def worker():
+        def work(context):
+            context.checkpoint()
+            os.makedirs(out_dir_root, exist_ok=True)
+            out_dir = tempfile.mkdtemp(
+                prefix=f"run-{time.strftime('%Y%m%d-%H%M%S')}-",
+                dir=out_dir_root,
+            )
             total = len(segs)
             pad = max(1, len(str(total)))
-
             completed = 0
             succeeded = 0
             failures = []
-            lock = threading.Lock()
 
-            def export_single(idx_seg):
-                idx, seg = idx_seg
+            # Each FFmpeg encoder already uses its own internal parallelism.
+            # Serial files give deterministic cancellation and avoid a nested
+            # non-daemon executor that could outlive the Tk application.
+            for idx, seg in enumerate(segs, start=1):
+                context.checkpoint()
                 stem = f"{idx:0{pad}d}_{seg['label']}"
                 final_path = os.path.join(out_dir, f"{stem}.mp4")
-                success = False
-                error_text = ""
                 try:
-                    written, _ = analyzer.export_ranges(
-                        self.video_path, final_path, seg['ranges'],
-                        self.fps, p['quality'],
-                        use_gpu=p.get('export_use_gpu', False),
-                        gpu_encoder=p.get('gpu_encoder', ''),
-                        ffmpeg_path=p.get('ffmpeg_path'))
-                    success = written > 0 and os.path.isfile(final_path) and os.path.getsize(final_path) > 0
-                    if not success:
-                        error_text = "未生成有效输出文件"
-                except Exception as e:
-                    error_text = str(e)
-                    print(f"Export failed for {stem}: {error_text}")
-                if not success and os.path.isfile(final_path):
-                    try:
-                        os.remove(final_path)
-                    except OSError as cleanup_error:
-                        error_text += f"；清理失败: {cleanup_error}"
+                    request = ExportRequest.ranges_export(
+                        video_path,
+                        final_path,
+                        timeline_plan,
+                        list(seg["ranges"]),
+                        fps=fps,
+                        quality=quality,
+                        use_gpu=use_gpu,
+                        gpu_encoder=gpu_encoder,
+                        ffmpeg_path=ffmpeg_path,
+                        ffprobe_path=ffprobe_path,
+                        include_audio=False,
+                        media_info=getattr(self, "media_info", None),
+                        enforce_media_certification=enforce_media_certification,
+                    )
+                    result = MediaExporter().export(
+                        request,
+                        cancel_cb=context.checkpoint,
+                        source_path_override=video_path,
+                        commit_cb=lambda source, target: context.commit(
+                            os.replace, source, target
+                        ),
+                    )
+                    written = result.written_frames
+                    succeeded += 1
+                except TaskCancelled:
+                    raise
+                except Exception as exc:
+                    failures.append((stem, str(exc)))
 
-                nonlocal completed, succeeded
-                with lock:
-                    completed += 1
-                    if success:
-                        succeeded += 1
-                    else:
-                        failures.append((stem, error_text))
-                    ratio = completed / total
-                    self.after(0, lambda r=ratio, c=completed, ok=succeeded, t=total: (
-                        self.settings.segment_export_progress_var.set(r * 100),
-                        self.settings.segment_export_status_var.set(
-                            f"处理 {c}/{t}，成功 {ok}，失败 {c - ok}")))
+                completed += 1
+                context.report(
+                    {
+                        "ratio": completed / total,
+                        "completed": completed,
+                        "succeeded": succeeded,
+                        "total": total,
+                    }
+                )
 
-            max_w = 1 if p.get('export_use_gpu', False) else max(1, (os.cpu_count() or 2) // 2)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
-                list(executor.map(export_single, enumerate(segs, start=1)))
+            # All per-file publishes are complete.  Mark the batch final while
+            # it still owns this project scope so a later edit cannot relabel
+            # already committed output as a cancelled export.
+            context.commit(lambda: None, final=True)
+            return {
+                "out_dir": out_dir,
+                "total": total,
+                "succeeded": succeeded,
+                "failures": failures,
+            }
 
+        def on_progress(value):
+            if self._closing:
+                return
+            completed = value["completed"]
+            succeeded = value["succeeded"]
+            total = value["total"]
+            self.settings.segment_export_progress_var.set(value["ratio"] * 100)
+            self.settings.segment_export_status_var.set(
+                f"处理 {completed}/{total}，成功 {succeeded}，"
+                f"失败 {completed - succeeded}"
+            )
+
+        def on_success(result):
+            if self._closing:
+                return
+            total = result["total"]
+            succeeded = result["succeeded"]
+            failures = result["failures"]
             failed = len(failures)
-            self.after(0, lambda: self.settings.segment_export_status_var.set(
-                f"完成：成功 {succeeded}/{total}，失败 {failed}（分段默认不保留音频）"))
+            self.settings.segment_export_progress_var.set(100)
+            self.settings.segment_export_status_var.set(
+                f"完成：成功 {succeeded}/{total}，失败 {failed}"
+                "（分段默认不保留音频）"
+            )
             details = "\n".join(
-                f"- {name}: {error[:500]}" for name, error in failures[:3])
+                f"- {name}: {error[:500]}" for name, error in failures[:3]
+            )
             if failed:
-                self.after(0, lambda msg=details: messagebox.showwarning(
+                messagebox.showwarning(
                     "分段导出完成",
-                    f"输出目录：{out_dir}\n成功：{succeeded}/{total}\n失败：{failed}/{total}"
-                    + (f"\n\n部分错误：\n{msg}" if msg else "")))
+                    f"输出目录：{result['out_dir']}\n"
+                    f"成功：{succeeded}/{total}\n失败：{failed}/{total}"
+                    + (f"\n\n部分错误：\n{details}" if details else ""),
+                )
             else:
-                self.after(0, lambda: messagebox.showinfo(
+                messagebox.showinfo(
                     "分段导出完成",
-                    f"输出目录：{out_dir}\n成功：{succeeded}/{total}\n说明：分段导出默认不保留音频。"))
-            self.after(0, lambda: self.settings.segment_export_btn.config(state=tk.NORMAL))
+                    f"输出目录：{result['out_dir']}\n"
+                    f"成功：{succeeded}/{total}\n"
+                    "说明：分段导出默认不保留音频。",
+                )
 
-        threading.Thread(target=worker, daemon=True).start()
+        def on_error(exc):
+            if self._closing:
+                return
+            self.settings.segment_export_status_var.set(f"失败：{str(exc)[:80]}")
+            messagebox.showerror("分段导出失败", str(exc))
+
+        def on_cancelled():
+            if not self._closing:
+                self.settings.segment_export_status_var.set(
+                    "分段导出已取消；已完成文件保留，未完成临时文件已清理"
+                )
+
+        def on_done(_status):
+            self._segment_export_handle = None
+            if self._closing:
+                return
+            self.settings.segment_export_btn.config(state=tk.NORMAL)
+            self._resume_preview_after_export()
+
+        try:
+            self._segment_export_handle = self.task_manager.submit(
+                _SEGMENT_EXPORT_TASK,
+                work,
+                on_success=on_success,
+                on_error=on_error,
+                on_progress=on_progress,
+                on_cancelled=on_cancelled,
+                on_done=on_done,
+                project_generation=project_generation,
+                timeline_revision=timeline_revision,
+                replace=True,
+            )
+        except RuntimeError as exc:
+            self.settings.segment_export_btn.config(state=tk.NORMAL)
+            self.settings.segment_export_status_var.set(str(exc))
+            self._resume_preview_after_export()
