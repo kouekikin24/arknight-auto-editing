@@ -366,6 +366,109 @@ git diff --check
   `NOT_RUN`; `VideoIOThread` remains active and production `MpvEngine` is still
   prohibited.
 
+# Session log - 2026-08-17 (B' execution + approval line restart: G0 PASS, G5 measured)
+
+## B' targeted adjudication executed (production line)
+
+- Rule implemented and committed (`1735f8d`):
+  `PASS_WITH_HEAD_ANOMALIES` certification when duplicate/non-monotonic PTS is
+  confined to the first 32 frames and the decode is otherwise clean
+  (`frame_pts_certifier`, `media_info`, `pts_timeline`, `media_exporter`);
+  exporter records tick-collision drops with expected-on-disk frame math.
+- Real-sample certification: samples 1, 2, 3 all certify
+  `PASS_WITH_HEAD_ANOMALIES` (sample 4 certification pending in the running
+  E2E; samples 1-3 evidence cached under `.cache/media_info/frame_pts/`).
+- E2E export verified with ffprobe frame counts:
+  - sample 3: PASS, 1901 frames exactly.
+  - sample 2: PASS, 16973 = 16973 planned − 1 adjudicated tick-collision drop
+    (frame 2 shares tick 768 with deleted frame 5, exactly as predicted by
+    `PTS_ANOMALY_FACTS_20260816`) + 1 terminal clone guard frame.
+- Found and fixed during E2E (committed with the same checkpoint):
+  - VFR nested-`if` `setpts` broke FFmpeg's expression parser beyond ~100
+    segments; replaced with flat `select` (OR of between) + flat gap-sum
+    `setpts` (out = PTS − start − Σ gap_j if PTS ≥ gap_end_j). Depth-1,
+    scales to thousands of segments.
+  - Per-range `trim` chains cost O(ranges × frames) (30-min timeout at 683
+    ranges); the flat formulation fixed scaling for samples 2/3.
+  - Sample 1/4 (2312/2623 ranges) still needs ~35-90 min because each frame
+    evaluates O(segments) expression nodes; batched-seek processing is a
+    queued performance work item, not a correctness issue.
+  - Skip segments are already half-open `[start, end)` (verified via
+    `skip_frames_sum`); `ffmpeg_timeout` is now a parameter (large exports
+    need >1800 s).
+  - Terminal `tpad` clone guard restored: it keeps the last real frame's
+    muxed duration positive; it may or may not be frame-counted by the muxer
+    (both counts are accepted in the E2E verifier).
+
+## Approval line restart
+
+### G0 — PASS (formal evidence, first gate ever passed)
+
+- Downloaded and archived a project-owned libmpv: `tools/libmpv/` —
+  zhongfly/mpv-winbuild release `2026-08-16-e034d612cf`,
+  `mpv-dev-lgpl-x86_64-20260816-git-e034d612cf.7z`
+  (mpv v0.41.0-926-ge034d612c, x86_64, **LGPL** build; the previous
+  exploratory DLL was borrowed from `D:\NipaPlay` and is not needed anymore).
+- Five-piece provenance (`tools/libmpv/provenance.json`): source archive,
+  DLL, build record, license (LICENSE.LGPL at commit
+  e034d612cf6893954e943916988eef9e4426604c), redistribution note — all
+  SHA-256 bound and verified.
+- Formal env run (exit 0): `runtime_status=pass`,
+  `supply_chain_status=pass`, `provenance_files.status=pass`,
+  `loaded_dll_matches_provenance_{path,sha256}=true`, pre-registered env
+  thresholds pass. Evidence: `.cache/mpv_spike/20260817-083902/environment.json`.
+- Note: `tools/libmpv/` is kept on disk only (gitignored), hashes are
+  recorded in the env report and this document.
+
+### G5 — measured, FAIL under pre-registered thresholds (deterministic)
+
+New `stepspeed` command in `scripts/spike_mpv.py` (headless source-mode
+frame-step exactness, cold/hot back-step latency, measured speed rates,
+CPU sampling, hwdec/framedrop condition flags). Pre-registered thresholds in
+`.cache/mpv_spike/thresholds/stepspeed-20260817.json`. Three condition runs
+recorded under `.cache/mpv_spike/20260817-*/stepspeed.json`
+(sw default, hwdec=auto, framedrop=decoder):
+
+| Metric | Result | Threshold | Verdict |
+|---|---|---|---|
+| back-step p95 / max (sw) | 72.9 / 84.2 ms | 500 / 2000 ms | PASS |
+| speed x2 / x10 / x20 | 0.996 / 1.000 / 1.000 | ratio ∈ [0.8, 1.25] | PASS |
+| speed x80 (sw) | 0.503 → 40.2x, CPU 7.3 cores | ≥ 0.8 | FAIL |
+| speed x80 (hwdec=auto) | 0.159 → 12.7x | ≥ 0.8 | FAIL (worse) |
+| speed x80 (framedrop=decoder) | 0.572 → 45.8x | ≥ 0.8 | FAIL |
+| frame-step exactness | 7/20 fwd + 6/20 bwd steps move 2 frames; **net −3 frames drift** per 40-step round trip, deterministic across runs | ≤ 8 ms | FAIL |
+
+Interpretation (facts only, no decision taken):
+
+- 80x real-time playback is not sustainable on this hardware with this
+  decode path (best ≈ 45.8x with decoder framedrop); product speeds above
+  ~40x would need app-level frame skipping (the current CvEngine approach)
+  rather than mpv clock speed.
+- `frame-step`/`frame-back-step` is not frame-exact on this B-frame H.264
+  sample (display-order stepping; deterministic over-steps). This is the
+  most product-relevant finding because precise editing relies on stepping;
+  alternative stepping routes (seek-by-1/fps absolute+exact, or hwdec
+  variations) are not yet tested.
+- Per spec §6 decision tree, G4/G5 partial failure routes to “evaluate
+  hybrid, no full-replacement commitment” — it does not by itself close the
+  line; G2/G3 remain the hard gates.
+
+### Next approval-line candidates (unchanged discipline)
+
+- G5 follow-ups (small): seek-based stepping exactness probe; decide
+  whether the 2-frame over-step reproduces on another sample.
+- G1 WID diagnostics (real desktop), G6 full-WID lifecycle + onedir.
+- G2 stays BLOCKED; the B' adjudicated certification is a *candidate* third
+  route but requires an explicit spec amendment decision by the owner.
+
+## Production E2E (running in background)
+
+`scripts/run_real_sample_certified_export.py --stems 1,4 --threads 4`
+(sample certifications cached; sample 1 export restarted after the clean-G5
+pause, sample 4 certification+export queued). On completion: verify
+manifests, rewrite sample 3's manifest under the corrected verdict logic,
+update this log, final commit.
+
 # Production-line progress - 2026-08-16 PTS consumer and cancellation boundary
 
 - Certified full and ranged exports now call `analyzer.export_pts_schedule`.
