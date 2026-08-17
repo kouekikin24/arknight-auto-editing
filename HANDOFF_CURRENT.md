@@ -461,13 +461,39 @@ Interpretation (facts only, no decision taken):
 - G2 stays BLOCKED; the B' adjudicated certification is a *candidate* third
   route but requires an explicit spec amendment decision by the owner.
 
-## Production E2E (running in background)
+## G5 stepping follow-up probes (2026-08-17)
 
-`scripts/run_real_sample_certified_export.py --stems 1,4 --threads 4`
-(sample certifications cached; sample 1 export restarted after the clean-G5
-pause, sample 4 certification+export queued). On completion: verify
-manifests, rewrite sample 3's manifest under the corrected verdict logic,
-update this log, final commit.
+Two further `stepspeed` modes settled the stepping question:
+
+- `--step-mode seek` (relative seek by 1/fps): drift **+25 frames** per
+  40-step round trip — worst of the three; relative seeking accumulates
+  landing error on this B-frame content.
+- `--step-mode abs` (absolute seek to each step's target time,
+  `absolute+exact`): **0.0 frames drift, 0.0 ms max deviation on all 40
+  steps, back-step p95 20.7 ms** (~4x faster than `frame-step`). Landing
+  exactness is measured via mpv's own time-pos (ms-quantized) — the
+  zero-drift round trip is the strong signal; a content-level
+  (pixel/oracle) verification of landings remains available if an even
+  harder proof is wanted.
+
+Consequence: the earlier “mpv cannot step exactly” finding narrows to
+“mpv's `frame-step`/relative-seek stepping cannot step exactly; absolute
+certified-time seeks step exactly and faster”. This reopens a preview-only
+hybrid (mpv EDL preview + absolute-seek stepping + ≤46x speeds) as a
+viable route, gated on: (a) owner decision to amend G2 to accept
+adjudicated certification as a time route, (b) product ruling on the
+≤46x speed ceiling, (c) G1 WID + G6 lifecycle cost (~2-3 days).
+
+## Production E2E results (completed 2026-08-17)
+
+- Sample 1: **PASS** — 81376 frames ∈ {81375, 81376} (clone guard counted);
+  2312 kept ranges, certification `PASS_WITH_HEAD_ANOMALIES`.
+- Sample 4: certification `PASS_WITH_HEAD_ANOMALIES`; export killed at the
+  10800s timeout (2623 ranges × 424k frames ≈ 2.2B expression evaluations
+  per frame — the O(segments)-per-frame filter cost). Performance work item
+  (batched-seek export) is now **required** for sample 4 scale, not optional.
+- Samples 2 and 3: PASS (recorded earlier; sample 3 manifest to be
+  rewritten under the corrected base-or-base+1 verdict logic).
 
 # Production-line progress - 2026-08-16 PTS consumer and cancellation boundary
 

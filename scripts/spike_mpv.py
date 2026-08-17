@@ -2753,30 +2753,95 @@ def _cmd_stepspeed(args: argparse.Namespace) -> int:
     player.seek(args.start_pos, reference="absolute+exact")
     time.sleep(0.2)
     initial_pos = player.time_pos
-    forward_dev_ms: list[float] = []
-    for _index in range(args.step_repeats):
-        before = player.time_pos
-        player.frame_step()
-        after, _wait = _wait_for_time_change(
-            player, before, timeout=args.timeout, minimum_change=1e-4
-        )
-        if after is None or before is None or frame_duration is None:
-            failures.append({"phase": "forward_step", "index": _index})
-            continue
-        forward_dev_ms.append(abs(after - before - frame_duration) * 1000.0)
-    back_dev_ms: list[float] = []
-    for _index in range(args.step_repeats):
-        before = player.time_pos
-        player.frame_back_step()
-        after, _wait = _wait_for_time_change(
-            player, before, timeout=args.timeout, minimum_change=1e-4
-        )
-        if after is None or before is None or frame_duration is None:
-            failures.append({"phase": "back_step_exactness", "index": _index})
-            continue
-        back_dev_ms.append(abs(before - after - frame_duration) * 1000.0)
+    step_mode = getattr(args, "step_mode", "frame")
+
+    if step_mode == "abs" and frame_duration:
+        # Absolute addressing: every step seeks to a target time derived from
+        # the measured position, so landing error cannot accumulate.
+        forward_targets_ms: list[float] = []
+        forward_err_ms: list[float] = []
+        for _index in range(args.step_repeats):
+            before = player.time_pos
+            if before is None:
+                failures.append({"phase": "forward_step", "index": _index})
+                continue
+            target = before + frame_duration
+            started = time.perf_counter()
+            player.seek(target, reference="absolute+exact")
+            after, _wait = _wait_for_time_change(
+                player, before, timeout=args.timeout, minimum_change=1e-4
+            )
+            if after is None:
+                failures.append({"phase": "forward_step", "index": _index})
+                continue
+            forward_err_ms.append(abs(after - target) * 1000.0)
+        back_err_ms: list[float] = []
+        for _index in range(args.step_repeats):
+            before = player.time_pos
+            if before is None:
+                failures.append({"phase": "back_step_exactness", "index": _index})
+                continue
+            target = before - frame_duration
+            player.seek(target, reference="absolute+exact")
+            after, _wait = _wait_for_time_change(
+                player, before, timeout=args.timeout, minimum_change=1e-4
+            )
+            if after is None:
+                failures.append({"phase": "back_step_exactness", "index": _index})
+                continue
+            back_err_ms.append(abs(after - target) * 1000.0)
+        forward_dev_ms = forward_err_ms
+        back_dev_ms = back_err_ms
+
+        def step_forward() -> None:
+            if frame_duration:
+                pos = player.time_pos
+                if pos is not None:
+                    player.seek(pos + frame_duration, reference="absolute+exact")
+
+        def step_backward() -> None:
+            if frame_duration:
+                pos = player.time_pos
+                if pos is not None:
+                    player.seek(pos - frame_duration, reference="absolute+exact")
+    else:
+        def step_forward() -> None:
+            if step_mode == "seek" and frame_duration:
+                player.seek(frame_duration, reference="relative+exact")
+            else:
+                player.frame_step()
+
+        def step_backward() -> None:
+            if step_mode == "seek" and frame_duration:
+                player.seek(-frame_duration, reference="relative+exact")
+            else:
+                player.frame_back_step()
+
+        forward_dev_ms = []
+        for _index in range(args.step_repeats):
+            before = player.time_pos
+            step_forward()
+            after, _wait = _wait_for_time_change(
+                player, before, timeout=args.timeout, minimum_change=1e-4
+            )
+            if after is None or before is None or frame_duration is None:
+                failures.append({"phase": "forward_step", "index": _index})
+                continue
+            forward_dev_ms.append(abs(after - before - frame_duration) * 1000.0)
+        back_dev_ms = []
+        for _index in range(args.step_repeats):
+            before = player.time_pos
+            step_backward()
+            after, _wait = _wait_for_time_change(
+                player, before, timeout=args.timeout, minimum_change=1e-4
+            )
+            if after is None or before is None or frame_duration is None:
+                failures.append({"phase": "back_step_exactness", "index": _index})
+                continue
+            back_dev_ms.append(abs(before - after - frame_duration) * 1000.0)
     all_dev = forward_dev_ms + back_dev_ms
     final_pos = player.time_pos
+    report["step_mode"] = getattr(args, "step_mode", "frame")
     report["step_position_drift"] = {
         "initial_pos": initial_pos,
         "final_pos": final_pos,
@@ -2814,7 +2879,7 @@ def _cmd_stepspeed(args: argparse.Namespace) -> int:
                 )
                 continue
             started = time.perf_counter()
-            player.frame_back_step()
+            step_backward()
             _after, _waited = _wait_for_time_change(
                 player,
                 previous,
@@ -2841,7 +2906,7 @@ def _cmd_stepspeed(args: argparse.Namespace) -> int:
                 )
                 continue
             started = time.perf_counter()
-            player.frame_back_step()
+            step_backward()
             _after, _waited = _wait_for_time_change(
                 player,
                 previous,
@@ -3288,6 +3353,8 @@ def _parser() -> argparse.ArgumentParser:
     stepspeed.add_argument("--speed-window", type=float, default=2.0)
     stepspeed.add_argument("--hwdec", default=None, help="e.g. auto / d3d11va / no")
     stepspeed.add_argument("--framedrop", default=None, help="e.g. decoder / vo / decoder+vo")
+    stepspeed.add_argument("--step-mode", choices=["frame", "seek", "abs"], default="frame",
+                           help="frame-step command vs seek-by-one-frame-duration")
     _add_provenance_arguments(stepspeed)
     _add_run_binding_arguments(stepspeed)
     stepspeed.add_argument("--output", type=Path, default=None)
