@@ -484,6 +484,45 @@ viable route, gated on: (a) owner decision to amend G2 to accept
 adjudicated certification as a time route, (b) product ruling on the
 ≤46x speed ceiling, (c) G1 WID + G6 lifecycle cost (~2-3 days).
 
+## Owner decision 2026-08-17: preview-only mpv route approved
+
+Owner chose the preview-only integration path.  Scope: mpv serves EDL
+(edited-cut) preview playback and absolute certified-time stepping; the
+speed ceiling (~46x software decode) is accepted with app-level frame
+skipping for faster scrubbing; CvEngine remains installed during the
+integration period.  Required before wiring into preview_player: EDL
+correctness proof at cut points (G3 scope), SOURCE/EDL switching (G4
+scope), WID embedding (G1), lifecycle (G6).  The B' adjudicated
+certification is accepted as the EDL time route under this scope
+(preview-only), recorded here as the owner ruling for the spec amendment.
+
+## Preview-only spike results (2026-08-17, after owner route approval)
+
+New tools: `scripts/certified_edl_preview.py` (builds an mpv EDL from the
+certified tick table via `_fraction_filter_seconds`, never frame/fps), and
+`scripts/verify_certified_edl_exactness.py` (pixel-ID exactness proof on the
+synthetic cfr fixture).
+
+- **Clean synthetic source: EDL playback is frame-exact.** Deleting [4,6)
+  and [8,9) from the 12-frame fixture played back exactly
+  [1000,1001,1002,1003,1006,1007,1009,1010,1011] with zero deleted-frame
+  leakage (`certified_edl/synthetic/exactness.verify.json`).  The EDL
+  mechanism itself is proven exact.
+- **Real sample 3 (head-PTS anomalies):** mpv renders frames to images
+  (`vo=image`; the lavfi showinfo log channel is not observable from
+  python-mpv — don't retry it).  All 216 segment-boundary comparisons
+  matched the certified source frames, but pause frames are visually
+  identical so boundary checks alone cannot detect shifts.  The
+  full-sequence pixel comparison exposed a **2-frame lag at the
+  pause→play transition around source frame 10689** (transition content
+  appears at played positions 15-16 instead of 13-14) and one frame short
+  at EOF (1900/1901).  The lag size matches the head duplicate-tick count,
+  i.e. the irreducible tick ambiguity shifts time-addressed playback.
+- Product framing: the certified **export** path is frame-exact and
+  authoritative for final output; EDL **preview** on anomaly-bearing
+  sources carries a documented ±2-frame bias at content transitions.
+  Acceptable for preview UX; must be disclosed, not hidden.
+
 ## Production E2E results (completed 2026-08-17)
 
 - Sample 1: **PASS** — 81376 frames ∈ {81375, 81376} (clone guard counted);
