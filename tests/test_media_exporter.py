@@ -460,7 +460,9 @@ class MediaExporterTests(unittest.TestCase):
             self.assertEqual(drops[0]["n"], 2)
             self.assertEqual(drops[0]["pts"], 120)
             adjudication = snapshot.metadata()["head_anomaly_adjudication"]
-            self.assertEqual(adjudication["expected_on_disk_frames"], 4)
+            # 5 kept frames - 1 tick-collision drop + 1 terminal clone guard.
+            self.assertEqual(adjudication["expected_on_disk_frames"], 5)
+            self.assertTrue(adjudication["terminal_clone_guard_frame"])
             self.assertEqual(
                 adjudication["head_anomaly_limit_ticks"],
                 media_info.HEAD_ANOMALY_FRAME_LIMIT,

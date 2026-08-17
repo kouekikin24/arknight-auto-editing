@@ -290,8 +290,13 @@ class ExportValidationSnapshot:
                 "head_frame_limit": HEAD_ANOMALY_FRAME_LIMIT,
                 "head_anomaly_limit_ticks": self.pts_timeline.head_anomaly_limit,
                 "tick_collision_drops": [dict(drop) for drop in self.tick_collision_drops],
+                # The vfr select consumer appends one terminal clone frame so
+                # the last real frame gets a positive muxed duration; it sits
+                # beyond the container's nominal end but is frame-counted.
+                "terminal_clone_guard_frame": self.certification.status == "vfr",
                 "expected_on_disk_frames": self.expected_written
-                - len(self.tick_collision_drops),
+                - len(self.tick_collision_drops)
+                + (1 if self.certification.status == "vfr" else 0),
             },
         }
 
@@ -404,6 +409,7 @@ class MediaExporter:
         commit_cb: CommitCallback | None = None,
         preflight: dict[str, Any] | None = None,
         source_path_override: str | None = None,
+        ffmpeg_timeout: float = 1800.0,
     ) -> ExportResult:
         import analyzer
 
@@ -473,6 +479,7 @@ class MediaExporter:
                     include_audio=request.include_audio,
                     source_has_audio=media.has_audio,
                     frame_pts_status=certification.status,
+                    ffmpeg_timeout=float(ffmpeg_timeout),
                     progress_cb=progress_cb,
                     cancel_cb=cancel_cb,
                 )

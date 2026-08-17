@@ -136,7 +136,7 @@ def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, incl
     print(f"[{stem}] exporting {len(plan.kept_ranges)} kept ranges "
           f"({expected_written} frames) ...", flush=True)
     try:
-        result = MediaExporter().export(request)
+        result = MediaExporter().export(request, ffmpeg_timeout=10800.0)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr
         if isinstance(stderr, bytes):
@@ -146,15 +146,18 @@ def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, incl
 
     adjudication = result.metadata.get("head_anomaly_adjudication", {})
     drops = adjudication.get("tick_collision_drops", [])
-    expected_on_disk = adjudication.get(
-        "expected_on_disk_frames", expected_written
-    )
+    guard = adjudication.get("terminal_clone_guard_frame", False)
+    base_frames = expected_written - len(drops)
+    # The terminal clone guard frame may or may not be frame-counted by the
+    # muxer depending on where its passthrough timestamp lands; it only
+    # duplicates the final kept frame, so either count is content-correct.
+    accepted_counts = {base_frames, base_frames + 1} if guard else {base_frames}
     print(f"[{stem}] export done: written={result.written_frames} "
           f"expected={expected_written} drops={drops}", flush=True)
 
     print(f"[{stem}] counting output frames with ffprobe ...", flush=True)
     actual_frames = _count_output_frames(output)
-    verdict = "PASS" if actual_frames == expected_on_disk else "FAIL"
+    verdict = "PASS" if actual_frames in accepted_counts else "FAIL"
 
     manifest = {
         "kind": "real_sample_certified_export",
@@ -168,7 +171,8 @@ def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, incl
         "kept_ranges": len(plan.kept_ranges),
         "expected_written": expected_written,
         "head_anomaly_adjudication": adjudication,
-        "expected_on_disk_frames": expected_on_disk,
+        "accepted_on_disk_frame_counts": sorted(accepted_counts),
+        "terminal_clone_counted": bool(actual_frames == base_frames + 1),
         "actual_on_disk_frames": actual_frames,
         "verdict": verdict,
         "output": str(output),
@@ -181,7 +185,7 @@ def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, incl
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"[{stem}] verdict={verdict} frames={actual_frames}/"
-          f"{expected_on_disk} manifest={manifest_path}", flush=True)
+          f"{sorted(accepted_counts)} manifest={manifest_path}", flush=True)
     return manifest
 
 

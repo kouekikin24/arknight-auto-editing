@@ -1621,6 +1621,7 @@ def export_pts_schedule(
     frame_pts_status: str | None = None,
     progress_cb=None,
     cancel_cb=None,
+    ffmpeg_timeout: float = 1800.0,
 ) -> tuple[int, int, dict[str, Any]]:
     """Export an immutable PTS schedule without falling back to FPS arithmetic.
 
@@ -1752,7 +1753,7 @@ def export_pts_schedule(
             f"按认证 PTS 时间表导出（{len(schedule)} 段）…",
         )
         try:
-            _run_ffmpeg_interruptible(cmd, timeout=1800.0, cancel_cb=cancel_cb)
+            _run_ffmpeg_interruptible(cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb)
         except BaseException:
             if os.path.isfile(output_path):
                 try:
