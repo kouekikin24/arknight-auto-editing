@@ -404,6 +404,46 @@ G0-G6 全部通过
 ```
 
 无论 mpv 结果如何，下一项正式生产代码改造仍是统一 `TimelinePlan`。
+
+# Owner amendment - 2026-08-17 preview-only route
+
+The owner approved a bounded preview integration after the G0 provenance
+evidence and the G5 absolute+exact seek measurements were recorded.  This
+amendment supersedes only the sequencing rule above; it does not change the
+Gate meanings or export authority:
+
+- libmpv is preview-only.  It may render SOURCE and certified-tick EDL views,
+  but it is not an export backend and must not alter `MediaExporter` or the
+  FFmpeg certification path.
+- The B' head-anomaly adjudication is accepted as the preview EDL time route.
+  Any bounded transition bias remains explicit preview metadata and is not a
+  claim of export-frame equivalence.
+- `VideoIOThread` and `CvEngine` remain installed as the compatibility and
+  high-speed frame-skip fallback.  If the project-owned libmpv runtime cannot
+  load, SOURCE preview must remain usable through CvEngine.
+- SOURCE editing seeks use certified PTS ticks with `absolute+exact` once the
+  current certification is bound.  Deleted source frames are not silently
+  snapped during editing; EDL playback may snap only when resuming the cut.
+- G3/G4/G1/G6 remain required for the preview integration and are not implied
+  by unit tests or by the existing headless evidence.  The overall Phase 0
+  decision remains `INCONCLUSIVE` until those scopes are separately measured.
+
+The preview EDL writer also applies the B' collision boundary explicitly: one
+kept head frame that falls outside its certified tick interval may be published
+only with collision-frame metadata and a visible preview-bias reason. Multiple
+such frames, or a collision outside the adjudicated head window, fail closed;
+no `frame / fps` time is synthesized to hide the ambiguity.
+
+Native mpv currently rejects business frame-speed policies with
+`MPV_SPEED_POLICY_UNSUPPORTED`; those requests continue through the retained
+`CvEngine`/`VideoIOThread` high-speed path until an independently certified
+piecewise mpv pacing implementation exists.
+
+Current owner status (2026-08-18) supersedes older gate-table prose in this
+historical specification: G0 is formally `PASS` for the project-owned LGPL
+libmpv provenance bundle. The preview integration must still treat G1/G3/G4/G6
+as unaccepted until their real WID, cut-point, switching, and distribution
+evidence is collected.
 # Authority override - 2026-08-14
 
 - The project owner authorizes independent Codex evidence review to replace the previous human-observation step.

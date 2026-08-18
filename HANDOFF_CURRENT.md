@@ -659,3 +659,66 @@ match those recorded hashes (`scripts/verify_mpv_frames.py` still matches).
 This drift is intentional (reviewed fixes, 356 tests green) and is recorded
 here instead of editing the write-once v2 decision. The next gate-decision
 version must re-bind the contract hashes when it is written.
+
+# Preview integration increment - 2026-08-18
+
+The owner-approved preview-only route is now represented by four small
+modules: `preview_engine.py` (request/protocol boundary), `cv_engine.py`
+(adapter over the existing `VideoIOThread`), `certified_edl.py` (source-bound
+PTS/tick EDL builder), and `mpv_engine.py` (injectable source/EDL libmpv
+preview skeleton). `preview_player.py` selects `cv` by default and accepts
+`preview_engine="mpv"` or `ARKNIGHT_PREVIEW_ENGINE=mpv`; a missing project-owned
+mpv DLL falls back to CvEngine. Export code and `VideoIOThread` were left
+unchanged.
+
+The adapter tests cover pending `file-loaded` exact seeks, SOURCE -> EDL ->
+SOURCE generation isolation, bounded native close retries, UTF-8 EDL paths,
+tick-only interval construction, and the Cv fallback command mapping. The
+repository regression is `371 passed` (70 subtests) after this increment.
+This does not change Gate status: real Tk WID pixels, resize/DPI/focus,
+cut-point playback, full SOURCE/EDL switching pressure, and onedir lifecycle
+remain outstanding G1/G3/G4/G6 work.
+
+# Preview contract hardening - 2026-08-18
+
+The preview increment was audited and tightened without changing the export
+authority or deleting the OpenCV path:
+
+- `CvEngine` now has a one-way, retryable close boundary. Control and metrics
+  mutations after close fail with `ENGINE_CLOSED`, and a successful close emits
+  one lifecycle event only.
+- `MpvEngine` validates source-bound certification requests, keeps a cheap
+  size/mtime identity guard for exact seeks, and reads the native `path`
+  property when a `file-loaded` callback races the observed property callback.
+  VFR pointer/EDL mapping uses floor frame ownership instead of nearest PTS.
+- Certified EDL construction records B' head tick collisions explicitly. One
+  adjudicated head collision may be previewed with bias metadata; multiple or
+  out-of-policy collisions fail closed before publishing an EDL. The affected
+  source frame is never described as exact.
+- A rejected mpv/CV playback request now returns the Tk player to stopped state,
+  including the button and calibration timer state.
+- Native mpv explicitly rejects unimplemented business frame-speed policies
+  with `MPV_SPEED_POLICY_UNSUPPORTED`; the default CvEngine remains the path
+  for those high-speed/frame-skip requests.
+
+Verification after this hardening: `python -m pytest tests/ -q` -> `387 passed`,
+`90 subtests passed`; isolated-cache `compileall` and `git diff --check` pass.
+This remains code/fake-binding verification only. G1/G3/G4/G6 real-window and
+distribution acceptance are still outstanding, and Phase 0 remains
+`INCONCLUSIVE`.
+
+A new bounded real-binding smoke also loaded the existing tiny CFR fixture with
+the project-owned DLL, observed `file-loaded` plus native property events, and
+closed cleanly (`alive: true -> false`). It used `vo=null`, no certification,
+and no EDL; this is a source-load sanity check only, not G1/G3/G4 acceptance.
+
+# Current owner status override - 2026-08-18
+
+The historical 2026-08-16 note above that reports a missing DLL is superseded
+by the current owner decision and filesystem evidence: the project-owned LGPL
+`tools/libmpv/dll/libmpv-2.dll` is present and its provenance archive, build
+record, license, redistribution note, and hashes are registered in
+`tools/libmpv/provenance.json`. G0 is therefore the formal `PASS` recorded by
+the owner. This does not promote the remaining real-window, cut-point,
+switching, or distribution scopes: G1/G3/G4/G6 still require their own
+acceptance, and the retained CvEngine remains mandatory fallback.
