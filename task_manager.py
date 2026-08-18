@@ -360,11 +360,22 @@ class TaskManager:
         """Run current callbacks; call this only from the Tk owner thread."""
         delivered = self._dispatch_posted()
         self._dispatch_progress()
+        # ``Future.result()`` may wake its waiter immediately after marking
+        # the future finished, before concurrent.futures invokes done
+        # callbacks.  Give that callback a bounded couple of scheduling turns
+        # so an owner dispatch immediately following ``result()`` cannot miss
+        # a completion.  The wait is only paid when the queue is empty.
+        empty_rounds = 0
         while True:
             try:
                 completion = self._completions.get_nowait()
             except Empty:
-                break
+                if empty_rounds >= 2:
+                    break
+                empty_rounds += 1
+                time.sleep(0.001)
+                continue
+            empty_rounds = 0
 
             handle = completion.handle
             with self._lock:

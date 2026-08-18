@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import ttk
 import cv2
+import inspect
 import numpy as np
 import PIL.Image
 import PIL.ImageTk
@@ -15,6 +16,14 @@ from queue import Queue, Empty
 from frame_types import (FRAME_TYPE_NORMAL, FRAME_TYPE_PAUSE,
                          FRAME_TYPE_1X, FRAME_TYPE_2X, FRAME_TYPE_0_2X)
 from video_io import VideoIOThread, CMD_SEEK, CMD_SEEK_LATEST, CMD_PLAY, CMD_STOP
+from cv_engine import CvEngine
+from mpv_engine import MpvEngine
+from preview_engine import (
+    PreviewEngine,
+    PreviewEngineError,
+    PreviewPlayRequest,
+    SourceSeekRequest,
+)
 from timeline_widget import TimelineWidget
 from timeline_plan import TimelinePlan
 from media_exporter import ExportRequest, ExportResult, MediaExporter
@@ -154,6 +163,8 @@ class VideoPreviewPlayer(tk.Frame):
         height=450,
         *,
         task_manager: TaskManager | None = None,
+        preview_engine: str | None = None,
+        engine_factory=None,
     ):
         super().__init__(parent)
         self.settings = settings
@@ -166,6 +177,12 @@ class VideoPreviewPlayer(tk.Frame):
         self._export_handle: TaskHandle | None = None
         self._segment_export_handle: TaskHandle | None = None
         self._closing = False
+        requested_engine = (
+            preview_engine
+            or os.environ.get("ARKNIGHT_PREVIEW_ENGINE", "cv")
+        ).strip().lower()
+        self._preview_engine_kind = requested_engine if requested_engine in {"cv", "mpv"} else "cv"
+        self._engine_factory = engine_factory
         self.video_path = video_path
         self.media_info = None
         self.media_info_error: Exception | None = None
@@ -198,7 +215,7 @@ class VideoPreviewPlayer(tk.Frame):
         self._cut_plan_cache: tuple[int, TimelinePlan] | None = None
 
         self.is_playing = False
-        self._io: VideoIOThread | None = None
+        self._io: PreviewEngine | None = None
         # 略大于 2：解码偶发尖峰时少丢帧；渲染侧仍只取最新一帧
         self._frame_q: Queue = Queue(maxsize=4)
         self._canvas_img_id = None
@@ -250,16 +267,26 @@ class VideoPreviewPlayer(tk.Frame):
     #  UI 构建
     # ==========================================================
     def _setup_ui(self):
-        self.video_canvas = tk.Canvas(self, width=self.canvas_w, height=self.canvas_h, bg="black")
-        self.video_canvas.pack(pady=5, fill=tk.BOTH, expand=True)
-        self.video_canvas.bind("<Button-1>", lambda e: self.video_canvas.focus_set())
+        # Native mpv rendering receives this dedicated child Frame WID.  The
+        # Canvas remains the sole RGB target for CvEngine.
+        self.video_surface = tk.Frame(self, bg="black")
+        self.video_surface.pack(pady=5, fill=tk.BOTH, expand=True)
+        self.video_canvas = tk.Canvas(
+            self.video_surface, width=self.canvas_w, height=self.canvas_h, bg="black"
+        )
+        self.video_canvas.pack(fill=tk.BOTH, expand=True)
+        self.mpv_host = tk.Frame(self.video_surface, bg="black")
+        self.video_surface.bind("<Configure>", self._on_video_surface_configure, add="+")
+        self.video_surface.bind("<Button-1>", lambda _event: self._focus_preview(), add="+")
+        self.mpv_host.bind("<Button-1>", lambda _event: self._focus_preview(), add="+")
+        self.video_canvas.bind("<Button-1>", lambda _event: self._focus_preview())
 
         self.timeline = TimelineWidget(self)
         self.timeline.pack(fill=tk.X, padx=10)
         self.timeline.on_seek_cb = self._on_tl_seek
         self.timeline.on_handle_end_cb = self._on_tl_drag_end
         self.timeline.on_edit_cb = self._on_timeline_edit
-        self.timeline.canvas.bind("<Button-1>", lambda e: self.video_canvas.focus_set(), add='+')
+        self.timeline.canvas.bind("<Button-1>", lambda _event: self._focus_preview(), add='+')
 
         ctrl = ttk.Frame(self)
         ctrl.pack(fill=tk.X, pady=5)
@@ -344,6 +371,116 @@ class VideoPreviewPlayer(tk.Frame):
 
         self._render_loop()
         self._bind_after_id = self.after_idle(self._bind_keys)
+
+    def _show_engine_surface(self, native: bool, engine: PreviewEngine | None = None) -> None:
+        if native:
+            self.video_canvas.pack_forget()
+            self.mpv_host.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.mpv_host.pack_forget()
+            self.video_canvas.pack(fill=tk.BOTH, expand=True)
+        try:
+            self.video_surface.update_idletasks()
+            target = engine or self._io
+            if target is not None:
+                width = max(1, self.video_surface.winfo_width() or self.canvas_w)
+                height = max(1, self.video_surface.winfo_height() or self.canvas_h)
+                target.set_viewport(width, height, self._preview_dpi_scale())
+        except Exception:
+            pass
+
+    def _focus_preview(self) -> None:
+        """Keep global playback shortcuts active after a native WID click."""
+        try:
+            self.focus_set()
+            self.winfo_toplevel().focus_force()
+        except Exception:
+            pass
+
+    def _preview_dpi_scale(self) -> float:
+        try:
+            # Tk reports physical pixels per inch; 96 is the Windows logical
+            # baseline used by libmpv's WID viewport.
+            return max(0.25, float(self.winfo_fpixels("1i")) / 96.0)
+        except Exception:
+            return 1.0
+
+    def _on_video_surface_configure(self, event) -> None:
+        if self._closing or self._io is None:
+            return
+        try:
+            self._io.set_viewport(
+                max(1, int(event.width)),
+                max(1, int(event.height)),
+                self._preview_dpi_scale(),
+            )
+        except Exception:
+            pass
+
+    def _make_preview_engine(self, path: str) -> PreviewEngine:
+        # CvEngine owns the only long-lived OpenCV capture.  Avoid opening a
+        # second probe capture on that path; mpv/factory engines need the small
+        # container-shape hint before their first request.
+        if self._engine_factory is None and self._preview_engine_kind == "cv":
+            engine = CvEngine(path, self._frame_q)
+            engine.start()
+            self._show_engine_surface(bool(getattr(engine, "native_rendering", False)), engine)
+            return engine
+
+        cap = cv2.VideoCapture(path)
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            cap.release()
+        if self._engine_factory is not None:
+            factory_kwargs = {
+                "frame_queue": self._frame_q,
+                "wid": self.mpv_host.winfo_id(),
+                "fps": fps,
+                "total": total,
+            }
+            try:
+                parameters = inspect.signature(self._engine_factory).parameters
+                accepts_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                if not accepts_kwargs:
+                    factory_kwargs = {
+                        key: value
+                        for key, value in factory_kwargs.items()
+                        if key in parameters
+                    }
+            except (TypeError, ValueError):
+                # Some extension callables do not expose a Python signature;
+                # pass the full documented factory contract in that case.
+                pass
+            engine = self._engine_factory(path, **factory_kwargs)
+        elif self._preview_engine_kind == "mpv":
+            try:
+                engine = MpvEngine(
+                    path,
+                    wid=self.mpv_host.winfo_id(),
+                    fps=fps,
+                    total=total,
+                    dll_dir=os.environ.get("MPV_DLL_DIR"),
+                    edl_dir=Path(__file__).resolve().parent / ".cache" / "preview_edl",
+                )
+                engine.start()
+            except PreviewEngineError as exc:
+                if exc.code not in {"MPV_DLL_MISSING", "MPV_IMPORT_FAILED"}:
+                    raise
+                # Keep the established OpenCV path usable when the optional
+                # project-owned mpv runtime is absent or cannot import.
+                self._preview_engine_kind = "cv"
+                engine = CvEngine(path, self._frame_q)
+        else:
+            engine = CvEngine(path, self._frame_q)
+        if not getattr(engine, "_started", False):
+            engine.start()
+        self._show_engine_surface(bool(getattr(engine, "native_rendering", False)), engine)
+        return engine
 
     # ==========================================================
     #  视频加载
@@ -487,8 +624,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline.selected_pause_id = None
         self.settings.set_selected_pause(None, "")
 
-        self._io = VideoIOThread(path, self._frame_q)
-        self._io.start()
+        self._io = self._make_preview_engine(path)
         self.fps = self._io.fps
         self.total_frames = self._io.total
 
@@ -596,13 +732,19 @@ class VideoPreviewPlayer(tk.Frame):
                 return
             self.media_info = result.media_info
             self.frame_pts_status = result.status
-            if result.status == "PASS":
-                self.frame_pts_error = None
-            else:
+            certified = bool(getattr(result, "certified", False))
+            if not certified:
                 self.frame_pts_error = RuntimeError(
                     "frame PTS certification blocked: "
                     + ", ".join(result.reason_codes)
                 )
+            else:
+                self.frame_pts_error = None
+                if self._io is not None:
+                    try:
+                        self._io.bind_media_info(self.media_info)
+                    except Exception as exc:
+                        self.frame_pts_error = exc
 
         def on_error(exc: BaseException) -> None:
             if self._closing or Path(self.video_path).resolve() != Path(source_path):
@@ -632,8 +774,8 @@ class VideoPreviewPlayer(tk.Frame):
     #  IO 线程命令封装
     # ==========================================================
     def _canvas_wh(self) -> tuple:
-        cw = self.video_canvas.winfo_width() or self.canvas_w
-        ch = self.video_canvas.winfo_height() or self.canvas_h
+        cw = self.video_surface.winfo_width() or self.canvas_w
+        ch = self.video_surface.winfo_height() or self.canvas_h
         return (max(1, cw), max(1, ch))
 
     def _speed_segs_snap(self) -> list:
@@ -752,22 +894,76 @@ class VideoPreviewPlayer(tk.Frame):
         # into this cut-only plan.
         return list(self._build_timeline_plan().deleted_ranges)
 
+    def _preview_pts_ready(self) -> bool:
+        media = self.media_info
+        if media is None:
+            return False
+        # ``complete_for_export`` re-hashes the source and revalidates both
+        # tools.  That is appropriate at the certification boundary, but this
+        # helper runs on every drag/step seek.  The certification callback has
+        # already performed that gate and binds the immutable evidence here.
+        return bool(
+            getattr(media, "frame_pts_authoritative", False)
+            and getattr(media, "frame_pts_certification", None) is not None
+            and self.frame_pts_error is None
+        )
+
     def _seek(self, frame_idx: int, skip_trim: bool = False):
         self._auto_rate_clear()
         if not self._io: return
+        frame_idx = max(0, min(int(frame_idx), max(0, self.total_frames - 1)))
         self.current_frame_idx = frame_idx
         self.timeline.current_frame_idx = frame_idx
-        self._io.send({
-            'type': CMD_SEEK_LATEST,
-            'frame': frame_idx,
-            'timeline_revision': self._timeline_revision,
-            'canvas_wh': self._canvas_wh(),
-            'pause_segs': self._all_skip_segs_snap(),
-            'skip_trimmed': skip_trim,
-        })
+        _project_generation, timeline_revision = self._task_scope()
+        self._timeline_revision = timeline_revision
+        try:
+            self._io.seek_source(
+                SourceSeekRequest(
+                    source_frame=frame_idx,
+                    canvas_size=self._canvas_wh(),
+                    timeline_revision=timeline_revision,
+                    # Before certification, only frame zero can be addressed
+                    # by the mpv engine.  Once bound, all source seeks use the
+                    # certified PTS table and absolute+exact mode.
+                    exact=self._preview_pts_ready(),
+                    latest_only=True,
+                )
+            )
+        except PreviewEngineError as exc:
+            if exc.code != "CERTIFICATION_REQUIRED":
+                raise
+            try:
+                self.lbl_info.config(text="认证时间表尚未就绪，暂不能精确定位")
+            except Exception:
+                pass
 
-    def _send_play(self, start: int):
-        if not self._io: return
+    def _reject_play_request(self, message: str) -> None:
+        """Return the UI to a stopped state when an engine rejects playback."""
+
+        self.is_playing = False
+        try:
+            self._auto_rate_clear()
+        except Exception:
+            pass
+        if getattr(self, "_calib_active", False):
+            try:
+                self._calib_cancel_timer()
+            except Exception:
+                pass
+            self._calib_active = False
+        try:
+            self.btn_play.config(text="▶ 播放")
+        except Exception:
+            pass
+        try:
+            self.lbl_info.config(text=message)
+        except Exception:
+            pass
+
+    def _send_play(self, start: int) -> bool:
+        if not self._io:
+            self._reject_play_request("预览引擎尚未就绪")
+            return False
         self._apply_pace_mode_to_io()
         p = self.settings.get_params()
 
@@ -785,27 +981,46 @@ class VideoPreviewPlayer(tk.Frame):
             speed_multiplier = 1.0 / max(speed, 0.01)
 
         ignore_biz = bool(self.preview_ignore_speedup_var.get())
-        self._io.send({
-            'type': CMD_PLAY,
-            'params': {
-                'start_frame': start,
-                'preview_step': preview_step,
-                'speed_multiplier': speed_multiplier,
-                'skip_trimmed': self.skip_trimmed.get(),
-                'speedup_1x': False if ignore_biz else p['speedup_1x'],
-                'speedup_02': False if ignore_biz else p['speedup_02'],
-                'speedup_02_factor': p['speedup_02_factor'],
-                'pause_segs': self._all_skip_segs_snap(),
-                'timeline_revision': self._timeline_revision,
-                'speed_segs': self._speed_segs_snap(),
-                'canvas_wh': self._canvas_wh(),
-                # S1: preview step cap (same as VideoIOThread._PREVIEW_STEP_CAP)
-                'preview_step_cap': 3,
-                # 吸收小裁剪段：>0 会把被裁掉的帧真的播出来（暂停闪屏来源），
-                # 故默认 0 关闭；消除 seek 尖峰改由 _GRAB_SEEK_THRESHOLD 承担。
-                'skip_trim_min_span': 0,
-            }
-        })
+        if self.total_frames <= 0:
+            self._reject_play_request("当前源没有可播放帧")
+            return False
+        start = max(0, min(int(start), self.total_frames - 1))
+        try:
+            plan = self._build_timeline_plan()
+            project_generation, timeline_revision = self._task_scope()
+            request = PreviewPlayRequest(
+                start_frame=start,
+                playback_rate=speed,
+                preview_step=preview_step,
+                speed_multiplier=speed_multiplier,
+                skip_trimmed=bool(self.skip_trimmed.get()),
+                speedup_1x=False if ignore_biz else bool(p['speedup_1x']),
+                speedup_02=False if ignore_biz else bool(p['speedup_02']),
+                speedup_02_factor=int(p['speedup_02_factor']),
+                timeline_plan=plan,
+                speed_segments=tuple(self._speed_segs_snap()),
+                canvas_size=self._canvas_wh(),
+                project_generation=project_generation,
+                timeline_revision=timeline_revision,
+                preview_step_cap=3,
+                skip_trim_min_span=0,
+            )
+            accepted = bool(self._io.play(request))
+            if not accepted:
+                self._reject_play_request("预览引擎拒绝了播放请求")
+                return False
+            return True
+        except PreviewEngineError as exc:
+            message = (
+                "认证时间表尚未就绪，无法播放剪辑预览"
+                if exc.code == "CERTIFICATION_REQUIRED"
+                else f"预览启动失败: {exc.code}"
+            )
+            self._reject_play_request(message)
+            return False
+        except (OSError, ValueError, TypeError) as exc:
+            self._reject_play_request(f"预览启动失败: {exc}")
+            return False
     def _on_preview_option_change(self):
         """倍速 / 跳裁剪 / 忽略业务加速 变更时，播放中立刻按新参数续播。"""
         if self.is_playing:
@@ -1296,7 +1511,8 @@ class VideoPreviewPlayer(tk.Frame):
 
 
     def _send_stop(self):
-        if self._io: self._io.send({'type': CMD_STOP})
+        if self._io:
+            self._io.stop()
 
     # ==========================================================
     #  键盘快捷键
@@ -1393,13 +1609,21 @@ class VideoPreviewPlayer(tk.Frame):
 
     def _do_preview_seek(self):
         if not self._io or self.total_frames <= 0: return
-        self._io.send({
-            'type': CMD_SEEK_LATEST,
-            'frame': self.current_frame_idx,
-            'canvas_wh': self._canvas_wh(),
-            'pause_segs': [],
-            'skip_trimmed': False,
-        })
+        _project_generation, timeline_revision = self._task_scope()
+        self._timeline_revision = timeline_revision
+        try:
+            self._io.seek_source(
+                SourceSeekRequest(
+                    source_frame=max(0, min(self.current_frame_idx, self.total_frames - 1)),
+                    canvas_size=self._canvas_wh(),
+                    timeline_revision=timeline_revision,
+                    exact=self._preview_pts_ready(),
+                    latest_only=True,
+                )
+            )
+        except PreviewEngineError as exc:
+            if exc.code != "CERTIFICATION_REQUIRED":
+                raise
 
     def _step_frame(self, delta: int, seek: bool = True):
         if self.total_frames <= 0: return
@@ -1576,7 +1800,9 @@ class VideoPreviewPlayer(tk.Frame):
         except Exception:
             pass
         self._reset_ui_gap_stats()
-        self._send_play(self.current_frame_idx)
+        if not self._send_play(self.current_frame_idx):
+            self._calib_active = False
+            return
         self._calib_after_id = self.after(10000, self._calib_finish_run)
 
     def _calib_finish_run(self) -> None:
@@ -1780,6 +2006,19 @@ class VideoPreviewPlayer(tk.Frame):
         if self._closing:
             self._render_after_id = None
             return
+        if self._io is not None:
+            try:
+                self._io.poll_events()
+            except Exception:
+                pass
+            if bool(getattr(self._io, "native_rendering", False)) and not self._is_dragging:
+                try:
+                    native_frame = self._io.snapshot_perf().get("source_frame")
+                    if isinstance(native_frame, int) and 0 <= native_frame < max(1, self.total_frames):
+                        self.current_frame_idx = native_frame
+                        self.timeline.current_frame_idx = native_frame
+                except Exception:
+                    pass
         # 只显示队列里最新一帧，避免积压时「补放旧帧」造成拖影/顿挫
         latest = None
         drained = 0
@@ -2194,8 +2433,15 @@ class VideoPreviewPlayer(tk.Frame):
         try:
             if self._io and self._io.is_alive():
                 return
-            self._io = VideoIOThread(self.video_path, self._frame_q)
-            self._io.start()
+            self._io = self._make_preview_engine(self.video_path)
+            # Rebind the immutable certification to the replacement preview
+            # engine; otherwise a resumed mpv instance would silently lose
+            # its exact source-time seek table after export.
+            if self.media_info is not None:
+                try:
+                    self._io.bind_media_info(self.media_info)
+                except Exception as exc:
+                    self.frame_pts_error = exc
             # 容器帧数可能与分析长度略有出入，以 IO 为准更新
             if self._io.total:
                 self.total_frames = int(self._io.total)

@@ -6,6 +6,8 @@ import unittest
 from unittest import mock
 
 from preview_player import VideoPreviewPlayer
+from preview_engine import PreviewEngineError
+from timeline_plan import TimelinePlan
 
 
 class _BoolVar:
@@ -88,6 +90,42 @@ class PreviewCloseCallbackTests(unittest.TestCase):
         player._reset_ui_gap_stats.assert_not_called()
         player._auto_rate_mark_start.assert_not_called()
         player._send_play.assert_not_called()
+
+    def test_rejected_play_request_rolls_back_ui_state(self):
+        player = VideoPreviewPlayer.__new__(VideoPreviewPlayer)
+        player._closing = False
+        player._io = mock.Mock()
+        player._io.play.side_effect = PreviewEngineError(
+            "CERTIFICATION_REQUIRED", "certified PTS required"
+        )
+        player.preview_speed_var = _BoolVar(True)
+        player.preview_speed_var.get = mock.Mock(return_value="1x")
+        player.preview_ignore_speedup_var = _BoolVar(False)
+        player.skip_trimmed = _BoolVar(False)
+        player.total_frames = 2
+        player.settings = mock.Mock()
+        player.settings.get_params.return_value = {
+            "speedup_1x": False,
+            "speedup_02": False,
+            "speedup_02_factor": 1,
+        }
+        player._apply_pace_mode_to_io = mock.Mock()
+        player._build_timeline_plan = mock.Mock(
+            return_value=TimelinePlan.from_deleted_ranges(2, [])
+        )
+        player._task_scope = mock.Mock(return_value=(0, 0))
+        player._speed_segs_snap = mock.Mock(return_value=[])
+        player._canvas_wh = mock.Mock(return_value=(320, 180))
+        player._auto_rate_clear = mock.Mock()
+        player._calib_active = False
+        player.btn_play = mock.Mock()
+        player.lbl_info = mock.Mock()
+        player.is_playing = True
+
+        self.assertFalse(player._send_play(0))
+        self.assertFalse(player.is_playing)
+        player.btn_play.config.assert_called_with(text="▶ 播放")
+        player.lbl_info.config.assert_called_once()
 
 
 if __name__ == "__main__":
