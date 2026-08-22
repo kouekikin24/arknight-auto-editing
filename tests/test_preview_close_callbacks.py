@@ -95,6 +95,9 @@ class PreviewCloseCallbackTests(unittest.TestCase):
         player = VideoPreviewPlayer.__new__(VideoPreviewPlayer)
         player._closing = False
         player._io = mock.Mock()
+        # Declare the engine kind explicitly: a bare Mock would make the
+        # native-rendering duck check report a truthy Mock attribute.
+        player._io.native_rendering = False
         player._io.play.side_effect = PreviewEngineError(
             "CERTIFICATION_REQUIRED", "certified PTS required"
         )

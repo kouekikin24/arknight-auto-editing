@@ -9,6 +9,7 @@ import PIL.Image
 import PIL.ImageTk
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from queue import Queue, Empty
@@ -254,6 +255,12 @@ class VideoPreviewPlayer(tk.Frame):
         self._auto_rate_f0: int = 0
         self._auto_rate_ignore: bool = False
         self._AUTO_RATE_MIN_S = 3.0
+        # 原生渲染启动遮盖：mpv 首帧画出前盖一层黑底，避免露出白色子窗口
+        self._native_cover: tk.Frame | None = None
+        self._native_cover_after_id: str | None = None
+        # 帧号屏显（mpv OSD）：节流计数 + 寻址后立即刷新一次
+        self._osd_tick: int = 0
+        self._osd_pending: bool = False
 
         self._setup_ui()
         if video_path: self.load_video(video_path)
@@ -318,6 +325,12 @@ class VideoPreviewPlayer(tk.Frame):
             command=self._on_preview_option_change,
         ).pack(side=tk.LEFT, padx=5)
 
+        # mpv 原生渲染时用 mpv OSD 在画面上叠加当前源帧号（编辑时直接读屏）
+        self.show_frame_osd_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ctrl, text="屏显帧号", variable=self.show_frame_osd_var,
+        ).pack(side=tk.LEFT, padx=5)
+
         # 默认开优化；取消勾选 / 按 O = #9 式基线（只统计，不追帧软锚）
         self.preview_opt_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -376,8 +389,10 @@ class VideoPreviewPlayer(tk.Frame):
         if native:
             self.video_canvas.pack_forget()
             self.mpv_host.pack(fill=tk.BOTH, expand=True)
+            self._raise_native_cover()
         else:
             self.mpv_host.pack_forget()
+            self._drop_native_cover()
             self.video_canvas.pack(fill=tk.BOTH, expand=True)
         try:
             self.video_surface.update_idletasks()
@@ -521,6 +536,7 @@ class VideoPreviewPlayer(tk.Frame):
             "_key_preview_id",
             "_calib_after_id",
             "_perf_after_id",
+            "_native_cover_after_id",
         ):
             after_id = getattr(self, attr, None)
             if after_id is not None:
@@ -565,7 +581,7 @@ class VideoPreviewPlayer(tk.Frame):
         self._export_handle = None
         self._segment_export_handle = None
         try:
-            self.btn_analyze.config(state=tk.NORMAL, text="鑷姩妯℃澘鍒嗘瀽")
+            self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析")
         except Exception:
             pass
         for attr in ("export_btn", "segment_export_btn"):
@@ -741,10 +757,24 @@ class VideoPreviewPlayer(tk.Frame):
             else:
                 self.frame_pts_error = None
                 if self._io is not None:
-                    try:
-                        self._io.bind_media_info(self.media_info)
-                    except Exception as exc:
-                        self.frame_pts_error = exc
+                    # Binding re-derives the certified timeline; run it off
+                    # the Tk owner thread so certification completion cannot
+                    # freeze the UI.  A play command racing the bind fails
+                    # closed with the existing CERTIFICATION_REQUIRED notice.
+                    io_ref = self._io
+                    media_ref = self.media_info
+
+                    def _bind_certification() -> None:
+                        try:
+                            io_ref.bind_media_info(media_ref)
+                        except Exception as exc:
+                            self.frame_pts_error = exc
+
+                    threading.Thread(
+                        target=_bind_certification,
+                        name="arknight-preview-cert-bind",
+                        daemon=True,
+                    ).start()
 
         def on_error(exc: BaseException) -> None:
             if self._closing or Path(self.video_path).resolve() != Path(source_path):
@@ -914,6 +944,7 @@ class VideoPreviewPlayer(tk.Frame):
         frame_idx = max(0, min(int(frame_idx), max(0, self.total_frames - 1)))
         self.current_frame_idx = frame_idx
         self.timeline.current_frame_idx = frame_idx
+        self._osd_pending = True
         _project_generation, timeline_revision = self._task_scope()
         self._timeline_revision = timeline_revision
         try:
@@ -980,7 +1011,19 @@ class VideoPreviewPlayer(tk.Frame):
             preview_step = 1
             speed_multiplier = 1.0 / max(speed, 0.01)
 
-        ignore_biz = bool(self.preview_ignore_speedup_var.get())
+        # mpv 原生引擎不支持业务变速段（MPV_SPEED_POLICY_UNSUPPORTED 会直接拒播），
+        # 日用路径自动按「忽略业务加速」处理并提示，而不是让播放失败。
+        native_engine = bool(getattr(self._io, "native_rendering", False))
+        biz_active = (
+            bool(p.get('speedup_1x')) or bool(p.get('speedup_02'))
+            or bool(self._speed_segs_snap())
+        )
+        ignore_biz = bool(self.preview_ignore_speedup_var.get()) or native_engine
+        if native_engine and biz_active and not bool(self.preview_ignore_speedup_var.get()):
+            try:
+                self.lbl_info.config(text="mpv 预览：业务变速段按原速播放（如需业务加速请切回 OpenCV 引擎）")
+            except Exception:
+                pass
         if self.total_frames <= 0:
             self._reject_play_request("当前源没有可播放帧")
             return False
@@ -998,7 +1041,7 @@ class VideoPreviewPlayer(tk.Frame):
                 speedup_02=False if ignore_biz else bool(p['speedup_02']),
                 speedup_02_factor=int(p['speedup_02_factor']),
                 timeline_plan=plan,
-                speed_segments=tuple(self._speed_segs_snap()),
+                speed_segments=() if ignore_biz else tuple(self._speed_segs_snap()),
                 canvas_size=self._canvas_wh(),
                 project_generation=project_generation,
                 timeline_revision=timeline_revision,
@@ -1207,7 +1250,7 @@ class VideoPreviewPlayer(tk.Frame):
             rs = ",".join(last.get("reasons") or [])
             spike_hint = f" | 末尖峰f{last.get('frame')} {last.get('present_ms')}ms[{rs}]"
 
-        return (
+        text = (
             f"流畅度[{state}/{mode_tag}]{grade} | "
             f"微抖{late_pct:.0f}% >1帧{late1_pct:.0f}% >2帧{late2_pct:.0f}% | "
             f"追帧{discarded}拍/{catchups}次 | "
@@ -1220,6 +1263,19 @@ class VideoPreviewPlayer(tk.Frame):
             f"{wall_s:.1f}s"
             f"{spike_hint}"
         )
+        if str(snap.get("engine")) == "mpv":
+            # mpv 原生渲染没有 per-frame 解码/落后统计；用 mpv 自己的丢帧
+            # 计数和 time-pos 实测实时比作为权威读数。
+            drops = snap.get("mpv_frame_drops")
+            ratio = snap.get("rt_ratio")
+            parts = []
+            if drops is not None:
+                parts.append(f"mpv丢帧{int(drops)}")
+            if ratio is not None:
+                parts.append(f"实测比{ratio:.2f}")
+            if parts:
+                text += " | " + " ".join(parts)
+        return text
 
     def export_video(self):
         from tkinter import messagebox
@@ -2002,21 +2058,70 @@ class VideoPreviewPlayer(tk.Frame):
                 self.settings.set_selected_pause(seg_id, seg.get('mode', 'auto'))
                 break
 
+    def _maybe_show_frame_osd(self, frame: int) -> None:
+        """原生渲染时用 mpv OSD 叠加当前源帧号；播放中 ~4Hz 节流刷新。"""
+        shower = getattr(self._io, "show_osd_text", None)
+        if not callable(shower) or not bool(self.show_frame_osd_var.get()):
+            return
+        if not self.is_playing and not self._osd_pending:
+            return
+        self._osd_tick += 1
+        if not self._osd_pending and self._osd_tick % 15 != 0:
+            return
+        self._osd_pending = False
+        try:
+            shower(f"帧 {frame:,} / {max(0, self.total_frames - 1):,}", 700)
+        except Exception:
+            pass
+
+    def _raise_native_cover(self) -> None:
+        """mpv 首帧前盖黑底，避免白色原生子窗口露脸；带兜底超时。"""
+        if self._native_cover is not None:
+            return
+        self._native_cover = tk.Frame(self.video_surface, bg="black")
+        self._native_cover.pack(fill=tk.BOTH, expand=True)
+        self._native_cover.lift()
+        self._schedule_drop_native_cover(delay_ms=3000)
+
+    def _schedule_drop_native_cover(self, delay_ms: int) -> None:
+        if self._native_cover is None or self._native_cover_after_id is not None:
+            return
+        self._native_cover_after_id = self.after(delay_ms, self._drop_native_cover)
+
+    def _drop_native_cover(self) -> None:
+        self._native_cover_after_id = None
+        cover = self._native_cover
+        self._native_cover = None
+        if cover is not None:
+            try:
+                cover.destroy()
+            except Exception:
+                pass
+
     def _render_loop(self):
         if self._closing:
             self._render_after_id = None
             return
         if self._io is not None:
+            events = ()
             try:
-                self._io.poll_events()
+                events = self._io.poll_events()
             except Exception:
                 pass
+            if (
+                self._native_cover is not None
+                and any(event.get("event") == "file-loaded" for event in events)
+            ):
+                # mpv 已经画好首帧附近的内容，稍等一拍再撤黑底遮盖，
+                # 避免启动瞬间露出未渲染的原生子窗口（白屏观感）。
+                self._schedule_drop_native_cover(delay_ms=150)
             if bool(getattr(self._io, "native_rendering", False)) and not self._is_dragging:
                 try:
                     native_frame = self._io.snapshot_perf().get("source_frame")
                     if isinstance(native_frame, int) and 0 <= native_frame < max(1, self.total_frames):
                         self.current_frame_idx = native_frame
                         self.timeline.current_frame_idx = native_frame
+                        self._maybe_show_frame_osd(native_frame)
                 except Exception:
                     pass
         # 只显示队列里最新一帧，避免积压时「补放旧帧」造成拖影/顿挫

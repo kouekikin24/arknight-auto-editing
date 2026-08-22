@@ -14,6 +14,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 import re
 import threading
+import time
 from typing import Any, Callable
 
 from certified_edl import CertifiedEdl, build_certified_edl
@@ -116,6 +117,7 @@ class MpvEngine:
         self._timeline_clean_start = 0
         self._edl: CertifiedEdl | None = None
         self._edl_cache_key: tuple[Any, ...] | None = None
+        self._skip_next_advance = False
         self._last_time_pos: float | None = None
         self._duration = 0.0
         self._source_frame = 0
@@ -157,6 +159,13 @@ class MpvEngine:
             "rate_trim_frames": 0,
             "spikes": [],
             "engine": "mpv",
+            # Native-render fluency sampling: the per-frame present/lag
+            # pipeline belongs to the OpenCV engine; for native rendering the
+            # trustworthy signals are mpv's own drop counter and the wall-clock
+            # realtime ratio accumulated from time-pos advances.
+            "media_advanced_s": 0.0,
+            "play_wall_t0": None,
+            "play_wall_end": None,
         }
 
     # ------------------------------------------------------------------
@@ -379,6 +388,7 @@ class MpvEngine:
             elif name in {"end-file", "eof-reached"}:
                 self._playing = False
                 self._play_end_reason = "eof"
+                self._freeze_play_wall_locked("eof")
             elif name == "shutdown":
                 self._closed = True
                 self._playing = False
@@ -442,6 +452,15 @@ class MpvEngine:
                 if position is not None and math.isfinite(position):
                     if self._last_time_pos is not None and abs(position - self._last_time_pos) > 1e-9:
                         self._stats["presented"] += 1
+                        if self._skip_next_advance:
+                            self._skip_next_advance = False
+                        else:
+                            advance = position - self._last_time_pos
+                            # Clamp to one presentation interval's worth: an
+                            # EDL relaunch or an unflagged jump must not
+                            # inflate the realtime ratio.
+                            if 0.0 < advance <= 0.5:
+                                self._stats["media_advanced_s"] += advance
                     self._last_time_pos = position
                     self._source_frame = self._frame_for_position_locked(position)
             elif property_name == "pause":
@@ -450,6 +469,7 @@ class MpvEngine:
             elif property_name == "eof-reached" and bool(value):
                 self._playing = False
                 self._play_end_reason = "eof"
+                self._freeze_play_wall_locked("eof")
             elif property_name == "duration":
                 try:
                     self._duration = float(value)
@@ -515,12 +535,31 @@ class MpvEngine:
             try:
                 # Bind only a current source.  This validation is deliberately
                 # transactional: a failed foreign/stale bind must not replace
-                # a previously valid certification on the engine.
-                media.assert_source_current()
-                candidate_timeline = None
-                if media.complete_for_export:
-                    candidate_timeline = CertifiedPtsTimeline.from_media_info(media)
+                # a previously valid certification on the engine.  Source
+                # identity is checked with the same cheap stat snapshot used
+                # on every exact seek: the certification was produced or
+                # cache-loaded through the fail-closed certifier in this
+                # process (which verified the source hash), and re-hashing a
+                # multi-gigabyte source here froze the Tk owner thread for
+                # seconds on certification completion.
                 stat = Path(self.path).stat()
+                if self._source_stat is not None and self._source_stat != (
+                    int(stat.st_size),
+                    int(stat.st_mtime_ns),
+                ):
+                    raise PreviewEngineError(
+                        "SOURCE_CHANGED_AFTER_PROBE",
+                        "source file was replaced while the engine was bound",
+                        details={"path": self.path},
+                    )
+                candidate_timeline = None
+                if (
+                    media.frame_pts_authoritative
+                    and media.frame_pts_certification is not None
+                ):
+                    candidate_timeline = (
+                        CertifiedPtsTimeline.from_validated_media_info(media)
+                    )
             except MediaInfoError as exc:
                 raise PreviewEngineError(
                     exc.code,
@@ -534,8 +573,14 @@ class MpvEngine:
                 ) from exc
             self._media_info = media
             self._timeline = candidate_timeline
+            # float seconds: 424k Fraction multiplications cost half a second
+            # per bind; float products stay exact far below one source tick
+            # at these magnitudes and only feed bisect lookups.
             self._timeline_times = (
-                tuple(row.pts * candidate_timeline.time_base for row in candidate_timeline.rows)
+                tuple(
+                    float(row.pts) * float(candidate_timeline.time_base)
+                    for row in candidate_timeline.rows
+                )
                 if candidate_timeline is not None
                 else ()
             )
@@ -641,6 +686,10 @@ class MpvEngine:
         mode = "absolute+exact" if exact else "absolute"
         player.command("seek", _fraction_seconds(seconds), mode)
         self._stats["seek_count"] += 1
+        # The next time-pos update lands at the seek target; its delta from
+        # the pre-seek position is a jump, not playback, and must not count
+        # toward the realtime ratio.
+        self._skip_next_advance = True
 
     def _flush_pending_locked(self) -> None:
         if self._closed or not self._loaded_ready or self._player is None:
@@ -713,7 +762,14 @@ class MpvEngine:
                     "native mpv preview does not yet implement frame-speed policies",
                 )
         if request.skip_trimmed and request.timeline_plan.deleted_ranges:
-            if self._media_info is None or not self._media_info.complete_for_export:
+            # complete_for_export re-hashes the multi-gigabyte source; the
+            # engine's bound certification is the authoritative readiness
+            # signal here (the certifier performed the full gate and the
+            # engine stat-checks the source on every command).
+            if self._media_info is None or not (
+                self._media_info.frame_pts_authoritative
+                and self._media_info.frame_pts_certification is not None
+            ):
                 raise PreviewEngineError(
                     "CERTIFICATION_REQUIRED",
                     "EDL preview requires current certified media",
@@ -827,6 +883,16 @@ class MpvEngine:
         self._play_end_reason = "playing"
         self._stats["playback_active"] = True
         self._stats["play_end_reason"] = "playing"
+        if self._stats.get("play_wall_t0") is None:
+            self._stats["play_wall_t0"] = time.perf_counter()
+            self._stats["play_wall_end"] = None
+
+    def _freeze_play_wall_locked(self, reason: str) -> None:
+        stats = self._stats
+        if stats.get("play_wall_t0") is not None and stats.get("play_wall_end") is None:
+            stats["play_wall_end"] = time.perf_counter()
+        stats["playback_active"] = False
+        stats["play_end_reason"] = reason
 
     def stop(self) -> bool:
         with self._lock:
@@ -849,8 +915,7 @@ class MpvEngine:
                     return False
             self._playing = False
             self._play_end_reason = "stop"
-            self._stats["playback_active"] = False
-            self._stats["play_end_reason"] = "stop"
+            self._freeze_play_wall_locked("stop")
             return True
 
     def send(self, command: dict[str, Any]) -> bool:
@@ -976,9 +1041,73 @@ class MpvEngine:
     def get_pace_mode(self) -> str:
         return self._pace_mode
 
+    def _read_frame_drop_count_locked(self) -> int | None:
+        """Read mpv's native drop counter; None when the binding lacks it."""
+
+        player = self._player
+        if player is None:
+            return None
+        for reader in (
+            lambda: int(getattr(player, "frame_drop_count")),
+            lambda: int(player.command("get_property", "frame-drop-count")),
+        ):
+            try:
+                value = reader()
+            except Exception:
+                continue
+            if value >= 0:
+                return value
+        return None
+
+    def show_osd_text(self, text: str, duration_ms: int = 600) -> bool:
+        """Overlay a short text on the native render surface."""
+
+        if not isinstance(text, str) or not text:
+            return False
+        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
+            raise ValueError("duration_ms must be a non-negative integer")
+        with self._lock:
+            if self._closed:
+                raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
+            player = self._player
+            if player is None:
+                return False
+            try:
+                player.command("show-text", text, duration_ms)
+                return True
+            except Exception:
+                return False
+
     def snapshot_perf(self) -> dict[str, Any]:
         with self._lock:
             value = dict(self._stats)
+            # Native-render fluency: mpv's own drop counter plus the realtime
+            # ratio accumulated from clamped time-pos advances.  These feed
+            # the same grading the OpenCV engine feeds from its present/lag
+            # pipeline; the per-frame ms fields stay zero by design.
+            t0 = value.get("play_wall_t0")
+            if t0 is not None:
+                end = value.get("play_wall_end")
+                value["wall_s"] = max(
+                    0.0, (end if end is not None else time.perf_counter()) - t0
+                )
+            advanced = float(value.get("media_advanced_s", 0.0))
+            wall = float(value.get("wall_s", 0.0))
+            value["rt_ratio"] = (advanced / wall) if wall > 0.5 else None
+            drops = self._read_frame_drop_count_locked()
+            value["mpv_frame_drops"] = drops
+            presented = int(value.get("presented", 0))
+            if drops is None:
+                value["mpv_drop_pct"] = None
+            else:
+                value["mpv_drop_pct"] = (
+                    100.0 * drops / (presented + drops) if (presented + drops) else 0.0
+                )
+            value.setdefault("late_pct", 0.0)
+            value.setdefault("late1_pct", 0.0)
+            value.setdefault("late2_pct", 0.0)
+            value.setdefault("drop_pct", value["mpv_drop_pct"] or 0.0)
+            value.setdefault("present_ms_avg", 0.0)
             value.update(
                 {
                     "engine": self.engine_name,
