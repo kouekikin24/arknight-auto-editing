@@ -11,6 +11,7 @@ import os
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from queue import Queue, Empty
 
@@ -261,6 +262,9 @@ class VideoPreviewPlayer(tk.Frame):
         # 帧号屏显（mpv OSD）：节流计数 + 寻址后立即刷新一次
         self._osd_tick: int = 0
         self._osd_pending: bool = False
+        # (monotonic, source_frame, mpv_drop_count) 采样，用于右上角
+        # 瞬时播放帧率（≈1s 窗口，丢帧不计入“看到的”帧率）
+        self._fps_samples: deque = deque(maxlen=64)
 
         self._setup_ui()
         if video_path: self.load_video(video_path)
@@ -938,19 +942,43 @@ class VideoPreviewPlayer(tk.Frame):
             and self.frame_pts_error is None
         )
 
-    def _seek(self, frame_idx: int, skip_trim: bool = False):
-        self._auto_rate_clear()
-        if not self._io: return
-        frame_idx = max(0, min(int(frame_idx), max(0, self.total_frames - 1)))
-        self.current_frame_idx = frame_idx
-        self.timeline.current_frame_idx = frame_idx
-        self._osd_pending = True
+    def _seek_frame(self, frame_idx: int) -> None:
+        """Mode-aware engine seek shared by arrow keys and timeline drags.
+
+        With 跳过裁剪区 active on the native engine, playback runs the EDL
+        view; a plain ``seek_source`` would force the engine back to the raw
+        source stream (a reload plus a jump into deleted footage, which made
+        ←/→ look dead).  Route through the EDL artifact instead when one has
+        been built; otherwise the engine is in source mode already and a
+        source seek is the consistent fallback.
+        """
+        if not self._io:
+            return
+        if (
+            bool(getattr(self._io, "native_rendering", False))
+            and bool(self.skip_trimmed.get())
+            and bool(self._all_skip_segs_snap())
+        ):
+            seek_edl = getattr(self._io, "seek_edl", None)
+            if callable(seek_edl):
+                try:
+                    seek_edl(int(frame_idx))
+                    return
+                except PreviewEngineError as exc:
+                    if exc.code != "EDL_NOT_READY":
+                        raise
+                    try:
+                        self.lbl_info.config(
+                            text="裁剪预览尚未建立，先播放一次后再逐帧定位"
+                        )
+                    except Exception:
+                        pass
         _project_generation, timeline_revision = self._task_scope()
         self._timeline_revision = timeline_revision
         try:
             self._io.seek_source(
                 SourceSeekRequest(
-                    source_frame=frame_idx,
+                    source_frame=int(frame_idx),
                     canvas_size=self._canvas_wh(),
                     timeline_revision=timeline_revision,
                     # Before certification, only frame zero can be addressed
@@ -967,6 +995,18 @@ class VideoPreviewPlayer(tk.Frame):
                 self.lbl_info.config(text="认证时间表尚未就绪，暂不能精确定位")
             except Exception:
                 pass
+
+    def _seek(self, frame_idx: int, skip_trim: bool = False):
+        self._auto_rate_clear()
+        if not self._io: return
+        frame_idx = max(0, min(int(frame_idx), max(0, self.total_frames - 1)))
+        self.current_frame_idx = frame_idx
+        self.timeline.current_frame_idx = frame_idx
+        self._osd_pending = True
+        # 寻址会让瞬时帧率窗口出现跳变，清掉重新累积
+        if self._fps_samples:
+            self._fps_samples.clear()
+        self._seek_frame(frame_idx)
 
     def _reject_play_request(self, message: str) -> None:
         """Return the UI to a stopped state when an engine rejects playback."""
@@ -1052,6 +1092,9 @@ class VideoPreviewPlayer(tk.Frame):
             if not accepted:
                 self._reject_play_request("预览引擎拒绝了播放请求")
                 return False
+            # 播放重新启动意味着位置跳变；瞬时帧率窗口从新的起点累积
+            if self._fps_samples:
+                self._fps_samples.clear()
             return True
         except PreviewEngineError as exc:
             message = (
@@ -1665,21 +1708,7 @@ class VideoPreviewPlayer(tk.Frame):
 
     def _do_preview_seek(self):
         if not self._io or self.total_frames <= 0: return
-        _project_generation, timeline_revision = self._task_scope()
-        self._timeline_revision = timeline_revision
-        try:
-            self._io.seek_source(
-                SourceSeekRequest(
-                    source_frame=max(0, min(self.current_frame_idx, self.total_frames - 1)),
-                    canvas_size=self._canvas_wh(),
-                    timeline_revision=timeline_revision,
-                    exact=self._preview_pts_ready(),
-                    latest_only=True,
-                )
-            )
-        except PreviewEngineError as exc:
-            if exc.code != "CERTIFICATION_REQUIRED":
-                raise
+        self._seek_frame(max(0, min(self.current_frame_idx, self.total_frames - 1)))
 
     def _step_frame(self, delta: int, seek: bool = True):
         if self.total_frames <= 0: return
@@ -2058,6 +2087,49 @@ class VideoPreviewPlayer(tk.Frame):
                 self.settings.set_selected_pause(seg_id, seg.get('mode', 'auto'))
                 break
 
+    def _note_fps_sample(self, frame, drops) -> None:
+        """喂采样并节流刷新右上角播放帧率 OSD。
+
+        显示的是「实际看到的帧率」：源帧推进速率减去 libmpv 报告的丢帧
+        速率，窗口取最近 ~1 秒。暂停 / 寻址瞬间清窗，重新累积。
+        """
+        now = time.monotonic()
+        if isinstance(frame, int) and self.is_playing:
+            self._fps_samples.append((now, frame, drops if isinstance(drops, int) else None))
+        else:
+            if self._fps_samples:
+                self._fps_samples.clear()
+        shower = getattr(self._io, "show_osd_corner_text", None)
+        if not callable(shower) or not bool(self.show_frame_osd_var.get()):
+            return
+        if not self.is_playing:
+            return
+        if self._osd_tick % 15 != 0:
+            return
+        text = None
+        samples = self._fps_samples
+        if len(samples) >= 8:
+            t0, f0, d0 = samples[0]
+            t1, f1, d1 = samples[-1]
+            dt = t1 - t0
+            if dt >= 0.5:
+                # 求逆序对：寻址/模式切换后样本可能倒退，那段窗口不可信
+                ordered = all(
+                    samples[i][1] <= samples[i + 1][1]
+                    for i in range(len(samples) - 1)
+                )
+                if ordered:
+                    advanced = (f1 - f0) / dt
+                    if d0 is not None and d1 is not None:
+                        presented = advanced - (d1 - d0) / dt
+                    else:
+                        presented = advanced
+                    text = f"{max(0.0, presented):.1f} FPS"
+        try:
+            shower(text or "… FPS")
+        except Exception:
+            pass
+
     def _maybe_show_frame_osd(self, frame: int) -> None:
         """原生渲染时用 mpv OSD 叠加当前源帧号；播放中 ~4Hz 节流刷新。"""
         shower = getattr(self._io, "show_osd_text", None)
@@ -2117,11 +2189,13 @@ class VideoPreviewPlayer(tk.Frame):
                 self._schedule_drop_native_cover(delay_ms=150)
             if bool(getattr(self._io, "native_rendering", False)) and not self._is_dragging:
                 try:
-                    native_frame = self._io.snapshot_perf().get("source_frame")
+                    perf = self._io.snapshot_perf()
+                    native_frame = perf.get("source_frame")
                     if isinstance(native_frame, int) and 0 <= native_frame < max(1, self.total_frames):
                         self.current_frame_idx = native_frame
                         self.timeline.current_frame_idx = native_frame
                         self._maybe_show_frame_osd(native_frame)
+                    self._note_fps_sample(native_frame, perf.get("mpv_frame_drops"))
                 except Exception:
                     pass
         # 只显示队列里最新一帧，避免积压时「补放旧帧」造成拖影/顿挫

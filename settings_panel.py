@@ -220,17 +220,23 @@ class SettingsPanel(ttk.LabelFrame):
         r = 0
         tab_export.columnconfigure(0, weight=0)
         tab_export.columnconfigure(1, weight=1)
+        tab_export.columnconfigure(2, weight=0)
         self.output_var = tk.StringVar()
         ttk.Label(tab_export, text="输出路径:").grid(row=r, column=0, sticky=tk.W, pady=2)
         ttk.Entry(tab_export, textvariable=self.output_var).grid(
             row=r, column=1, sticky=tk.EW, padx=4)
-        ttk.Button(tab_export, text="浏览", command=self._browse_output).grid(row=r, column=2)
+        ttk.Button(tab_export, text="浏览", command=self._browse_output, width=5).grid(
+            row=r, column=2, sticky=tk.E)
         r += 1
 
         self.quality_var = tk.IntVar(value=6)
         ttk.Label(tab_export, text="视频质量 (0-10):").grid(row=r, column=0, sticky=tk.W, pady=2)
-        ttk.Spinbox(tab_export, from_=0, to=10, textvariable=self.quality_var, width=8).grid(
-            row=r, column=1, sticky=tk.W, padx=4)
+        # 与上行输入框左缘对齐：固定宽度 Spinbox 放在等宽的对齐槽里，
+        # 槽本身随列拉伸，控件保持左对齐，两行左缘一致。
+        quality_slot = ttk.Frame(tab_export)
+        quality_slot.grid(row=r, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        ttk.Spinbox(quality_slot, from_=0, to=10, textvariable=self.quality_var,
+                    width=8).pack(side=tk.LEFT)
         r += 1
 
         self.export_btn = ttk.Button(tab_export, text="导出整段剪辑视频", command=self._on_export)

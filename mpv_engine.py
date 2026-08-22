@@ -747,6 +747,39 @@ class MpvEngine:
             self._source_frame = request.source_frame
             return True
 
+    def seek_edl(self, source_frame: int) -> bool:
+        """Seek inside the current EDL view by source frame, staying in EDL mode.
+
+        ``seek_source`` forces the engine back to the raw source stream, so
+        frame stepping through the skip-trimmed preview must not use it.
+        Frames inside deleted ranges snap to the containing span end, the
+        same mapping playback uses.  Pause state is untouched: a paused
+        player steps paused, a playing one keeps rolling after the seek.
+        Raises ``EDL_NOT_READY`` when no EDL artifact has been built yet
+        (caller falls back to a plain source seek; the engine is in source
+        mode in that case anyway).
+        """
+        with self._lock:
+            if self._closed:
+                raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
+            edl = self._edl
+            if edl is None:
+                raise PreviewEngineError(
+                    "EDL_NOT_READY",
+                    "no EDL artifact has been built for this engine yet",
+                )
+            if isinstance(source_frame, bool) or not isinstance(source_frame, int):
+                raise TypeError("source_frame must be an integer")
+            frame = max(0, min(int(source_frame), edl.frame_count - 1))
+            virtual = edl.virtual_time_for_source(frame, snap=True)
+            self._ensure_loaded_locked(edl.path, "edl")
+            if self._loaded_ready:
+                self._command_seek_locked(virtual, exact=True)
+            else:
+                self._pending_seek = (virtual, True)
+            self._source_frame = edl.source_frame_for_virtual_time(virtual)
+            return True
+
     def play(self, request: PreviewPlayRequest) -> bool:
         with self._lock:
             if self._closed:
@@ -1074,6 +1107,40 @@ class MpvEngine:
                 return False
             try:
                 player.command("show-text", text, duration_ms)
+                return True
+            except Exception:
+                return False
+
+    def show_osd_corner_text(self, text: str) -> bool:
+        """Persistent top-right OSD overlay, independent of ``show_osd_text``.
+
+        ``show-text`` owns a single OSD slot, so a second corner readout has
+        to go through libmpv's ``osd-overlay`` command (ASS event positioned
+        with ``{\\an9}``).  Pass an empty string to clear the overlay.
+        """
+
+        if not isinstance(text, str):
+            return False
+        with self._lock:
+            if self._closed:
+                raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
+            player = self._player
+            if player is None:
+                return False
+            try:
+                if not text:
+                    player.command("osd-overlay", 1, "none", "", 0, 0, 0)
+                else:
+                    safe = text.replace("\\", "\\\\").replace("{", "\\{")
+                    player.command(
+                        "osd-overlay",
+                        1,
+                        "ass-events",
+                        f"Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,{{\\an9}}{safe}",
+                        0,
+                        0,
+                        0,
+                    )
                 return True
             except Exception:
                 return False

@@ -319,6 +319,74 @@ class MpvEngineContractTests(unittest.TestCase):
             self.assertEqual(engine.snapshot_perf()["mode"], "source")
             self.assertTrue(engine.close())
 
+    def test_seek_edl_requires_built_artifact(self):
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _FakePlayer(**options)
+            return holder["player"]
+
+        engine = MpvEngine("source.mp4", mpv_factory=factory, total=2)
+        engine.start()
+        with self.assertRaises(PreviewEngineError) as raised:
+            engine.seek_edl(3)
+        self.assertEqual(raised.exception.code, "EDL_NOT_READY")
+        engine.close()
+
+    def test_seek_edl_stays_in_edl_mode_and_snaps_deleted_frames(self):
+        from tests.test_preview_engine import _certified_media
+
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _FakePlayer(**options)
+            return holder["player"]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = _certified_media(
+                root,
+                [{"n": i, "pts": i * 40, "duration": 40} for i in range(8)],
+            )
+            engine = MpvEngine(
+                str(media.source_path),
+                total=8,
+                mpv_factory=factory,
+                edl_dir=root / "edl",
+            )
+            engine.bind_media_info(media)
+            engine.start()
+            player = holder["player"]
+
+            plan = TimelinePlan.from_deleted_ranges(8, [(2, 4)])
+            self.assertTrue(
+                engine.play_edl(CertifiedEdlRequest(media, plan, 0, 0), start_frame=0)
+            )
+            edl_generation = engine.snapshot_perf()["generation"]
+            engine._current_path = str(engine._edl.path)
+            player.event_callback({"event": "file-loaded", "generation": edl_generation})
+            engine.poll_events()
+            self.assertEqual(engine.snapshot_perf()["mode"], "edl")
+
+            # Kept frame: seek lands on its own virtual time, no reload happens.
+            loads_before = len([command for command in player.commands if command[0] == "play"])
+            self.assertTrue(engine.seek_edl(5))
+            seek_commands = [command for command in player.commands if command[0] == "seek"]
+            self.assertEqual(seek_commands[-1], ("seek", "0.12", "absolute+exact"))
+            self.assertEqual(engine.snapshot_perf()["mode"], "edl")
+            self.assertEqual(
+                len([command for command in player.commands if command[0] == "play"]),
+                loads_before,
+            )
+
+            # Deleted frame snaps to the containing span end (frame 4), the
+            # same mapping playback uses; _source_frame follows the artifact.
+            self.assertTrue(engine.seek_edl(3))
+            seek_commands = [command for command in player.commands if command[0] == "seek"]
+            self.assertEqual(seek_commands[-1], ("seek", "0.08", "absolute+exact"))
+            self.assertEqual(engine._source_frame, 4)
+            self.assertTrue(engine.close())
+
     def test_scope_mismatch_event_is_dropped(self):
         holder = {}
 

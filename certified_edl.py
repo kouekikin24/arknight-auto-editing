@@ -84,6 +84,10 @@ class CertifiedEdl:
     preview_tick_collision_frames: tuple[int, ...] = ()
 
     @property
+    def frame_count(self) -> int:
+        return len(self._rows)
+
+    @property
     def expected_frames(self) -> int:
         return sum(end - start for start, end in (s.source_frame_range for s in self.segments))
 

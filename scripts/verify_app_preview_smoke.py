@@ -19,6 +19,7 @@ import pickle
 from pathlib import Path
 import sys
 import time
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
@@ -199,16 +200,57 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
             failures.append("OSD_COMMAND_REJECTED")
         pump(0.4)
 
-        # -- seek then toggle to SOURCE view --------------------------------
+        # -- corner FPS overlay ---------------------------------------------
+        corner_ok = bool(engine.show_osd_corner_text("59.9 FPS"))
+        pump(0.6)
+        corner_image = grab_window()
+        w, h = corner_image.size
+        tr = corner_image.crop((int(w * 0.7), 0, w, int(h * 0.12))).convert("L")
+        bright_tr = sum(1 for v in tr.getdata() if v > 140)
+        result["checks"]["corner_fps_osd"] = {
+            "command_accepted": corner_ok,
+            "top_right_bright_pixels": bright_tr,
+        }
+        if not corner_ok or bright_tr <= 40:
+            failures.append("CORNER_FPS_OSD_MISSING")
+        engine.show_osd_corner_text("")
+
+        # -- EDL-mode frame stepping must stay in EDL -----------------------
         player._stop_playback_ui(from_user=True)
         pump(0.5)
+        mode_before_step = engine.mode
+        player._on_key_press_right(SimpleNamespace())
+        player._on_key_release(SimpleNamespace(keysym="Right"))
+        pump(1.0)
+        mode_after_step = engine.mode
+        frame_after_step = engine.snapshot_perf().get("source_frame")
+        result["checks"]["edl_frame_step"] = {
+            "mode_before": mode_before_step,
+            "mode_after": mode_after_step,
+            "source_frame_after_step": frame_after_step,
+        }
+        if mode_after_step != "edl":
+            failures.append("EDL_FRAME_STEP_LEFT_EDL_MODE")
+
+        # -- seek then toggle to SOURCE view --------------------------------
+        # 逐帧后引擎可能停在源帧 0 或某个裁剪段内：先起播一次，把 EDL
+        # 视图推进到可见内容，再检查切换到 SOURCE 的真实路径。
+        player.toggle_play()
+        pump(2.0)
         player._seek(180_000)
-        pump(2.5)
+        # 播放中寻址后画面仍在推进；先停播再读帧号做容差判定
+        pump(0.3)
+        player._stop_playback_ui(from_user=True)
+        pump(1.0)
         frame_after_seek = engine.snapshot_perf().get("source_frame")
+        player.toggle_play()
+        pump(0.8)
         player.skip_trimmed.set(False)
         player._on_preview_option_change()
         pump(2.5)
         mode_after_toggle = engine.mode
+        player._stop_playback_ui(from_user=True)
+        pump(0.5)
         result["checks"]["seek_and_source_toggle"] = {
             "requested_frame": 180_000,
             "observed_source_frame": frame_after_seek,
