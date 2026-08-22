@@ -233,10 +233,21 @@ class PreviewLifecycleTests(unittest.TestCase):
         player = holder["player"]
         self.assertTrue(engine.play(_source_play_request()))
         generation = engine.snapshot_perf()["generation"]
+        # file-loaded now releases the queued seek/resume on the binding's
+        # event thread itself, so the seek lands before close() begins.
         player.event_callback({"event": "file-loaded", "generation": generation})
+        flushed_seeks = sum(1 for command in player.commands if command[0] == "seek")
+        self.assertEqual(flushed_seeks, 1)
         self.assertFalse(engine.close(timeout=0.001))
+        # Once close begins, later load completions and owner polls must
+        # not issue any further commands.  close() has already detached the
+        # binding callback, so deliver the event to the engine directly.
+        engine._on_event({"event": "file-loaded", "generation": generation})
         engine.poll_events()
-        self.assertFalse(any(command[0] == "seek" for command in player.commands))
+        self.assertEqual(
+            sum(1 for command in player.commands if command[0] == "seek"),
+            flushed_seeks,
+        )
         player.allow_terminate.set()
         self.assertTrue(engine.close(timeout=1.0))
 

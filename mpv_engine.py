@@ -115,6 +115,7 @@ class MpvEngine:
         self._timeline_times: tuple[Fraction, ...] = ()
         self._timeline_clean_start = 0
         self._edl: CertifiedEdl | None = None
+        self._edl_cache_key: tuple[Any, ...] | None = None
         self._last_time_pos: float | None = None
         self._duration = 0.0
         self._source_frame = 0
@@ -367,6 +368,14 @@ class MpvEngine:
                     self._loaded_ready = False
                 self._playing = False
                 self._play_end_reason = None
+                if name == "file-loaded":
+                    # python-mpv delivers this callback on its own event
+                    # thread, not the Tk owner's pump, so release the queued
+                    # seek/speed/resume here.  Playback then starts even
+                    # while the owner thread is busy with a long redraw or
+                    # export teardown; poll_events() stays a read-only
+                    # fallback for bindings without a live event thread.
+                    self._flush_pending_locked()
             elif name in {"end-file", "eof-reached"}:
                 self._playing = False
                 self._play_end_reason = "eof"
@@ -494,6 +503,8 @@ class MpvEngine:
                 self._timeline_times = ()
                 self._timeline_clean_start = 0
                 self._source_stat = None
+                self._edl = None
+                self._edl_cache_key = None
                 return
             if Path(media.source_path).resolve() != Path(self.path).resolve():
                 raise PreviewEngineError(
@@ -600,7 +611,9 @@ class MpvEngine:
         self._last_time_pos = None
         self._source_frame = 0
         self._play_end_reason = None
-        player.play(source)
+        # Hold the player paused across the load: pause is a global property
+        # that persists into the next file, and the pending seek must land
+        # before anything is presented.
         try:
             player.pause = True
         except Exception:
@@ -608,6 +621,20 @@ class MpvEngine:
                 player.command("set", "pause", "yes")
             except Exception:
                 pass
+        # A synchronous loadfile blocks the caller for the whole demuxer
+        # open; a real EDL with thousands of segments takes seconds and
+        # freezes the Tk owner thread ("not responding").  Issue the load
+        # fire-and-forget when the binding supports async commands; the
+        # event thread completes the sequence via file-loaded.  Fake and
+        # reduced bindings keep the synchronous play() route.
+        loader = getattr(player, "command_async", None)
+        if callable(loader):
+            try:
+                loader("loadfile", source, "replace")
+                return
+            except Exception:
+                pass
+        player.play(source)
 
     def _command_seek_locked(self, seconds: Fraction, *, exact: bool) -> None:
         player = self._require_player_locked()
@@ -743,7 +770,28 @@ class MpvEngine:
             self._validate_request_source_locked(request)
             # Serialize EDL publication with close().  Once close begins, no
             # command may publish a new preview artifact or reach libmpv.
-            edl = build_certified_edl(request, self._edl_dir)
+            # Rebuilding the EDL re-derives the certified timeline; repeated
+            # toggles of the same plan reuse the built artifact instead, and
+            # a fresh build passes the engine's already-bound timeline so
+            # the multi-gigabyte source is stat-checked, not re-hashed.
+            cache_key = (
+                request.media_info.source_sha256,
+                request.timeline_plan.fingerprint,
+                request.project_generation,
+                request.timeline_revision,
+            )
+            if (
+                self._edl is not None
+                and self._edl_cache_key == cache_key
+                and self._edl.path.is_file()
+            ):
+                edl = self._edl
+            else:
+                self._assert_bound_source_current_locked()
+                edl = build_certified_edl(
+                    request, self._edl_dir, timeline=self._timeline
+                )
+                self._edl_cache_key = cache_key
             seconds = edl.virtual_time_for_source(start_frame, snap=True)
             self._project_generation = request.project_generation
             self._timeline_revision = request.timeline_revision

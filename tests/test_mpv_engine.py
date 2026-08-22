@@ -52,6 +52,17 @@ class _FakePlayer:
         self.terminated += 1
 
 
+class _AsyncLoadPlayer(_FakePlayer):
+    """Binding subset exposing fire-and-forget async commands."""
+
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.async_commands = []
+
+    def command_async(self, *args, **_kwargs):
+        self.async_commands.append(tuple(args))
+
+
 class _BlockingTerminatePlayer(_FakePlayer):
     def __init__(self, **options):
         super().__init__(**options)
@@ -105,6 +116,90 @@ class MpvEngineContractTests(unittest.TestCase):
         self.assertIn(("seek", "0", "absolute"), holder["player"].commands)
         self.assertEqual(holder["player"].options["wid"], None) if "wid" in holder["player"].options else None
         engine.close()
+
+    def test_async_loadfile_replaces_synchronous_play(self):
+        # A real EDL with thousands of segments makes a synchronous loadfile
+        # block the owner thread for the whole demuxer open; the engine must
+        # issue the load fire-and-forget when the binding supports it.
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _AsyncLoadPlayer(**options)
+            return holder["player"]
+
+        engine = MpvEngine("source.mp4", mpv_factory=factory, total=2)
+        engine.start()
+        player = holder["player"]
+        self.assertEqual(player.async_commands, [("loadfile", engine.path, "replace")])
+        # The player is held paused before the load is issued so nothing is
+        # presented before the pending seek lands.
+        self.assertTrue(player.pause)
+        self.assertFalse(any(command[0] == "play" for command in player.commands))
+        engine.close()
+
+    def test_timeline_passthrough_matches_full_validation_build(self):
+        # The preview engine's caller-owned timeline route must produce the
+        # exact artifact the fail-closed exporter route produces.
+        from certified_edl import build_certified_edl
+        from pts_timeline import CertifiedPtsTimeline
+        from tests.test_preview_engine import _certified_media
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = _certified_media(
+                root,
+                [{"n": i, "pts": i * 40, "duration": 40} for i in range(8)],
+            )
+            plan = TimelinePlan.from_deleted_ranges(8, [(2, 4)])
+            request = CertifiedEdlRequest(media, plan, 0, 0)
+            full = build_certified_edl(request, root / "edl")
+            timeline = CertifiedPtsTimeline.from_media_info(media)
+            fast = build_certified_edl(request, root / "edl", timeline=timeline)
+            self.assertEqual(full.content_sha256, fast.content_sha256)
+            self.assertEqual(full.segments, fast.segments)
+            self.assertEqual(full.path, fast.path)
+
+    def test_play_edl_reuses_cached_artifact_for_same_plan(self):
+        import mpv_engine as mpv_engine_module
+        from tests.test_preview_engine import _certified_media
+
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _FakePlayer(**options)
+            return holder["player"]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = _certified_media(
+                root,
+                [{"n": i, "pts": i * 40, "duration": 40} for i in range(8)],
+            )
+            engine = MpvEngine(
+                str(media.source_path), total=8, mpv_factory=factory, edl_dir=root / "edl"
+            )
+            engine.bind_media_info(media)
+            engine.start()
+            plan = TimelinePlan.from_deleted_ranges(8, [(2, 4)])
+            request = CertifiedEdlRequest(media, plan, 3, 1)
+            calls: list[bool] = []
+            original = mpv_engine_module.build_certified_edl
+
+            def counting(request_, dir_, **kwargs):
+                calls.append(kwargs.get("timeline") is not None)
+                return original(request_, dir_, **kwargs)
+
+            mpv_engine_module.build_certified_edl = counting
+            try:
+                self.assertTrue(engine.play_edl(request, start_frame=0))
+                self.assertTrue(engine.play_edl(request, start_frame=0))
+            finally:
+                mpv_engine_module.build_certified_edl = original
+            # One build for both toggles, and it received the engine's
+            # already-bound timeline instead of re-deriving it.
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0])
+            engine.close()
 
     def test_edl_request_rejects_foreign_certified_source_before_publish(self):
         from tests.test_preview_engine import _certified_media

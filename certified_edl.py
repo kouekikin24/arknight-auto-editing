@@ -312,29 +312,66 @@ def _head_tick_collision_frames(
 def build_certified_edl(
     request: CertifiedEdlRequest,
     output_dir: str | os.PathLike[str],
+    *,
+    timeline: CertifiedPtsTimeline | None = None,
 ) -> CertifiedEdl:
-    """Build or reuse one EDL whose intervals come solely from certified PTS."""
+    """Build or reuse one EDL whose intervals come solely from certified PTS.
+
+    ``timeline`` lets a caller that has already bound and validated the
+    certified timeline (the preview engine, which stat-checks the source on
+    every command) skip the per-call multi-gigabyte source hash and the
+    evidence re-derivation.  The default path re-validates everything and
+    remains the fail-closed route for exporters.
+    """
 
     media = request.media_info
-    try:
-        media.assert_source_current()
-    except MediaInfoError as exc:
-        raise PreviewEngineError(exc.code, str(exc), details=exc.details) from exc
-    if not media.complete_for_export or media.frame_pts_certification is None:
-        raise PreviewEngineError(
-            "CERTIFICATION_REQUIRED",
-            "certified PTS media is required before building an EDL",
-        )
-    plan = request.timeline_plan
     certification = media.frame_pts_certification
+    if timeline is None:
+        try:
+            media.assert_source_current()
+        except MediaInfoError as exc:
+            raise PreviewEngineError(exc.code, str(exc), details=exc.details) from exc
+        if not media.complete_for_export or certification is None:
+            raise PreviewEngineError(
+                "CERTIFICATION_REQUIRED",
+                "certified PTS media is required before building an EDL",
+            )
+    else:
+        # complete_for_export re-hashes the source; the caller vouched for
+        # the full gate when it bound this timeline, so only the cheap
+        # certification identity is re-checked here.
+        if certification is None:
+            raise PreviewEngineError(
+                "CERTIFICATION_REQUIRED",
+                "certified PTS media is required before building an EDL",
+            )
+        if (
+            timeline.frame_count != certification.frame_count
+            or timeline.time_base != certification.time_base
+        ):
+            raise PreviewEngineError(
+                "TIMELINE_MISMATCH",
+                "caller-provided certified timeline does not match the request certification",
+                details={
+                    "timeline_frames": timeline.frame_count,
+                    "certification_frames": certification.frame_count,
+                    "timeline_time_base": str(timeline.time_base),
+                    "certification_time_base": str(certification.time_base),
+                },
+            )
+    plan = request.timeline_plan
     if plan.total_frames != certification.frame_count:
         raise PreviewEngineError(
             "FRAME_COUNT_MISMATCH",
             "timeline plan and certified PTS frame count differ",
             details={"plan": plan.total_frames, "certified": certification.frame_count},
         )
+    if timeline is None:
+        try:
+            timeline = CertifiedPtsTimeline.from_media_info(media)
+        except MediaInfoError as exc:
+            raise PreviewEngineError(exc.code, str(exc), details=exc.details) from exc
     try:
-        timeline = CertifiedPtsTimeline.from_media_info(media)
         intervals = timeline.intervals_for_plan(plan)
     except MediaInfoError as exc:
         raise PreviewEngineError(exc.code, str(exc), details=exc.details) from exc
