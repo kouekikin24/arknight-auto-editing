@@ -84,7 +84,20 @@ def _deleted_ranges() -> list[tuple[int, int]]:
     ]
 
 
-def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
+def _load_deleted_ranges(path: Path) -> list[tuple[int, int]]:
+    """Load a real skip-segs jump table produced by cache_apt_analysis.py."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    ranges: list[tuple[int, int]] = []
+    for item in raw:
+        start, end = int(item[0]), int(item[1])
+        if end > start:
+            ranges.append((start, end))
+    if not ranges:
+        raise ValueError(f"no usable [start, end) ranges in {path}")
+    return ranges
+
+
+def run(source: Path, dll_dir: Path, out_dir: Path, skip_segs_path: Path | None) -> dict:
     import tkinter as tk
     from PIL import ImageGrab
 
@@ -95,14 +108,21 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
     from frame_pts_certifier import produce_frame_pts_certification
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    deleted = _deleted_ranges()
+    if skip_segs_path is not None:
+        deleted = _load_deleted_ranges(skip_segs_path)
+        deleted_source = str(skip_segs_path)
+    else:
+        deleted = _deleted_ranges()
+        deleted_source = "synthetic"
 
     result = {
         "schema_version": 1,
         "kind": "mpv_real_preview_verification",
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": str(source),
-        "deleted_ranges": deleted,
+        "deleted_source": deleted_source,
+        "deleted_range_count": len(deleted),
+        "deleted_ranges_preview": deleted[:20],
         "checks": {},
         "status": "fail",
         "reason_codes": [],
@@ -219,7 +239,10 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
         pump(0.5)
 
         # -- Check 1: SOURCE mode seeks -------------------------------------
-        source_frames = [0, 90_000, 180_000, 300_000, total - 1]
+        # Probe kept frames only: a deleted tail frame can render as the
+        # fade-out the analysis legitimately cut, which is not a blank window.
+        kept_probe_last = 423_148 if total == 424_176 else total - 1
+        source_frames = [0, 90_000, 180_000, 300_000, kept_probe_last]
         source_rows = []
         for frame in source_frames:
             target = source_seconds(frame)
@@ -337,6 +360,12 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument(
+        "--skip-segs",
+        type=Path,
+        default=None,
+        help="real deleted-ranges JSON from cache_apt_analysis.py; default uses built-in synthetic spans",
+    )
     parser.add_argument("--dll-dir", type=Path, default=DEFAULT_DLL_DIR)
     parser.add_argument("--out-dir", type=Path, default=OUT_ROOT)
     args = parser.parse_args(argv)
@@ -344,12 +373,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.source.is_file():
         print(f"source missing: {args.source}", file=sys.stderr)
         return 2
+    if args.skip_segs is not None and not args.skip_segs.is_file():
+        print(f"skip-segs missing: {args.skip_segs}", file=sys.stderr)
+        return 2
     if not (args.dll_dir / "libmpv-2.dll").is_file():
         print(f"libmpv-2.dll missing under {args.dll_dir}", file=sys.stderr)
         return 2
 
     out_dir = args.out_dir / datetime.now().strftime("%Y%m%d-%H%M%S")
-    result = run(args.source, args.dll_dir, out_dir)
+    result = run(args.source, args.dll_dir, out_dir, args.skip_segs)
     report = out_dir / "real_preview.json"
     report.write_text(
         json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
