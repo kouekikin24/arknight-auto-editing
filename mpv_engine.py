@@ -203,7 +203,9 @@ class MpvEngine:
     def _make_player(self) -> Any:
         factory = self._prepare_binding()
         options: dict[str, Any] = {
-            "audio": "auto",
+            # The preview is a silent editing surface; never decode or output
+            # audio even when the source has an audio stream.
+            "audio": "no",
             "idle": "yes",
             "keep_open": "yes",
             "terminal": False,
