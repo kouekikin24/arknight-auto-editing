@@ -161,6 +161,24 @@ def _worker_classify_gray(gray: np.ndarray) -> int:
     return _classify_gray(gray, _worker_configs, _worker_thresholds, _worker_proc_res)
 
 
+def _worker_classify_gray_scored(gray: np.ndarray) -> tuple[int, float]:
+    """Diagnostic variant: also return the raw pause-template score.
+
+    Only used when the caller enables diagnostics; the production path keeps
+    using _worker_classify_gray so the judgment logic is byte-for-byte
+    unchanged.  Returns (state, pause_score).  pause_score is -1.0 when no
+    pause templates are configured.
+    """
+    state = _classify_gray(gray, _worker_configs, _worker_thresholds, _worker_proc_res)
+    pause_templates = _worker_configs.get('pause') or []
+    score = (
+        _get_best_score(gray, pause_templates, _worker_proc_res)
+        if pause_templates
+        else -1.0
+    )
+    return state, float(score)
+
+
 # ---------------------------------------------------------------
 #  First-pass pause-boundary context (skip second VideoCapture scan)
 # ---------------------------------------------------------------
@@ -429,6 +447,7 @@ def _analyze_video_opencv(
     n_threads: int,
     progress_cb=None,
     want_context: bool = False,
+    want_diagnostics: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict | None]:
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -437,6 +456,9 @@ def _analyze_video_opencv(
     n_workers = min(n_threads, multiprocessing.cpu_count())
     pw, ph = proc_res
     tracker = _BoundaryTracker() if want_context else None
+    # Diagnostic collectors (only when explicitly requested; judgment untouched)
+    diag_scores: list[float] | None = [] if want_diagnostics else None
+    diag_luma: list[float] | None = [] if want_diagnostics else None
     # If total unknown/0, still allow reading until EOF with growable lists.
     use_dynamic = total <= 0
     if use_dynamic:
@@ -471,6 +493,8 @@ def _analyze_video_opencv(
                 batch_grays.append(gray)
                 batch_indices.append(idx)
                 batch_prev.append(prev_gray)
+                if diag_luma is not None:
+                    diag_luma.append(float(gray.mean()))
 
                 if not use_dynamic:
                     if prev_gray is not None and idx < len(diffs):
@@ -489,7 +513,12 @@ def _analyze_video_opencv(
                 break
 
             chunk = max(4, len(batch_grays) // (n_workers * 2))
-            results = list(ex.map(_worker_classify_gray, batch_grays, chunksize=chunk))
+            if diag_scores is not None:
+                scored = list(ex.map(_worker_classify_gray_scored, batch_grays, chunksize=chunk))
+                results = [s for s, _ in scored]
+                diag_scores.extend(sc for _, sc in scored)
+            else:
+                results = list(ex.map(_worker_classify_gray, batch_grays, chunksize=chunk))
 
             for i, s, g, pg in zip(batch_indices, results, batch_grays, batch_prev):
                 if use_dynamic:
@@ -512,14 +541,25 @@ def _analyze_video_opencv(
     else:
         decoded = idx
         # allocated_total from metadata; decoded may be smaller
+    diag = None
+    if diag_scores is not None or diag_luma is not None:
+        diag = {
+            "pause_score": np.asarray(diag_scores[:decoded], dtype=np.float32),
+            "luma": np.asarray(diag_luma[:decoded], dtype=np.float32),
+        }
     if want_context:
         states, diffs, context = _finalize_analysis_arrays(
             states, diffs, max(allocated_total, decoded), decoded, tracker, last_gray
         )
+        if diag is not None:
+            context = dict(context or {})
+            context["_diagnostics"] = diag
         return states, diffs, context
     if decoded < len(states):
         states = states[:decoded]
         diffs = diffs[:decoded]
+    if diag is not None:
+        return states, diffs, {"_diagnostics": diag}
     return states, diffs, None
 
 
@@ -533,6 +573,7 @@ def _analyze_video_ffmpeg_sw_passthrough(
     progress_cb=None,
     ffmpeg_path: str | None = None,
     want_context: bool = False,
+    want_diagnostics: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict | None]:
     """Production A_PT: FFmpeg software gray@proc_res with output fps_mode=passthrough."""
     ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
@@ -556,6 +597,8 @@ def _analyze_video_ffmpeg_sw_passthrough(
     diffs = np.zeros(total, dtype=np.float32)
     n_workers = min(n_threads, multiprocessing.cpu_count())
     tracker = _BoundaryTracker() if want_context else None
+    diag_scores: list[float] | None = [] if want_diagnostics else None
+    diag_luma: list[float] | None = [] if want_diagnostics else None
 
     stderr_file = tempfile.TemporaryFile()
     proc: subprocess.Popen | None = None
@@ -617,6 +660,8 @@ def _analyze_video_ffmpeg_sw_passthrough(
                     batch_grays.append(gray)
                     batch_indices.append(got)
                     batch_prev.append(prev_gray)
+                    if diag_luma is not None:
+                        diag_luma.append(float(gray.mean()))
                     if prev_gray is not None:
                         diffs[got] = float(cv2.mean(cv2.absdiff(gray, prev_gray))[0])
                     prev_gray = gray
@@ -625,9 +670,16 @@ def _analyze_video_ffmpeg_sw_passthrough(
 
                 if batch_grays:
                     chunk = max(4, len(batch_grays) // (n_workers * 2))
-                    results = list(
-                        ex.map(_worker_classify_gray, batch_grays, chunksize=chunk)
-                    )
+                    if diag_scores is not None:
+                        scored = list(
+                            ex.map(_worker_classify_gray_scored, batch_grays, chunksize=chunk)
+                        )
+                        results = [s for s, _ in scored]
+                        diag_scores.extend(sc for _, sc in scored)
+                    else:
+                        results = list(
+                            ex.map(_worker_classify_gray, batch_grays, chunksize=chunk)
+                        )
                     for i, s, g, pg in zip(
                         batch_indices, results, batch_grays, batch_prev
                     ):
@@ -688,10 +740,21 @@ def _analyze_video_ffmpeg_sw_passthrough(
         states, diffs, context = _finalize_analysis_arrays(
             states, diffs, total, got, tracker, last_gray
         )
+        if diag_scores is not None or diag_luma is not None:
+            context = dict(context or {})
+            context["_diagnostics"] = {
+                "pause_score": np.asarray((diag_scores or [])[:got], dtype=np.float32),
+                "luma": np.asarray((diag_luma or [])[:got], dtype=np.float32),
+            }
         return states, diffs, context
     if got != total:
         states = states[:got]
         diffs = diffs[:got]
+    if diag_scores is not None or diag_luma is not None:
+        return states, diffs, {"_diagnostics": {
+            "pause_score": np.asarray((diag_scores or [])[:got], dtype=np.float32),
+            "luma": np.asarray((diag_luma or [])[:got], dtype=np.float32),
+        }}
     return states, diffs, None
 
 
@@ -737,12 +800,18 @@ def analyze_video_with_context(
     progress_cb=None,
     decode_backend: str = DECODE_BACKEND_OPENCV,
     ffmpeg_path: str | None = None,
+    want_diagnostics: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Three-item API: (states, diffs, analysis_context).
 
     analysis_context is JSON-safe (no frame pixels). When complete, pass it to
     build_segments(..., analysis_context=context) to skip the second boundary
     VideoCapture scan. Incomplete/mismatched context is rejected wholesale.
+
+    want_diagnostics=True additionally records the raw pause-template score and
+    per-frame luma into context["_diagnostics"] as numpy arrays.  This is a
+    pure side-channel for offline boundary analysis; the classification logic
+    and the JSON-safe context validation are unchanged.
     """
     backend = normalize_decode_backend(decode_backend)
     if backend == DECODE_BACKEND_OPENCV:
@@ -755,6 +824,7 @@ def analyze_video_with_context(
             n_threads,
             progress_cb,
             want_context=True,
+            want_diagnostics=want_diagnostics,
         )
         return states, diffs, context or _make_analysis_context(len(states), [], False)
     if backend == DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH:
@@ -768,6 +838,7 @@ def analyze_video_with_context(
             progress_cb,
             ffmpeg_path=ffmpeg_path,
             want_context=True,
+            want_diagnostics=want_diagnostics,
         )
         return states, diffs, context or _make_analysis_context(len(states), [], False)
     raise ValueError(f"unsupported decode_backend={backend!r}")

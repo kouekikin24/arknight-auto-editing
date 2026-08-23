@@ -218,21 +218,22 @@ class SettingsPanel(ttk.LabelFrame):
 
         # ---- 导出 ----
         r = 0
+        # 三列：标签(固定) / 控件(拉伸) / 浏览按钮(固定钉右)。
+        # 给列 1 设 minsize，保证输入框不会被标签+按钮挤没。
         tab_export.columnconfigure(0, weight=0)
-        tab_export.columnconfigure(1, weight=1)
+        tab_export.columnconfigure(1, weight=1, minsize=220)
         tab_export.columnconfigure(2, weight=0)
         self.output_var = tk.StringVar()
         ttk.Label(tab_export, text="输出路径:").grid(row=r, column=0, sticky=tk.W, pady=2)
         ttk.Entry(tab_export, textvariable=self.output_var).grid(
             row=r, column=1, sticky=tk.EW, padx=4)
-        ttk.Button(tab_export, text="浏览", command=self._browse_output, width=5).grid(
+        ttk.Button(tab_export, text="浏览", command=self._browse_output).grid(
             row=r, column=2, sticky=tk.E)
         r += 1
 
         self.quality_var = tk.IntVar(value=6)
         ttk.Label(tab_export, text="视频质量 (0-10):").grid(row=r, column=0, sticky=tk.W, pady=2)
-        # 与上行输入框左缘对齐：固定宽度 Spinbox 放在等宽的对齐槽里，
-        # 槽本身随列拉伸，控件保持左对齐，两行左缘一致。
+        # Spinbox 与上行输入框共用列 1 的左缘：套一个 sticky=EW 的槽，控件在槽内左对齐。
         quality_slot = ttk.Frame(tab_export)
         quality_slot.grid(row=r, column=1, columnspan=2, sticky=tk.EW, padx=4)
         ttk.Spinbox(quality_slot, from_=0, to=10, textvariable=self.quality_var,

@@ -291,6 +291,9 @@ class VideoPreviewPlayer(tk.Frame):
         self.video_surface.bind("<Button-1>", lambda _event: self._focus_preview(), add="+")
         self.mpv_host.bind("<Button-1>", lambda _event: self._focus_preview(), add="+")
         self.video_canvas.bind("<Button-1>", lambda _event: self._focus_preview())
+        # 右键：复制帧号/帧率到剪贴板（OSD 画在视频上没法选中复制）
+        for _w in (self.video_surface, self.mpv_host, self.video_canvas):
+            _w.bind("<Button-3>", self._on_video_right_click, add="+")
 
         self.timeline = TimelineWidget(self)
         self.timeline.pack(fill=tk.X, padx=10)
@@ -405,6 +408,43 @@ class VideoPreviewPlayer(tk.Frame):
                 width = max(1, self.video_surface.winfo_width() or self.canvas_w)
                 height = max(1, self.video_surface.winfo_height() or self.canvas_h)
                 target.set_viewport(width, height, self._preview_dpi_scale())
+        except Exception:
+            pass
+
+    def _on_video_right_click(self, event) -> None:
+        """视频区右键：弹出复制帧号/帧率菜单。"""
+        if self._closing or not bool(getattr(self._io, "native_rendering", False)):
+            return
+        getter = getattr(self._io, "get_osd_texts", None)
+        frame_text, fps_text = ("", "")
+        if callable(getter):
+            try:
+                frame_text, fps_text = getter()
+            except Exception:
+                pass
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label=f"复制帧号  ({frame_text or '无'})",
+            command=lambda: self._copy_to_clipboard(frame_text),
+            state=(tk.NORMAL if frame_text else tk.DISABLED),
+        )
+        menu.add_command(
+            label=f"复制帧率  ({fps_text or '无'})",
+            command=lambda: self._copy_to_clipboard(fps_text),
+            state=(tk.NORMAL if fps_text else tk.DISABLED),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.lbl_info.config(text=f"已复制: {text}")
         except Exception:
             pass
 
@@ -2087,15 +2127,17 @@ class VideoPreviewPlayer(tk.Frame):
                 self.settings.set_selected_pause(seg_id, seg.get('mode', 'auto'))
                 break
 
-    def _note_fps_sample(self, frame, drops) -> None:
+    def _note_fps_sample(self, time_pos, drops) -> None:
         """喂采样并节流刷新右上角播放帧率 OSD。
 
-        显示的是「实际看到的帧率」：源帧推进速率减去 libmpv 报告的丢帧
-        速率，窗口取最近 ~1 秒。暂停 / 寻址瞬间清窗，重新累积。
+        口径：媒体时间推进速率 × 源帧率 = 实际内容帧率。用 time-pos（EDL
+        里也连续、不会因跳过删除段而大跳）而不是源帧号，所以不会被 EDL
+        跳变污染成 129/175 那种虚高值。结果钳制到源帧率，多读必是测量噪声。
+        暂停 / 寻址瞬间清窗重新累积。
         """
         now = time.monotonic()
-        if isinstance(frame, int) and self.is_playing:
-            self._fps_samples.append((now, frame, drops if isinstance(drops, int) else None))
+        if isinstance(time_pos, (int, float)) and self.is_playing:
+            self._fps_samples.append((now, float(time_pos), drops if isinstance(drops, int) else None))
         else:
             if self._fps_samples:
                 self._fps_samples.clear()
@@ -2108,41 +2150,41 @@ class VideoPreviewPlayer(tk.Frame):
             return
         text = None
         samples = self._fps_samples
-        if len(samples) >= 8:
-            t0, f0, d0 = samples[0]
-            t1, f1, d1 = samples[-1]
+        src_fps = float(getattr(self._io, "fps", 0.0) or 0.0)
+        if len(samples) >= 8 and src_fps > 0:
+            t0, p0, d0 = samples[0]
+            t1, p1, d1 = samples[-1]
             dt = t1 - t0
             if dt >= 0.5:
-                # 求逆序对：寻址/模式切换后样本可能倒退，那段窗口不可信
+                # 求逆序对：寻址/模式切换后 time-pos 可能倒退，那段窗口不可信
                 ordered = all(
                     samples[i][1] <= samples[i + 1][1]
                     for i in range(len(samples) - 1)
                 )
                 if ordered:
-                    advanced = (f1 - f0) / dt
+                    media_rate = (p1 - p0) / dt  # 媒体秒 / 墙钟秒
+                    fps = media_rate * src_fps
                     if d0 is not None and d1 is not None:
-                        presented = advanced - (d1 - d0) / dt
-                    else:
-                        presented = advanced
-                    text = f"{max(0.0, presented):.1f} FPS"
+                        fps -= (d1 - d0) / dt  # 扣掉丢帧速率
+                    fps = max(0.0, min(fps, src_fps))  # 钳到源帧率
+                    text = f"{fps:.1f} FPS"
         try:
             shower(text or "… FPS")
         except Exception:
             pass
 
     def _maybe_show_frame_osd(self, frame: int) -> None:
-        """原生渲染时用 mpv OSD 叠加当前源帧号；播放中 ~4Hz 节流刷新。"""
-        shower = getattr(self._io, "show_osd_text", None)
+        """原生渲染时用持久 overlay 在左上角显示当前源帧号；暂停也常驻。"""
+        shower = getattr(self._io, "show_osd_topleft_text", None)
         if not callable(shower) or not bool(self.show_frame_osd_var.get()):
             return
-        if not self.is_playing and not self._osd_pending:
-            return
+        # 持久 overlay 不会自己消失；_osd_pending 让寻址/暂停时也立即刷新一次
         self._osd_tick += 1
         if not self._osd_pending and self._osd_tick % 15 != 0:
             return
         self._osd_pending = False
         try:
-            shower(f"帧 {frame:,} / {max(0, self.total_frames - 1):,}", 700)
+            shower(f"帧 {frame:,} / {max(0, self.total_frames - 1):,}")
         except Exception:
             pass
 
@@ -2195,7 +2237,7 @@ class VideoPreviewPlayer(tk.Frame):
                         self.current_frame_idx = native_frame
                         self.timeline.current_frame_idx = native_frame
                         self._maybe_show_frame_osd(native_frame)
-                    self._note_fps_sample(native_frame, perf.get("mpv_frame_drops"))
+                    self._note_fps_sample(perf.get("time_pos"), perf.get("mpv_frame_drops"))
                 except Exception:
                     pass
         # 只显示队列里最新一帧，避免积压时「补放旧帧」造成拖影/顿挫

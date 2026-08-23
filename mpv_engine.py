@@ -127,6 +127,8 @@ class MpvEngine:
         self._pending_seek: tuple[Fraction, bool] | None = None
         self._pending_resume = False
         self._pending_speed: float | None = None
+        self._osd_topleft = ""
+        self._osd_corner = ""
         self._play_end_reason: str | None = None
         self._pace_mode = "opt"
         self._viewport: tuple[int, int, float] | None = None
@@ -1112,11 +1114,26 @@ class MpvEngine:
                 return False
 
     def show_osd_corner_text(self, text: str) -> bool:
-        """Persistent top-right OSD overlay, independent of ``show_osd_text``.
+        """持久右上角 OSD（播放帧率）。见 _osd_overlay。"""
+        return self._osd_overlay(1, text, "an9")
 
-        ``show-text`` owns a single OSD slot, so a second corner readout has
-        to go through libmpv's ``osd-overlay`` command (ASS event positioned
-        with ``{\\an9}``).  Pass an empty string to clear the overlay.
+    def show_osd_topleft_text(self, text: str) -> bool:
+        """持久左上角 OSD（帧号）。暂停时也常驻，不随 show-text 超时消失。"""
+        return self._osd_overlay(2, text, "an7")
+
+    def get_osd_texts(self) -> tuple[str, str]:
+        """Return (frame_osd_text, fps_osd_text) for copy-to-clipboard."""
+        with self._lock:
+            return (self._osd_topleft, self._osd_corner)
+
+    def _osd_overlay(self, overlay_id: int, text: str, align: str) -> bool:
+        """Persistent OSD overlay on the native render surface.
+
+        ``show-text`` owns a single OSD slot and auto-expires, so both the
+        frame number and the FPS readout go through libmpv's ``osd-overlay``
+        command with distinct ids.  ``data`` is ASS-override tag + plain text
+        (no ``Dialogue:`` prefix — that gets rendered literally).  Pass an
+        empty string to clear.
         """
 
         if not isinstance(text, str):
@@ -1129,18 +1146,18 @@ class MpvEngine:
                 return False
             try:
                 if not text:
-                    player.command("osd-overlay", 1, "none", "", 0, 0, 0)
+                    player.command("osd-overlay", overlay_id, "none", "", 0, 0, 0)
+                    shown = ""
                 else:
-                    safe = text.replace("\\", "\\\\").replace("{", "\\{")
+                    safe = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
                     player.command(
-                        "osd-overlay",
-                        1,
-                        "ass-events",
-                        f"Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,{{\\an9}}{safe}",
-                        0,
-                        0,
-                        0,
+                        "osd-overlay", overlay_id, "ass-events", f"{{\\{align}}}{safe}", 0, 0, 0
                     )
+                    shown = text
+                if overlay_id == 1:
+                    self._osd_corner = shown
+                elif overlay_id == 2:
+                    self._osd_topleft = shown
                 return True
             except Exception:
                 return False
@@ -1183,6 +1200,7 @@ class MpvEngine:
                     "project_generation": self._project_generation,
                     "timeline_revision": self._timeline_revision,
                     "source_frame": self._source_frame,
+                    "time_pos": self._last_time_pos,
                     "playing": self._playing,
                     "playback_active": self._playing,
                     "play_end_reason": self._play_end_reason,

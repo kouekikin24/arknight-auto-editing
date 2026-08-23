@@ -79,6 +79,11 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--threads", type=int, default=max(1, (analyzer.multiprocessing.cpu_count() or 4)))
     ap.add_argument("--ffmpeg", type=str, default=None, help="ffmpeg path; default auto")
+    ap.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="also save raw pause-template score + per-frame luma to *_pause_score.npy / *_luma.npy",
+    )
     args = ap.parse_args()
 
     video = args.video
@@ -145,6 +150,7 @@ def main() -> int:
         prog,
         decode_backend=backend,
         ffmpeg_path=ffmpeg,
+        want_diagnostics=args.diagnostics,
     )
     t_an = time.monotonic() - t0
     print(
@@ -171,6 +177,15 @@ def main() -> int:
     stem = video.stem
     np.save(out / f"{stem}_states.npy", states)
     np.save(out / f"{stem}_diffs.npy", diffs)
+    diag = (context or {}).get("_diagnostics") if args.diagnostics else None
+    if diag is not None:
+        np.save(out / f"{stem}_pause_score.npy", diag["pause_score"])
+        np.save(out / f"{stem}_luma.npy", diag["luma"])
+        print(
+            f"[cache_apt] diagnostics saved: pause_score={len(diag['pause_score'])} "
+            f"luma={len(diag['luma'])}",
+            flush=True,
+        )
     with (out / f"{stem}_pauses.pkl").open("wb") as f:
         pickle.dump(pauses, f, protocol=pickle.HIGHEST_PROTOCOL)
     with (out / f"{stem}_speeds.pkl").open("wb") as f:

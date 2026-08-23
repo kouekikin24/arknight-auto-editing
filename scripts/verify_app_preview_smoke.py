@@ -193,8 +193,8 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
         if "变速段按原速" not in info_text:
             failures.append("SPEED_POLICY_HINT_MISSING")
 
-        # -- frame OSD -----------------------------------------------------
-        osd_ok = bool(engine.show_osd_text("帧号OSD自检 12345", 800))
+        # -- frame OSD (persistent top-left overlay) ------------------------
+        osd_ok = bool(engine.show_osd_topleft_text("帧号OSD自检 12345"))
         result["checks"]["frame_osd"] = {"command_accepted": osd_ok}
         if not osd_ok:
             failures.append("OSD_COMMAND_REJECTED")
@@ -205,15 +205,23 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
         pump(0.6)
         corner_image = grab_window()
         w, h = corner_image.size
+        # 干净文本应只在右上角一小条；若再出现 Dialogue 长串会横向铺满顶部
         tr = corner_image.crop((int(w * 0.7), 0, w, int(h * 0.12))).convert("L")
+        tl = corner_image.crop((int(w * 0.3), 0, int(w * 0.7), int(h * 0.12))).convert("L")
         bright_tr = sum(1 for v in tr.getdata() if v > 140)
+        bright_midtop = sum(1 for v in tl.getdata() if v > 140)
         result["checks"]["corner_fps_osd"] = {
             "command_accepted": corner_ok,
             "top_right_bright_pixels": bright_tr,
+            "top_middle_bright_pixels": bright_midtop,
         }
         if not corner_ok or bright_tr <= 40:
             failures.append("CORNER_FPS_OSD_MISSING")
+        # Dialogue 前缀泄漏会横跨顶部中间区域，出现大片亮字
+        if bright_midtop > 400:
+            failures.append("CORNER_FPS_OSD_DIALOGUE_LEAK")
         engine.show_osd_corner_text("")
+        engine.show_osd_topleft_text("")
 
         # -- EDL-mode frame stepping must stay in EDL -----------------------
         player._stop_playback_ui(from_user=True)
