@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 from types import SimpleNamespace
 import unittest
@@ -27,10 +28,12 @@ def _bare_player() -> VideoPreviewPlayer:
     player._fps_samples = deque(maxlen=64)
     player._osd_tick = 0
     player._osd_pending = False
+    player._paused_seek_guard_until = 0.0
     player._io = mock.Mock()
     player._io.native_rendering = True
     player._io.fps = 60.0  # time-pos 口径需要真实源帧率
     player.show_frame_osd_var = _BoolVar(True)
+    player.preview_speed_var = SimpleNamespace(get=lambda: "1x")
     return player
 
 
@@ -55,6 +58,28 @@ class InstantFpsOsdTests(unittest.TestCase):
         value = float(corner_texts[0].split()[0])
         # media_rate = 0.9/0.9 = 1.0 -> 60fps; minus 14 drops/0.9s ≈ 15.6 -> ~44.4
         self.assertAlmostEqual(value, 60.0 - 14 / 0.9, places=1)
+
+    def test_speed_2x_raises_clamp_ceiling(self):
+        # mpv 的 2x 是 playback_rate 原生变速：内容帧率上限 = 源帧率×2，
+        # 钳到源帧率会把真实的 ~120 误显示成 60。
+        player = _bare_player()
+        player.preview_speed_var = SimpleNamespace(get=lambda: "2x")
+        player.is_playing = True
+        corner_texts: list[str] = []
+        player._io.show_osd_corner_text.side_effect = corner_texts.append
+
+        base = 1000.0
+        ticks = 15
+        step = 0.9 / (ticks - 1)
+        with mock.patch("preview_player.time.monotonic") as clock:
+            for i in range(ticks):
+                clock.return_value = base + i * step
+                player._osd_tick = i + 1
+                # time-pos 以 2 倍墙钟推进（playback_rate=2），无丢帧
+                player._note_fps_sample(2.0 * i * step, 0)
+        self.assertEqual(len(corner_texts), 1)
+        value = float(corner_texts[0].split()[0])
+        self.assertAlmostEqual(value, 120.0, places=1)
 
     def test_edl_jump_does_not_inflate(self):
         # time-pos 倒退（seek/EDL 重锚）时，有序性检查必须挡住这次输出，
@@ -99,6 +124,59 @@ class InstantFpsOsdTests(unittest.TestCase):
         player._preview_pts_ready = mock.Mock(return_value=False)
         player._seek(5)
         self.assertEqual(len(player._fps_samples), 0)
+
+
+class PausedSeekGuardTests(unittest.TestCase):
+    """暂停中步进寻址后，渲染循环不得用引擎回读的旧帧号回写 UI。"""
+
+    def _player(self) -> VideoPreviewPlayer:
+        player = _bare_player()
+        player.total_frames = 100
+        player.current_frame_idx = 10
+        player.timeline = mock.Mock()
+        return player
+
+    def test_paused_step_not_reverted_by_stale_engine_frame(self):
+        player = self._player()
+        # 用户在帧 10 暂停，按 → 步进到 11（_seek 会武装保护窗口）
+        player.current_frame_idx = 11
+        player._paused_seek_guard_until = time.monotonic() + 0.25
+        # 引擎还回读旧值 10（mpv 寻址异步，旧 time-pos 事件先到）
+        player._apply_native_perf(
+            {"source_frame": 10, "time_pos": None, "mpv_frame_drops": None}
+        )
+        self.assertEqual(player.current_frame_idx, 11)
+        # guard 生效时不得回写 timeline（timeline 是 Mock，被赋值即留下记录）
+        self.assertNotEqual(player.timeline.current_frame_idx, 10)
+
+    def test_guard_expiry_adopts_engine_frame(self):
+        player = self._player()
+        player.current_frame_idx = 11
+        player._paused_seek_guard_until = time.monotonic() - 0.01  # 已过期
+        player._apply_native_perf(
+            {"source_frame": 10, "time_pos": None, "mpv_frame_drops": None}
+        )
+        self.assertEqual(player.current_frame_idx, 10)
+
+    def test_playing_always_adopts_engine_frame(self):
+        player = self._player()
+        player.is_playing = True
+        # 播放中即使保护窗口未过期，也以引擎为权威（播放会自己前进）
+        player._paused_seek_guard_until = time.monotonic() + 60.0
+        player._apply_native_perf(
+            {"source_frame": 42, "time_pos": None, "mpv_frame_drops": None}
+        )
+        self.assertEqual(player.current_frame_idx, 42)
+
+    def test_seek_frame_arms_guard_when_paused(self):
+        player = self._player()
+        player.skip_trimmed = _BoolVar(False)
+        player._auto_rate_clear = mock.Mock()
+        player._task_scope = mock.Mock(return_value=(0, 0))
+        player._canvas_wh = mock.Mock(return_value=(320, 180))
+        player._preview_pts_ready = mock.Mock(return_value=False)
+        player._seek(11)
+        self.assertGreater(player._paused_seek_guard_until, time.monotonic())
 
 
 class EdlAwareSeekTests(unittest.TestCase):

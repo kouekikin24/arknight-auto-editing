@@ -262,6 +262,10 @@ class VideoPreviewPlayer(tk.Frame):
         # 帧号屏显（mpv OSD）：节流计数 + 寻址后立即刷新一次
         self._osd_tick: int = 0
         self._osd_pending: bool = False
+        # 暂停中步进寻址的采信保护：mpv 寻址是异步的，旧 time-pos 事件会经
+        # snapshot_perf 把 UI 帧号拉回寻址前的值（左右键看似失灵）。
+        # 保护窗口内渲染循环不回写 current_frame_idx。
+        self._paused_seek_guard_until: float = 0.0
         # (monotonic, source_frame, mpv_drop_count) 采样，用于右上角
         # 瞬时播放帧率（≈1s 窗口，丢帧不计入“看到的”帧率）
         self._fps_samples: deque = deque(maxlen=64)
@@ -338,6 +342,12 @@ class VideoPreviewPlayer(tk.Frame):
             ctrl, text="屏显帧号", variable=self.show_frame_osd_var,
         ).pack(side=tk.LEFT, padx=5)
 
+        # mpv 原生窗口会吞掉视频区右键，复制帧号/帧率的入口放在控制条上
+        ttk.Button(ctrl, text="复制帧号", width=8,
+                   command=lambda: self._copy_osd_text("frame")).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(ctrl, text="复制帧率", width=8,
+                   command=lambda: self._copy_osd_text("fps")).pack(side=tk.LEFT, padx=(4, 0))
+
         # 默认开优化；取消勾选 / 按 O = #9 式基线（只统计，不追帧软锚）
         self.preview_opt_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -411,26 +421,46 @@ class VideoPreviewPlayer(tk.Frame):
         except Exception:
             pass
 
-    def _on_video_right_click(self, event) -> None:
-        """视频区右键：弹出复制帧号/帧率菜单。"""
-        if self._closing or not bool(getattr(self._io, "native_rendering", False)):
-            return
+    def _osd_texts(self) -> tuple[str, str]:
         getter = getattr(self._io, "get_osd_texts", None)
-        frame_text, fps_text = ("", "")
-        if callable(getter):
+        if not callable(getter):
+            return "", ""
+        try:
+            return getter()
+        except Exception:
+            return "", ""
+
+    def _copy_osd_text(self, kind: str) -> None:
+        """复制帧号（纯数字，方便直接贴进排查工具）或帧率读数到剪贴板。"""
+        if kind == "frame":
+            self._copy_to_clipboard(str(int(self.current_frame_idx)))
+            return
+        _frame_text, fps_text = self._osd_texts()
+        if fps_text:
+            self._copy_to_clipboard(fps_text)
+        else:
             try:
-                frame_text, fps_text = getter()
+                self.lbl_info.config(text="暂无可复制的帧率读数")
             except Exception:
                 pass
+
+    def _on_video_right_click(self, event) -> None:
+        """视频区右键：复制帧号/帧率菜单。
+
+        原生 mpv 子窗口会吞掉右键事件，此菜单实际只对 CV 引擎触发；
+        mpv 下用控制条上的「复制帧号/复制帧率」按钮。
+        """
+        if self._closing:
+            return
+        _frame_text, fps_text = self._osd_texts()
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(
-            label=f"复制帧号  ({frame_text or '无'})",
-            command=lambda: self._copy_to_clipboard(frame_text),
-            state=(tk.NORMAL if frame_text else tk.DISABLED),
+            label=f"复制帧号  ({int(self.current_frame_idx)})",
+            command=lambda: self._copy_osd_text("frame"),
         )
         menu.add_command(
             label=f"复制帧率  ({fps_text or '无'})",
-            command=lambda: self._copy_to_clipboard(fps_text),
+            command=lambda: self._copy_osd_text("fps"),
             state=(tk.NORMAL if fps_text else tk.DISABLED),
         )
         try:
@@ -994,6 +1024,10 @@ class VideoPreviewPlayer(tk.Frame):
         """
         if not self._io:
             return
+        if not self.is_playing:
+            # 暂停中寻址：引擎回读的旧帧号会经渲染循环把 UI 拉回原值，
+            # 保护窗口内不采信引擎帧号（详见 _apply_native_perf）
+            self._paused_seek_guard_until = time.monotonic() + 0.25
         if (
             bool(getattr(self._io, "native_rendering", False))
             and bool(self.skip_trimmed.get())
@@ -1007,12 +1041,8 @@ class VideoPreviewPlayer(tk.Frame):
                 except PreviewEngineError as exc:
                     if exc.code != "EDL_NOT_READY":
                         raise
-                    try:
-                        self.lbl_info.config(
-                            text="裁剪预览尚未建立，先播放一次后再逐帧定位"
-                        )
-                    except Exception:
-                        pass
+                    # EDL 尚未建立（还没播放过）：此时引擎本就在源模式，
+                    # 落到下面的源寻址即可，步进不该被卡住
         _project_generation, timeline_revision = self._task_scope()
         self._timeline_revision = timeline_revision
         try:
@@ -2127,13 +2157,22 @@ class VideoPreviewPlayer(tk.Frame):
                 self.settings.set_selected_pause(seg_id, seg.get('mode', 'auto'))
                 break
 
+    def _preview_speed_factor(self) -> float:
+        """当前预览倍速（解析失败按 1x）；用于 FPS 读数的上限钳制。"""
+        var = getattr(self, "preview_speed_var", None)
+        try:
+            return max(0.01, float(str(var.get()).rstrip("xX")))
+        except Exception:
+            return 1.0
+
     def _note_fps_sample(self, time_pos, drops) -> None:
         """喂采样并节流刷新右上角播放帧率 OSD。
 
         口径：媒体时间推进速率 × 源帧率 = 实际内容帧率。用 time-pos（EDL
         里也连续、不会因跳过删除段而大跳）而不是源帧号，所以不会被 EDL
-        跳变污染成 129/175 那种虚高值。结果钳制到源帧率，多读必是测量噪声。
-        暂停 / 寻址瞬间清窗重新累积。
+        跳变污染成 129/175 那种虚高值。上限钳到 源帧率×当前倍速（mpv 的
+        2x/4x 是 playback_rate 原生变速，内容帧率随之放大到 ~120/~240），
+        超出上限必是测量噪声。暂停 / 寻址瞬间清窗重新累积。
         """
         now = time.monotonic()
         if isinstance(time_pos, (int, float)) and self.is_playing:
@@ -2166,7 +2205,7 @@ class VideoPreviewPlayer(tk.Frame):
                     fps = media_rate * src_fps
                     if d0 is not None and d1 is not None:
                         fps -= (d1 - d0) / dt  # 扣掉丢帧速率
-                    fps = max(0.0, min(fps, src_fps))  # 钳到源帧率
+                    fps = max(0.0, min(fps, src_fps * self._preview_speed_factor()))
                     text = f"{fps:.1f} FPS"
         try:
             shower(text or "… FPS")
@@ -2212,6 +2251,26 @@ class VideoPreviewPlayer(tk.Frame):
             except Exception:
                 pass
 
+    def _apply_native_perf(self, perf: dict) -> None:
+        """原生引擎渲染分支：采信引擎帧号、刷新帧号 OSD、喂 FPS 采样。
+
+        暂停中用户刚用 ←/→ 或拖时间轴发了寻址时（保护窗口内），不用引擎
+        回读的帧号回写 UI：mpv 寻址是异步的，旧的 time-pos 事件先把
+        source_frame 拉回寻址前的值，UI 跟着回退，表现为步进失灵。
+        播放中维持引擎为权威源不动。
+        """
+        native_frame = perf.get("source_frame")
+        paused_guard = (
+            not self.is_playing
+            and time.monotonic() < getattr(self, "_paused_seek_guard_until", 0.0)
+        )
+        if isinstance(native_frame, int) and 0 <= native_frame < max(1, self.total_frames):
+            if not paused_guard:
+                self.current_frame_idx = native_frame
+                self.timeline.current_frame_idx = native_frame
+            self._maybe_show_frame_osd(self.current_frame_idx)
+        self._note_fps_sample(perf.get("time_pos"), perf.get("mpv_frame_drops"))
+
     def _render_loop(self):
         if self._closing:
             self._render_after_id = None
@@ -2231,13 +2290,7 @@ class VideoPreviewPlayer(tk.Frame):
                 self._schedule_drop_native_cover(delay_ms=150)
             if bool(getattr(self._io, "native_rendering", False)) and not self._is_dragging:
                 try:
-                    perf = self._io.snapshot_perf()
-                    native_frame = perf.get("source_frame")
-                    if isinstance(native_frame, int) and 0 <= native_frame < max(1, self.total_frames):
-                        self.current_frame_idx = native_frame
-                        self.timeline.current_frame_idx = native_frame
-                        self._maybe_show_frame_osd(native_frame)
-                    self._note_fps_sample(perf.get("time_pos"), perf.get("mpv_frame_drops"))
+                    self._apply_native_perf(self._io.snapshot_perf())
                 except Exception:
                     pass
         # 只显示队列里最新一帧，避免积压时「补放旧帧」造成拖影/顿挫

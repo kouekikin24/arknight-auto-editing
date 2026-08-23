@@ -218,27 +218,29 @@ class SettingsPanel(ttk.LabelFrame):
 
         # ---- 导出 ----
         r = 0
-        # 三列：标签(固定) / 控件(拉伸) / 浏览按钮(固定钉右)。
-        # 给列 1 设 minsize，保证输入框不会被标签+按钮挤没。
-        tab_export.columnconfigure(0, weight=0)
-        tab_export.columnconfigure(1, weight=1, minsize=220)
-        tab_export.columnconfigure(2, weight=0)
-        self.output_var = tk.StringVar()
-        ttk.Label(tab_export, text="输出路径:").grid(row=r, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(tab_export, textvariable=self.output_var).grid(
-            row=r, column=1, sticky=tk.EW, padx=4)
-        ttk.Button(tab_export, text="浏览", command=self._browse_output).grid(
-            row=r, column=2, sticky=tk.E)
+        # 跨列行（按钮/进度条/分段导出框架）的宽度需求会被 grid 摊进各列，
+        # 把列 0 撑到 ~190px、输入框挤成一条缝。路径/质量两行放进独立表单
+        # 框架，表单内部自管三列：标签(固定) / 控件(拉伸) / 浏览(钉右)。
+        tab_export.columnconfigure(0, weight=1)
+        form = ttk.Frame(tab_export)
+        form.grid(row=r, column=0, columnspan=3, sticky=tk.EW)
+        form.columnconfigure(1, weight=1)
         r += 1
 
+        self.output_var = tk.StringVar()
+        ttk.Label(form, text="输出路径:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(form, textvariable=self.output_var).grid(
+            row=0, column=1, sticky=tk.EW, padx=4)
+        ttk.Button(form, text="浏览", command=self._browse_output).grid(
+            row=0, column=2, sticky=tk.E)
+
         self.quality_var = tk.IntVar(value=6)
-        ttk.Label(tab_export, text="视频质量 (0-10):").grid(row=r, column=0, sticky=tk.W, pady=2)
+        ttk.Label(form, text="视频质量 (0-10):").grid(row=1, column=0, sticky=tk.W, pady=2)
         # Spinbox 与上行输入框共用列 1 的左缘：套一个 sticky=EW 的槽，控件在槽内左对齐。
-        quality_slot = ttk.Frame(tab_export)
-        quality_slot.grid(row=r, column=1, columnspan=2, sticky=tk.EW, padx=4)
+        quality_slot = ttk.Frame(form)
+        quality_slot.grid(row=1, column=1, columnspan=2, sticky=tk.EW, padx=4)
         ttk.Spinbox(quality_slot, from_=0, to=10, textvariable=self.quality_var,
                     width=8).pack(side=tk.LEFT)
-        r += 1
 
         self.export_btn = ttk.Button(tab_export, text="导出整段剪辑视频", command=self._on_export)
         self.export_btn.grid(row=r, column=0, columnspan=3, pady=8)
@@ -251,7 +253,7 @@ class SettingsPanel(ttk.LabelFrame):
 
         self.export_status_var = tk.StringVar(value="就绪")
         ttk.Label(tab_export, textvariable=self.export_status_var).grid(
-            row=r, column=0, columnspan=3)
+            row=r, column=0, columnspan=3, sticky=tk.W, padx=2)
         r += 1
 
         ttk.Separator(tab_export, orient=tk.HORIZONTAL).grid(
