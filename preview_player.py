@@ -262,6 +262,9 @@ class VideoPreviewPlayer(tk.Frame):
         # 帧号屏显（mpv OSD）：节流计数 + 寻址后立即刷新一次
         self._osd_tick: int = 0
         self._osd_pending: bool = False
+        # 原生 mpv 子窗口点击后会夺走键盘焦点（详见
+        # _reclaim_focus_from_native_child）；连续两拍确认才拉回
+        self._focus_reclaim_streak: int = 0
         # 暂停中步进寻址的采信保护：mpv 寻址是异步的，旧 time-pos 事件会经
         # snapshot_perf 把 UI 帧号拉回寻址前的值（左右键看似失灵）。
         # 保护窗口内渲染循环不回写 current_frame_idx。
@@ -1026,7 +1029,9 @@ class VideoPreviewPlayer(tk.Frame):
             return
         if not self.is_playing:
             # 暂停中寻址：引擎回读的旧帧号会经渲染循环把 UI 拉回原值，
-            # 保护窗口内不采信引擎帧号（详见 _apply_native_perf）
+            # 保护窗口内不采信引擎帧号（详见 _apply_native_perf）。
+            # 保留已挂起的步进目标：寻址就是朝它去的，清掉会让渲染循环
+            # 在保护窗过期后采信旧位置、把 UI 拉回去。
             self._paused_seek_guard_until = time.monotonic() + 0.25
         if (
             bool(getattr(self._io, "native_rendering", False))
@@ -1782,6 +1787,8 @@ class VideoPreviewPlayer(tk.Frame):
 
     def _step_frame(self, delta: int, seek: bool = True):
         if self.total_frames <= 0: return
+        # 原始 ±1 步进。删除段/保留段的落点交给引擎（seek_edl 对删除段
+        # 向前 snap）；不要替用户"跨段"，否则步进距离不可预期。
         new_idx = max(0, min(self.total_frames - 1, self.current_frame_idx + delta))
         if new_idx == self.current_frame_idx: return
         self.current_frame_idx = new_idx
@@ -2251,6 +2258,75 @@ class VideoPreviewPlayer(tk.Frame):
             except Exception:
                 pass
 
+    def _reclaim_focus_from_native_child(self) -> None:
+        """把被原生 mpv 子窗口夺走的键盘焦点拉回 Tk。
+
+        点击画面后 Windows 焦点落在 mpv 的视频子窗口上：此后 ←/→/空格 全部
+        进不了 Tk 的事件循环，快捷键看似失灵（与右键菜单被吞同源）。
+        GetFocus 只报本线程的窗口，对外线程子窗口恒为 0，所以用
+        GetGUIThreadInfo 拿全局焦点窗口：本窗口在前台、全局焦点落在本窗口
+        内部、但本线程 GetFocus 为空 = 焦点被外线程子窗口持有。连续两拍
+        成立才 focus_set，避免与文件对话框等瞬时状态打架。
+        ARKNIGHT_FOCUS_WATCHDOG=0 可关闭。
+        """
+        if self._closing or os.environ.get("ARKNIGHT_FOCUS_WATCHDOG", "1") == "0":
+            self._focus_reclaim_streak = 0
+            return
+        if not bool(getattr(self._io, "native_rendering", False)):
+            self._focus_reclaim_streak = 0
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            foreground = user32.GetForegroundWindow()
+            top_hwnd = int(self.winfo_toplevel().wm_frame(), 16)
+            ga_root = 2
+            if (
+                not foreground
+                or user32.GetAncestor(foreground, ga_root)
+                != user32.GetAncestor(top_hwnd, ga_root)
+            ):
+                self._focus_reclaim_streak = 0
+                return
+            if user32.GetFocus():
+                # 焦点在本线程的 Tk 控件上（输入框等），不动
+                self._focus_reclaim_streak = 0
+                return
+
+            class _GTI(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_ulong),
+                    ("flags", ctypes.c_ulong),
+                    ("hwndActive", ctypes.c_void_p),
+                    ("hwndFocus", ctypes.c_void_p),
+                    ("hwndCapture", ctypes.c_void_p),
+                    ("hwndMenuOwner", ctypes.c_void_p),
+                    ("hwndMoveSize", ctypes.c_void_p),
+                    ("hwndCaret", ctypes.c_void_p),
+                    ("rcCaret", ctypes.c_long * 4),
+                ]
+
+            gti = _GTI()
+            gti.cbSize = ctypes.sizeof(_GTI)
+            if not user32.GetGUIThreadInfo(0, ctypes.byref(gti)):
+                self._focus_reclaim_streak = 0
+                return
+            focus_hwnd = gti.hwndFocus or gti.hwndActive
+            if not focus_hwnd:
+                self._focus_reclaim_streak = 0
+                return
+            # 全局焦点不在本窗口内（别的应用/桌面），与我们无关
+            if user32.GetAncestor(focus_hwnd, ga_root) != user32.GetAncestor(top_hwnd, ga_root):
+                self._focus_reclaim_streak = 0
+                return
+            self._focus_reclaim_streak += 1
+            if self._focus_reclaim_streak < 2:
+                return
+            self._focus_reclaim_streak = 0
+            self.focus_set()
+        except Exception:
+            self._focus_reclaim_streak = 0
+
     def _apply_native_perf(self, perf: dict) -> None:
         """原生引擎渲染分支：采信引擎帧号、刷新帧号 OSD、喂 FPS 采样。
 
@@ -2260,12 +2336,18 @@ class VideoPreviewPlayer(tk.Frame):
         播放中维持引擎为权威源不动。
         """
         native_frame = perf.get("source_frame")
-        paused_guard = (
-            not self.is_playing
-            and time.monotonic() < getattr(self, "_paused_seek_guard_until", 0.0)
-        )
+        guard_until = getattr(self, "_paused_seek_guard_until", 0.0)
+        paused_guard = not self.is_playing and time.monotonic() < guard_until
         if isinstance(native_frame, int) and 0 <= native_frame < max(1, self.total_frames):
-            if not paused_guard:
+            if paused_guard:
+                # 保护窗内：寻址还没落地，旧 time-pos 回读不得回写 UI。
+                pass
+            elif not self.is_playing:
+                # 暂停中：UI 帧号是权威（用户刚步进/拖动过）。引擎回读与
+                # UI 一致是寻址落地；不一致是 VFR/EDL 的 ±1 映射偏差，
+                # 采信只会把 UI 从用户的目标弹回旧值，所以一律不回写。
+                pass
+            else:
                 self.current_frame_idx = native_frame
                 self.timeline.current_frame_idx = native_frame
             self._maybe_show_frame_osd(self.current_frame_idx)
@@ -2275,6 +2357,7 @@ class VideoPreviewPlayer(tk.Frame):
         if self._closing:
             self._render_after_id = None
             return
+        self._reclaim_focus_from_native_child()
         if self._io is not None:
             events = ()
             try:

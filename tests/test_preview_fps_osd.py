@@ -149,15 +149,6 @@ class PausedSeekGuardTests(unittest.TestCase):
         # guard 生效时不得回写 timeline（timeline 是 Mock，被赋值即留下记录）
         self.assertNotEqual(player.timeline.current_frame_idx, 10)
 
-    def test_guard_expiry_adopts_engine_frame(self):
-        player = self._player()
-        player.current_frame_idx = 11
-        player._paused_seek_guard_until = time.monotonic() - 0.01  # 已过期
-        player._apply_native_perf(
-            {"source_frame": 10, "time_pos": None, "mpv_frame_drops": None}
-        )
-        self.assertEqual(player.current_frame_idx, 10)
-
     def test_playing_always_adopts_engine_frame(self):
         player = self._player()
         player.is_playing = True
@@ -177,6 +168,55 @@ class PausedSeekGuardTests(unittest.TestCase):
         player._preview_pts_ready = mock.Mock(return_value=False)
         player._seek(11)
         self.assertGreater(player._paused_seek_guard_until, time.monotonic())
+
+
+class PausedStepSemanticsTests(unittest.TestCase):
+    """暂停中 ←/→ 原始 ±1 步进，UI 帧号即权威，不被引擎旧回读弹回。"""
+
+    def _player(self, current: int, total: int = 100) -> VideoPreviewPlayer:
+        player = _bare_player()
+        player.total_frames = total
+        player.current_frame_idx = current
+        player.timeline = mock.Mock()
+        player.skip_trimmed = _BoolVar(True)
+        player._all_skip_segs_snap = mock.Mock(return_value=[(10, 20)])
+        player._seek = mock.Mock()
+        player._update_labels = mock.Mock()
+        return player
+
+    def test_right_step_moves_by_one_and_seeks(self):
+        player = self._player(current=5)
+        player._step_frame(+1, seek=True)
+        self.assertEqual(player.current_frame_idx, 6)
+        player._seek.assert_called_once_with(6, skip_trim=False)
+
+    def test_left_step_moves_by_one_and_seeks(self):
+        player = self._player(current=5)
+        player._step_frame(-1, seek=True)
+        self.assertEqual(player.current_frame_idx, 4)
+        player._seek.assert_called_once_with(4, skip_trim=False)
+
+    def test_engine_stale_readback_does_not_revert_paused_step(self):
+        # 按下 → 到 6，保护窗过期后引擎还回读旧值 5（VFR/EDL 的 ±1 偏差）。
+        # 暂停中 UI 帧号是权威，不得从 6 弹回 5。
+        player = self._player(current=5)
+        player.is_playing = False
+        player._step_frame(+1, seek=True)
+        player._paused_seek_guard_until = 0.0  # 保护窗已过期
+        player._apply_native_perf(
+            {"source_frame": 5, "time_pos": None, "mpv_frame_drops": None}
+        )
+        self.assertEqual(player.current_frame_idx, 6)
+
+    def test_playing_adopts_engine_frame(self):
+        # 播放中引擎是权威：回读多少 UI 就是多少
+        player = self._player(current=5)
+        player.is_playing = True
+        player._paused_seek_guard_until = 0.0
+        player._apply_native_perf(
+            {"source_frame": 42, "time_pos": None, "mpv_frame_drops": None}
+        )
+        self.assertEqual(player.current_frame_idx, 42)
 
 
 class EdlAwareSeekTests(unittest.TestCase):
