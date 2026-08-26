@@ -8,7 +8,9 @@ dependencies = [
     "opencv-python",
     "pillow",
     "imageio-ffmpeg",
-    "av>=14,<19",
+    # av 13.x 与打包的 ffmpeg.exe 7.1 同代（libswscale 8），scale=area 输出逐位一致；
+    # av>=14（FFmpeg 8 代）实测有 ±1 灰阶缩放漂移，故锁定 13.x。
+    "av~=13.1",
 ]
 
 [project.optional-dependencies]

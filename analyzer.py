@@ -1,5 +1,6 @@
 # analyzer.py —— 模板加载 + 帧状态识别（无 GUI 依赖）
 
+import ctypes
 import cv2
 import numpy as np
 import os
@@ -385,6 +386,31 @@ def normalize_decode_backend(decode_backend: str | None) -> str:
     return _DECODE_BACKEND_ALIASES[key]
 
 
+def _a_pt_impl() -> str:
+    """Select the A_PT implementation: "pyav" (default) or "ffmpeg" CLI.
+
+    PyAV is the consolidated in-process path and is bit-identical to the
+    ffmpeg.exe 7.1 CLI when it bundles the same FFmpeg 7.x generation (av 13.x).
+    Set ARKNIGHT_A_PT_IMPL=ffmpeg to force the legacy CLI subprocess path. If
+    PyAV is requested but unavailable, fall back to the CLI with a notice.
+    """
+    impl = os.environ.get("ARKNIGHT_A_PT_IMPL", "pyav").strip().lower()
+    if impl not in ("pyav", "ffmpeg"):
+        raise ValueError(
+            f"unknown ARKNIGHT_A_PT_IMPL={impl!r}; allowed=['pyav', 'ffmpeg']"
+        )
+    if impl == "pyav":
+        try:
+            import av  # noqa: F401
+        except Exception:
+            print(
+                "[analyze] PyAV unavailable; A_PT falling back to FFmpeg CLI",
+                flush=True,
+            )
+            return "ffmpeg"
+    return impl
+
+
 def resolve_ffmpeg_path(ffmpeg_path: str | None = None) -> str:
     try:
         return str(media_info.resolve_ffmpeg_path(ffmpeg_path))
@@ -449,6 +475,16 @@ def _analyze_video_opencv(
     want_context: bool = False,
     want_diagnostics: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict | None]:
+    """FROZEN decode backend — kept as a fallback, no longer maintained.
+
+    The production decode path is A_PT, now implemented in-process by PyAV
+    (_analyze_video_pyav_filter), with the FFmpeg CLI retained behind
+    ARKNIGHT_A_PT_IMPL=ffmpeg. This OpenCV decode backend exists only as a
+    last-resort fallback and must not receive new feature work. Scope note:
+    this freeze covers the *decode backend* only — cv2.matchTemplate (the
+    pause/speed recognition algorithm itself), imaging and preview are
+    unchanged and remain in active use.
+    """
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     states = np.zeros(max(0, total), dtype=np.int8)
@@ -758,6 +794,199 @@ def _analyze_video_ffmpeg_sw_passthrough(
     return states, diffs, None
 
 
+def _analyze_video_pyav_filter(
+    video_path: str,
+    configs: dict,
+    thresholds: dict,
+    proc_res: tuple,
+    batch_size: int,
+    n_threads: int,
+    progress_cb=None,
+    ffmpeg_path: str | None = None,
+    want_context: bool = False,
+    want_diagnostics: bool = False,
+) -> tuple[np.ndarray, np.ndarray, dict | None]:
+    """Production A_PT implemented with PyAV: the CLI filter graph
+    (scale={pw}:{ph}:flags=area → format=gray, one frame per decoded frame)
+    run in-process via libavfilter.
+
+    Bit-identical to the ffmpeg.exe 7.1 CLI output when PyAV bundles the same
+    FFmpeg 7.x generation (av 13.x); verified frame-for-frame on the production
+    samples. ARKNIGHT_ANALYZE_DECODE=ffmpeg restores the CLI implementation.
+    """
+    try:
+        import av
+        import av.filter
+    except Exception as exc:
+        raise RuntimeError(f"PyAV is required for the pyav A_PT backend: {exc}") from exc
+
+    pw, ph = int(proc_res[0]), int(proc_res[1])
+    if pw <= 0 or ph <= 0:
+        raise ValueError(f"invalid proc_res={proc_res}")
+
+    # Frame count oracle matches the CLI path (same CAP_PROP_FRAME_COUNT).
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+    if total <= 0:
+        raise RuntimeError(f"cannot determine frame count for {video_path}")
+
+    # Wall budget scales with length; identical to the CLI path.
+    timeout_s = max(180.0, 120.0 + float(total) * 0.12)
+
+    states = np.zeros(total, dtype=np.int8)
+    diffs = np.zeros(total, dtype=np.float32)
+    n_workers = min(n_threads, multiprocessing.cpu_count())
+    tracker = _BoundaryTracker() if want_context else None
+    diag_scores: list[float] | None = [] if want_diagnostics else None
+    diag_luma: list[float] | None = [] if want_diagnostics else None
+
+    container = None
+    got = 0
+    prev_gray = None
+    last_gray = None
+    deadline = time.perf_counter() + timeout_s
+    try:
+        container = av.open(str(video_path))
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        graph = av.filter.Graph()
+        src = graph.add_buffer(template=stream)
+        scale = graph.add("scale", f"{pw}:{ph}:flags=area")
+        fmt = graph.add("format", "gray")
+        sink = graph.add("buffersink")
+        src.link_to(scale)
+        scale.link_to(fmt)
+        fmt.link_to(sink)
+        graph.configure()
+
+        from av.error import BlockingIOError as _Again, EOFError as _Done  # type: ignore
+
+        batch_grays: list[np.ndarray] = []
+        batch_indices: list[int] = []
+        batch_prev: list[np.ndarray | None] = []
+        stop = False
+
+        def _consume(out) -> None:
+            nonlocal got, prev_gray, last_gray, stop
+            if got >= total:
+                stop = True
+                return
+            p = out.planes[0]
+            raw = (ctypes.c_ubyte * p.buffer_size).from_address(p.buffer_ptr)
+            gray = np.frombuffer(
+                raw, dtype=np.uint8
+            ).reshape(out.height, p.line_size)[:, : out.width].copy()
+            batch_grays.append(gray)
+            batch_indices.append(got)
+            batch_prev.append(prev_gray)
+            if diag_luma is not None:
+                diag_luma.append(float(gray.mean()))
+            if prev_gray is not None:
+                diffs[got] = float(cv2.mean(cv2.absdiff(gray, prev_gray))[0])
+            prev_gray = gray
+            last_gray = gray
+            got += 1
+            if got >= total:
+                stop = True
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_worker_init,
+            initargs=(configs, thresholds, proc_res),
+        ) as ex:
+
+            def _flush_batch() -> None:
+                if not batch_grays:
+                    return
+                if time.perf_counter() > deadline:
+                    raise TimeoutError(
+                        f"PyAV A_PT timed out after {timeout_s:.1f}s at frame {got}/{total}"
+                    )
+                chunk = max(4, len(batch_grays) // (n_workers * 2))
+                if diag_scores is not None:
+                    scored = list(
+                        ex.map(_worker_classify_gray_scored, batch_grays, chunksize=chunk)
+                    )
+                    results = [s for s, _ in scored]
+                    diag_scores.extend(sc for _, sc in scored)
+                else:
+                    results = list(
+                        ex.map(_worker_classify_gray, batch_grays, chunksize=chunk)
+                    )
+                for i, s, g, pg in zip(
+                    batch_indices, results, batch_grays, batch_prev
+                ):
+                    states[i] = s
+                    if tracker is not None:
+                        tracker.observe(i, g, int(s), pg)
+                if progress_cb:
+                    progress_cb((got / total) * 0.5)
+                batch_grays.clear()
+                batch_indices.clear()
+                batch_prev.clear()
+
+            def _drain(eof: bool) -> None:
+                while not stop:
+                    try:
+                        _consume(graph.pull())
+                    except _Again:
+                        return
+                    except _Done:
+                        return
+
+            for frame in container.decode(stream):
+                if stop:
+                    break
+                graph.push(frame)
+                _drain(eof=False)
+                if stop:
+                    break
+                if len(batch_grays) >= int(batch_size):
+                    _flush_batch()
+            if not stop:
+                graph.push(None)
+                _drain(eof=True)
+            _flush_batch()
+    finally:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
+
+    if got == 0:
+        raise RuntimeError(f"PyAV A_PT produced 0 frames for {video_path}")
+    if got < total:
+        # Metadata overstated frame count (common). Accept actual stream length.
+        print(
+            f"[analyze] A_PT(PyAV) decoded {got}/{total} frames "
+            f"(container metadata may overstate FRAME_COUNT)",
+            flush=True,
+        )
+
+    if want_context:
+        states, diffs, context = _finalize_analysis_arrays(
+            states, diffs, total, got, tracker, last_gray
+        )
+        if diag_scores is not None or diag_luma is not None:
+            context = dict(context or {})
+            context["_diagnostics"] = {
+                "pause_score": np.asarray((diag_scores or [])[:got], dtype=np.float32),
+                "luma": np.asarray((diag_luma or [])[:got], dtype=np.float32),
+            }
+        return states, diffs, context
+    if got != total:
+        states = states[:got]
+        diffs = diffs[:got]
+    if diag_scores is not None or diag_luma is not None:
+        return states, diffs, {"_diagnostics": {
+            "pause_score": np.asarray((diag_scores or [])[:got], dtype=np.float32),
+            "luma": np.asarray((diag_luma or [])[:got], dtype=np.float32),
+        }}
+    return states, diffs, None
+
+
 # ---------------------------------------------------------------
 #  批量分析整段视频
 # ---------------------------------------------------------------
@@ -828,18 +1057,33 @@ def analyze_video_with_context(
         )
         return states, diffs, context or _make_analysis_context(len(states), [], False)
     if backend == DECODE_BACKEND_FFMPEG_SW_PASSTHROUGH:
-        states, diffs, context = _analyze_video_ffmpeg_sw_passthrough(
-            video_path,
-            configs,
-            thresholds,
-            proc_res,
-            batch_size,
-            n_threads,
-            progress_cb,
-            ffmpeg_path=ffmpeg_path,
-            want_context=True,
-            want_diagnostics=want_diagnostics,
-        )
+        impl = _a_pt_impl()
+        if impl == "pyav":
+            states, diffs, context = _analyze_video_pyav_filter(
+                video_path,
+                configs,
+                thresholds,
+                proc_res,
+                batch_size,
+                n_threads,
+                progress_cb,
+                ffmpeg_path=ffmpeg_path,
+                want_context=True,
+                want_diagnostics=want_diagnostics,
+            )
+        else:
+            states, diffs, context = _analyze_video_ffmpeg_sw_passthrough(
+                video_path,
+                configs,
+                thresholds,
+                proc_res,
+                batch_size,
+                n_threads,
+                progress_cb,
+                ffmpeg_path=ffmpeg_path,
+                want_context=True,
+                want_diagnostics=want_diagnostics,
+            )
         return states, diffs, context or _make_analysis_context(len(states), [], False)
     raise ValueError(f"unsupported decode_backend={backend!r}")
 
