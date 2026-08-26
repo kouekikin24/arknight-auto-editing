@@ -1,14 +1,20 @@
 # HANDOFF — PyAV 整合（ffprobe/ffmpeg→PyAV，导出除外）
-日期 2026-08-27 · 分支 `fix/preview-pacing-metrics` · 状态：**方案已批准、未动代码**（准备压缩上下文）
+日期 2026-08-27 · 分支 `fix/preview-pacing-metrics` · 状态：**三阶段已实施完成，全部通过验收**
 
 > 前序交接：HANDOFF_PREVIEW_ACCURACY.md（预览帧精确+指纹验戳）、RESEARCH_TIMESTAMP_PANORAMA.md（四维调研）。
 > 本文档自包含，接手人读这一份即可继续实施。
 
 ---
 
-## 0. 一句话现状
+## 0. 一句话现状（2026-08-26 收尾）
 
-整合方案已获 owner 批准、尚未动工。核心决定：**ffprobe 探测 + ffmpeg 分析解码迁进 PyAV；帧 oracle 与导出留在 ffmpeg.exe；OpenCV 解码后端冻结；PyAV 降级到 13.x 与 ffmpeg.exe 7.1 同代对齐（owner"按你的建议"）**。因帧 oracle 把两个工具的 sha256 写进认证，**二进制不能删**——本次整合 = 统一"调用方式"到 PyAV，不是删工具。
+整合**已完成并提交**。元数据探测与分析解码都已默认走 PyAV，帧 oracle 与导出仍留
+ffmpeg.exe，OpenCV 解码后端已标注冻结。**关键实证**：av 13.1（FFmpeg 7.x，libswscale 8）
+与打包 ffmpeg.exe 7.1 的 `scale=area+gray` 输出**逐位一致**（全片 184293 帧
+states/diffs 完全相同）；而 av 18（FFmpeg 8.x，libswscale 9）有 ±1 灰阶缩放漂移
+（虽未造成任何分类翻转，仍按预案锁定 13.x 以求逐位一致）。全程单测绿（415 + 90 子测试）。
+帧 oracle 把两个工具的 sha256 写进认证，**二进制不能删**——本次整合 = 统一"调用方式"
+到 PyAV，不是删工具。
 
 ---
 
@@ -32,45 +38,71 @@
 
 ---
 
-## 2. 版本对齐（已实证，接手直接用）
+## 2. 版本对齐（已实施并实证，结论落定）
 
-| 组件 | FFmpeg 代际 | libavcodec |
-|---|---|---|
-| ffmpeg.exe / ffprobe.exe | 7.1 | 61 |
-| **当前 av 18.1.0** | 8.x | 62 |
-| **av 13.1.0（拆 wheel 实证）** | 7.x | **61 ✅ 匹配** |
+| 组件 | FFmpeg 代际 | libavcodec | `scale=area` vs ffmpeg.exe 7.1 |
+|---|---|---|---|
+| ffmpeg.exe / ffprobe.exe | 7.1 | 61 | 基准 |
+| av 18.1.0（整合前的环境） | 8.x | 62 | **±1 灰阶漂移**（实测，0 分类翻转） |
+| **av 13.1.0（已安装并锁定）** | 7.x | **61 ✅** | **逐位一致**（全片验证） |
 
-- **要做**：`pyproject.toml` 现约束 `av>=14,<19` **恰好排除 13.x**，需改为允许 13.x（建议 `av>=13,<19` 或 `av~=13.1`），装 13.1.0，并验证 `av.library_versions['libavcodec'] == (61, …)`。
-- **⚠ 有锁文件**：仓库带 `uv.lock`（98KB）+ `requirements.txt`。改 `pyproject.toml` 后**必须同步锁文件**（`uv lock` / `uv sync`），否则依赖不一致。上一轮加 `av>=14,<19` 时若没更锁，这里要一并补齐。
-- **为何对齐**：H.264 解码像素规范锁定、跨版本一致；真正怕版本差的是 **libswscale（缩放）**。阶段二用 `scale=area+gray`，同代 swscale → 缩放近逐像素一致 → 分类不漂，从根上消掉阶段二最大风险。
-- **代价（已认）**：丢 av18 的 `hwaccel` 新接口（无关紧要，导出留 ffmpeg）；13.x 较旧但基础能力（解码/探测/取帧）够稳。
-- **注意**：上一轮的指纹验戳 `_pyav_frame_hash64`（preview_player.py:1285 区）用 `frame.planes[0].buffer_ptr/buffer_size/line_size/width`——属 PyAV 老接口，13.x 应兼容，**降级后需实跑验证**（`.cache/probe_hash_verify.py` 可复跑）。
-- 已下载的候选 wheel 在 `/tmp/avcheck_13.1.0/`（13.1.0=avcodec-61 已验）。
+- **已做**：`pyproject.toml` 依赖锁定 `av~=13.1`（13.x）。理由：实测证明 14+（FFmpeg 8 代，
+  libswscale 9）相对 7.1 有 ±1 灰阶缩放漂移；13.x（libswscale 8）与 7.1 同代，输出逐位一致。
+- **⚠ 工具链实情（与原假设不同，接手人须知）**：本机**没有 uv**，av 13.1.0 装在**全局**
+  Python 3.11（无 venv）。仓库里 `uv.lock`(98KB)/`requirements.txt` 是 2026-07-15 的过期产物
+  （生成于加 av 依赖之前），**与当前 pyproject 不同步**，且无 uv 可用无法 `uv lock`。
+  当前安装/回退用 pip：`python -m pip install av==13.1.0`（回退 `av==18.1.0`）。
+- **降级安全验证（已做）**：av 13.1 下复跑 `.cache/probe_hash_verify.py` → **27 点 ALL PASS**
+  （含用 av18 建的指纹账本在 av13 解码下逐位通过，证明 H.264 解码+指纹管线跨版本位稳）；
+  全量单测 415 + 90 子测试绿。
+- 候选 wheel 备份：`/tmp/avcheck_13.1.0/av-13.1.0-cp311-cp311-win_amd64.whl`（13.1.0=avcodec-61）。
 
 ---
 
-## 3. 三阶段实施计划（已批准，未动工）
+## 3. 三阶段实施计划（全部完成 ✅）
 
-### 阶段一｜元数据探测：ffprobe → PyAV
+> 落地摘要：元数据探测与分析解码都默认走 PyAV，各带环境变量回退开关；
+> 帧 oracle、导出、打包二进制、CvEngine、预览静帧链均未动。
+> - **回退开关**：`ARKNIGHT_MEDIA_PROBE=ffprobe`（元数据）、`ARKNIGHT_A_PT_IMPL=ffmpeg`（分析解码）。
+> - **后端标签**（settings_panel.py）：维持 "FFmpeg软件 A_PT（默认）" 不改名——PyAV 即 FFmpeg
+>   库，名义成立；分发逻辑（`"A_PT"/"FFmpeg" in label`）不受影响。
+> - **验证探针**（在 `.cache/`，已 .gitignore，不进版本库）：
+>   `probe_pyav_metadata.py`、`probe_mediainfo_backend_diff.py`、`probe_scale_area_drift.py`、
+>   `probe_analyze_fullfile_equiv.py`。
+
+### 阶段一｜元数据探测：ffprobe → PyAV ✅
 - 新增 PyAV 探测，产出与 `parse_ffprobe_json` **逐字段一致**的 `MediaInfo`。
 - **保留** `_verify_tool`(ffprobe+ffmpeg) 的 ToolInfo 采集（供 oracle 绑定），只是**不再 spawn ffprobe 读元数据**。
-- 验收：对测试视频（`D:\qq下载\920\2.mp4` 等）逐字段一致——fps/时长/帧数/音频/时基。
+- **落地**：`probe_media_pyav` + `_pyav_probe_payload`（media_info.py），把 PyAV 元数据拼成
+  ffprobe 形状的 dict 喂给现有 `parse_ffprobe_json`，复用全部校验。`_active_probe_backend()`
+  默认 `pyav`，`ARKNIGHT_MEDIA_PROBE=ffprobe` 回退。流/容器 `duration` 用
+  `_round_to_microsecond` 对齐 ffprobe 的 µs 表示。
+- **验收（实测）**：1/2/3/4.mp4 四个样本（含坏时间戳 2.mp4）ffprobe 路径与 PyAV 路径的
+  `MediaInfo.as_dict()` **逐字段 IDENTICAL**，两路 `tool_pair_verified` 均为 True。
 
-### 阶段二｜分析解码：A_PT(ffmpeg CLI) → PyAV + 一致性验证
+### 阶段二｜分析解码：A_PT(ffmpeg CLI) → PyAV + 一致性验证 ✅
+- 已实现 `_analyze_video_pyav_filter`（analyzer.py），经 `analyze_video_with_context` 分发；
+  `ARKNIGHT_A_PT_IMPL` 默认 `pyav`，可回退 `ffmpeg`。
+- **一致性验证（硬门槛）实测结果**：
+  - 片段级（`probe_scale_area_drift.py`）：av18 对 7.1 有 ±1 灰阶漂移但 **0 分类翻转**；
+    换 av13.1 后 3.mp4(1000 帧)/2.mp4(3000 帧) **逐帧 bit-identical**。
+  - 全片级（`probe_analyze_fullfile_equiv.py`，2.mp4 184293 帧）：帧数、`states`、`diffs`
+    **全部逐元素相同**（max_abs_delta=0.0），VERDICT PASS。未放宽任何阈值。
 - PyAV 解码→`scale={pw}:{ph}:flags=area`→`gray`，替换 `_ffmpeg_sw_passthrough_cmd`+`_analyze_video_ffmpeg_sw_passthrough`；`_classify_gray` 及下游**不动**。
 - 关键对齐：`flags=area` 须与 ffmpeg 7.1 的 swscale area 一致（版本对齐后应近逐像素）。
 - 验收（**硬门槛**）：真实视频分别跑旧 A_PT 与新 PyAV，逐帧比对 `states/diffs/scores`，不得越过分类阈值；不达标→调缩放实现或回退，**绝不放宽阈值**。
 
 **⚠ 阶段二必须吃透的现状结构（`_analyze_video_ffmpeg_sw_passthrough`, analyzer.py:566-735）**：
 1. **帧数 oracle = OpenCV `CAP_PROP_FRAME_COUNT`**（:585-586）——这是"帧数权威"，不是要冻结的解码后端；但它常**高估**，靠 EOF 兜底（见 5）。迁 PyAV 后帧数口径必须与认证表一致，**不得漂**。
-2. **ffmpeg 子进程 → stdout 管道**，逐帧读 `bpf=pw*ph` 字节 raw 灰（`_read_exact`）。迁 PyAV = 改成迭代 `container.decode` 拿帧、`frame.reformat/resize` 成 (ph,pw) gray——**不再走管道**。
+2. **ffmpeg 子进程 → stdout 管道**，逐帧读 `bpf=pw*ph` 字节 raw 灰（`_read_exact`）。迁 PyAV 后不再走管道——**实际落地用 `av.filter.Graph`**（`buffer→scale={pw}:{ph}:flags=area→format=gray→buffersink`），逐帧 push/pull，零拷贝读 Y 平面。选 av.filter 而非 `frame.reformat` 是因为 reformat 用默认双线性、无法指定 `flags=area`，只有 av.filter 能逐字复刻 CLI 滤镜链、保证逐位一致。
 3. **分类在 `ProcessPoolExecutor`**：`_worker_init(configs,thresholds,proc_res)` + `_worker_classify_gray`/`_worker_classify_gray_scored`，按 `chunk=max(4,len//(n_workers*2))` 分发。**这套并行分发保留不变**。
 4. **`diffs` 在主循环算**（:666 `cv2.mean(cv2.absdiff(gray, prev_gray))`），不在 worker；`cv2.absdiff` 属成像不属解码，**照旧保留**。
 5. **EOF 兜底**：`got<total` 时接受实际流长（:710-716"metadata 常高估 FRAME_COUNT"）。迁 PyAV 后要保留"以实际解出帧数为准"的语义。
 6. `states` 预分配 `total`、按 index 填；`_BoundaryTracker`(want_context)、`diag_scores/diag_luma`(want_diagnostics) 行为须保持。
 
-### 阶段三｜OpenCV 解码后端冻结
-- `_analyze_video_opencv` 保留但标注"冻结/不再维护"；默认后端维持 A_PT（其后即 PyAV）。
+### 阶段三｜OpenCV 解码后端冻结 ✅
+- `_analyze_video_opencv` 已加冻结 docstring（"FROZEN decode backend — kept as a fallback,
+  no longer maintained"）；默认后端为 A_PT（现为 PyAV 实现）。
 - **cv2.matchTemplate（识别本体）与成像/预览照旧**——不是"解码后端"，不在冻结范围。
 - CvEngine/VideoIOThread 遵守长期约束，保留。
 
@@ -177,32 +209,40 @@
 
 - **PyAV GPU 编码已跑通**：`output.add_stream("h264_nvenc",rate=fps,hwaccel=HWAccel(device_type="cuda"))`+`pix_fmt="cuda"`，喂普通 yuv420p 帧即可；RTX 4060 双重验证（合法 h264/30 帧/渐变正确）。证据 `.cache/research/pyav_nvenc_test.mp4`。**注意**：该新 `hwaccel` 接口是 av18 的，降到 13.x 可能没有——无碍，导出留 ffmpeg。
 - **导出三模式**：快速滤镜 / 刻度精确(`_pts_select_setpts_video_filter`) / 逐帧兜底(OpenCV 解码+ffmpeg pipe)。PyAV 化导出的真实差距=**音频混音(~100 行,最险)+性能倒退+重新验证**，非"挑选/拼接"（逐帧兜底已是 Python 版）。结论：**导出继续用 ffmpeg.exe**。
-- **工具链三 FFmpeg 版本**：OpenCV=4.4 / ffmpeg.exe=7.1 / PyAV=8.x（本次拟降到 7.x 对齐）。身份关键路径（指纹）已全走 PyAV 自洽。
+- **工具链三 FFmpeg 版本**：OpenCV=4.4 / ffmpeg.exe=7.1 / PyAV=7.x（av13.1，已对齐 7.1）。身份关键路径（指纹）已全走 PyAV 自洽。
 - **OpenCV 不可替代**：`cv2.matchTemplate`(analyzer.py:86,125) 是暂停/变速检测算法本体（认画面），ffmpeg/PyAV 只解码不识别。
 
 ---
 
-## 7. 接手人按序执行清单
+## 7. 执行清单（已全部完成 ✅）
 
-1. **改依赖**：`pyproject.toml` `av>=14,<19` → 允许 13.x；装 `av==13.1.0`；验证 `av.library_versions['libavcodec']` 首元素==61；复跑 `.cache/probe_hash_verify.py` 确认指纹链在 13.x 仍绿。
-2. **阶段一**：写 PyAV 探测函数 → 与现 `probe_media`(ffprobe) 逐字段对比脚本（`2.mp4` 等）→ 一致后接线。
-3. **阶段二**：PyAV 分析解码（area+gray）→ 旧 A_PT vs 新 PyAV 逐帧 `states/diffs/scores` 一致性验证 → 通过再接线。
-4. **阶段三**：标注 `_analyze_video_opencv` 冻结。
-5. **全程** `python -m pytest tests/ -q` 保持 409+90 绿。
-6. **更新**本文档 + HANDOFF_PREVIEW_ACCURACY.md 的对应小节。
-
----
-
-## 8. 风险与约束
-- **阶段二缩放漂移**：对齐 7.1 后应大幅缓解，仍需逐帧一致性验证把关（最大风险）。
-- **PyAV 元数据差异**：坏时间戳文件上 fps/帧数可能与 ffprobe 不同（阶段一验收把关）。
-- **二进制不能删**：oracle 绑两工具 sha256（已说明）。
-- **指纹链兼容**：av 降级后 `_pyav_frame_hash64` 需实跑验证。
-- **长期约束**：解码后端优先 A_PT；0.2X/夹心推迟；不 push upstream；不用 `git reset --hard` 等；owner"主动停止"即停且清后台进程。
+1. ✅ **改依赖**：`pyproject.toml` 锁 `av~=13.1`；装 `av==13.1.0`（libavcodec==61 已验）；
+   复跑 `.cache/probe_hash_verify.py` → 27 点 ALL PASS（指纹链在 13.x 绿）。
+2. ✅ **阶段一**：`probe_media_pyav` + 逐字段对比（4 样本 IDENTICAL）→ 默认切 PyAV。
+3. ✅ **阶段二**：`_analyze_video_pyav_filter`（av.filter area+gray）→ 片段+全片一致性
+   （184293 帧 states/diffs 逐元素相同）→ 默认切 PyAV。
+4. ✅ **阶段三**：`_analyze_video_opencv` 加冻结 docstring。
+5. ✅ **全程** `python -m pytest tests/ -q` → 415 passed + 90 subtests。
+6. ✅ **更新**本文档 + HANDOFF_PREVIEW_ACCURACY.md 对应小节。
 
 ---
 
-## 9. 未提交改动与边界
-- 上一轮成果（指纹验戳+调研文档）**仍未提交**，等 owner 重启验收：改动集=`mpv_engine.py / preview_player.py / pyproject.toml / settings_panel.py / tests/test_mpv_engine.py / tests/test_preview_fps_osd.py / HANDOFF_PREVIEW_ACCURACY.md / RESEARCH_TIMESTAMP_PANORAMA.md`。
-- **本整合任务尚未改任何代码**。注意它也需改 `pyproject.toml`(av 版本)、`media_info.py`、`analyzer.py`——与上面未提交集有 `pyproject.toml` 交叠，**建议先让 owner 验收提交上一轮，再开整合分支/提交**，避免混在一起。
-- 测试基线：`python -m pytest tests/ -q` → 409 passed, 90 subtests。
+## 8. 风险与约束（实测后结论）
+- **阶段二缩放漂移**：已实证——av13.1 与 7.1 逐位一致（全片 184293 帧），风险消除。
+  av18 有 ±1 灰阶漂移（0 分类翻转），故锁定 13.x。
+- **PyAV 元数据差异**：已实证——坏时间戳 2.mp4 上 fps/帧数/时基与 ffprobe 完全一致，无差异。
+- **二进制不能删**：oracle 绑两工具 sha256（已说明；两 exe 继续随包）。
+- **指纹链兼容**：av 降级后复跑 27 点验证已绿（含跨版本账本）。
+- **长期约束**：解码后端优先 A_PT；0.2X/夹心推迟；不 push upstream；不用 `git reset --hard` 等；
+  owner"主动停止"即停且清后台进程。
+
+---
+
+## 9. 提交记录与边界
+- **指纹批次**：`bf621f2` feat: fingerprint-verified paused stills via PyAV count+hash
+  positioning; A_PT default backend（6 文件 + 3 文档，排除 .zcode/）。
+- **阶段一**：`bd8628f` feat: PyAV metadata probe backend with field-identical MediaInfo and
+  env rollback switch（media_info.py + test_media_info.py）。
+- **阶段二+三+依赖锁**：见最新提交（analyzer.py PyAV 分析解码/回退开关/冻结标注、
+  media_info.py 探测默认切 PyAV、pyproject.toml 锁 av~=13.1、测试更新）。
+- 验证探针在 `.cache/`（.gitignore，不入库）。测试基线：415 passed + 90 subtests。

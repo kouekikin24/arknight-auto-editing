@@ -1109,11 +1109,12 @@ def _verify_tool(path: Path, *, execute: Callable[..., Any], timeout_seconds: fl
 def _active_probe_backend() -> str:
     """Metadata probe backend selector.
 
-    Defaults to the ffprobe CLI so behavior is unchanged; set
-    ARKNIGHT_MEDIA_PROBE=pyav to route metadata reading through PyAV while the
-    ffprobe/ffmpeg tool pair is still verified for frame-PTS oracle binding.
+    Defaults to the in-process PyAV reader (field-identical to ffprobe on all
+    production samples); the ffprobe/ffmpeg tool pair is still verified for
+    frame-PTS oracle binding. Set ARKNIGHT_MEDIA_PROBE=ffprobe to restore the
+    CLI metadata spawn as a rollback.
     """
-    return os.environ.get("ARKNIGHT_MEDIA_PROBE", "ffprobe").strip().lower()
+    return os.environ.get("ARKNIGHT_MEDIA_PROBE", "pyav").strip().lower()
 
 
 def _round_to_microsecond(value: Fraction | None) -> Fraction | None:

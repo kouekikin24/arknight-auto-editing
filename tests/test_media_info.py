@@ -566,6 +566,18 @@ class MediaInfoParsingTests(unittest.TestCase):
 
 
 class MediaInfoProbeTests(unittest.TestCase):
+    # These tests exercise the ffprobe CLI metadata path via a mocked
+    # subprocess. The production default is now the PyAV reader, so pin this
+    # class to the ffprobe rollback to keep the CLI-path assertions valid.
+    def setUp(self) -> None:
+        self._env_patch = mock.patch.dict(
+            os.environ, {"ARKNIGHT_MEDIA_PROBE": "ffprobe"}
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+
     def test_probe_binds_tool_paths_and_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -703,9 +715,9 @@ class MediaInfoPyAVProbeTests(unittest.TestCase):
 
     def test_probe_backend_env_selection(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(media_info._active_probe_backend(), "ffprobe")
-        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "pyav"}):
             self.assertEqual(media_info._active_probe_backend(), "pyav")
+        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "ffprobe"}):
+            self.assertEqual(media_info._active_probe_backend(), "ffprobe")
         with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "  PYAV "}):
             self.assertEqual(media_info._active_probe_backend(), "pyav")
 
@@ -717,8 +729,16 @@ class MediaInfoPyAVProbeTests(unittest.TestCase):
         self.assertIs(result, sentinel)
         pyav_probe.assert_called_once()
 
-    def test_probe_media_default_backend_stays_ffprobe(self) -> None:
+    def test_probe_media_dispatches_to_pyav_backend_by_default(self) -> None:
+        sentinel = mock.Mock(name="pyav-mediainfo")
         with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(media_info, "probe_media_pyav", return_value=sentinel) as pyav_probe:
+                result = media_info.probe_media("any.mp4", ffprobe_path="p", ffmpeg_path="f")
+        self.assertIs(result, sentinel)
+        pyav_probe.assert_called_once()
+
+    def test_probe_media_ffprobe_rollback_backend(self) -> None:
+        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "ffprobe"}):
             with mock.patch.object(media_info, "probe_media_pyav") as pyav_probe:
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
