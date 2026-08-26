@@ -8,6 +8,7 @@ dependencies = [
     "opencv-python",
     "pillow",
     "imageio-ffmpeg",
+    "av>=14,<19",
 ]
 
 [project.optional-dependencies]

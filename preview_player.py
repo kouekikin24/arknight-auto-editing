@@ -8,9 +8,12 @@ import numpy as np
 import PIL.Image
 import PIL.ImageTk
 import os
+import subprocess
 import tempfile
 import threading
 import time
+import ctypes
+import hashlib
 from collections import deque
 from pathlib import Path
 from queue import Queue, Empty
@@ -29,6 +32,7 @@ from preview_engine import (
 from timeline_widget import TimelineWidget
 from timeline_plan import TimelinePlan
 from media_exporter import ExportRequest, ExportResult, MediaExporter
+from media_info import resolve_ffmpeg_path
 from task_manager import TaskCancelled, TaskContext, TaskHandle, TaskManager
 from project_state import ProjectState
 from edit_commands import SetClipBounds, SetPauseMaskRun, SetPauseMode
@@ -269,6 +273,20 @@ class VideoPreviewPlayer(tk.Frame):
         # snapshot_perf 把 UI 帧号拉回寻址前的值（左右键看似失灵）。
         # 保护窗口内渲染循环不回写 current_frame_idx。
         self._paused_seek_guard_until: float = 0.0
+        # 暂停静帧覆盖层（MLT/Shotcut 模式）：暂停态的画面由独立解码管线
+        # 出静帧贴到覆盖层，帧精确；mpv 只负责播放。gen 丢弃过期解码。
+        self._overlay_gen: int = 0
+        self._still_overlay = None
+        self._still_photo = None
+        self._still_last_gray = None
+        self._still_pending = None
+        self._still_decoding: bool = False
+        self._was_playing: bool = False
+        # PyAV 静帧解码（API 层主选）：关键帧索引表后台构建（npz 缓存），
+        # 未就绪/未安装时自动回退 ffmpeg CLI 两段式，再回退 OpenCV
+        self._pyav_kf = None
+        self._pyav_state = "idle"
+        self._pyav_container = None
         # (monotonic, source_frame, mpv_drop_count) 采样，用于右上角
         # 瞬时播放帧率（≈1s 窗口，丢帧不计入“看到的”帧率）
         self._fps_samples: deque = deque(maxlen=64)
@@ -592,6 +610,7 @@ class VideoPreviewPlayer(tk.Frame):
             )
             return io_closed and not survivors
         self._closing = True
+        self._pyav_reset()
         self.task_manager.invalidate(_ANALYSIS_TASK)
         self.task_manager.invalidate(_MEDIA_INFO_TASK)
         self.task_manager.invalidate(_FRAME_PTS_TASK)
@@ -690,6 +709,8 @@ class VideoPreviewPlayer(tk.Frame):
                 break
 
         self.video_path = path
+        self._drop_still_overlay()
+        self._pyav_reset()
         self.media_info = None
         self.media_info_error = None
         self.frame_pts_error = None
@@ -720,6 +741,8 @@ class VideoPreviewPlayer(tk.Frame):
         self._io = self._make_preview_engine(path)
         self.fps = self._io.fps
         self.total_frames = self._io.total
+        if self._preview_engine_kind == "mpv":
+            self._start_pyav_table_build()
 
         self.timeline.total_frames = self.total_frames
         self.timeline.fps = self.fps
@@ -1042,6 +1065,7 @@ class VideoPreviewPlayer(tk.Frame):
             if callable(seek_edl):
                 try:
                     seek_edl(int(frame_idx))
+                    self._show_paused_still(int(frame_idx))
                     return
                 except PreviewEngineError as exc:
                     if exc.code != "EDL_NOT_READY":
@@ -1070,6 +1094,378 @@ class VideoPreviewPlayer(tk.Frame):
                 self.lbl_info.config(text="认证时间表尚未就绪，暂不能精确定位")
             except Exception:
                 pass
+        self._show_paused_still(int(frame_idx))
+
+    def _show_paused_still(self, frame_idx: int) -> None:
+        """暂停态静帧覆盖：独立解码管线出帧，帧精确（MLT/Shotcut 模式）。
+
+        mpv 的暂停精确寻址在其源码语义里就不承诺帧级精度（普通 exact
+        seek 有容差且寻址期丢帧，frame-step 才走 VERY_EXACT 路径），所以
+        暂停画面不由 mpv 出：OpenCV 随机定位解码目标帧贴到覆盖层，mpv
+        只负责播放。播放恢复时覆盖层撤下（渲染循环边缘检测）。
+        """
+        if self._closing or self.is_playing:
+            return
+        io = getattr(self, "_io", None)
+        if io is None or not getattr(io, "native_rendering", False):
+            return
+        if not hasattr(self, "tk") or not self.video_path:
+            return
+        try:
+            w = max(1, self.video_surface.winfo_width())
+            h = max(1, self.video_surface.winfo_height())
+        except Exception:
+            return
+        # 节流：已有解码在飞时跳过（渲染循环的追帧逻辑会在落地后补齐最新目标），
+        # 避免拖时间轴时每个 tick 都 spawn 一个 ffmpeg 子进程
+        if self._still_decoding:
+            return
+        # Tk/settings 只能在主线程读（Tcl 非线程安全）：这里取好全部参数，
+        # 工作线程只拿纯值
+        t = None
+        fn = getattr(io, "source_time_for_frame", None)
+        if callable(fn):
+            t = fn(int(frame_idx))
+        if t is None:
+            fps = float(getattr(io, "fps", 0) or 0) or 60.0
+            t = int(frame_idx) / fps
+        try:
+            ffmpeg_path = self.settings.get_params().get("ffmpeg_path")
+        except Exception:
+            ffmpeg_path = None
+        # 碰撞刻度消歧依据：N 在暂停段内=暗帧，否则亮帧（主线程读段落）
+        expected_bright = self._expected_bright(int(frame_idx))
+        self._overlay_gen += 1
+        gen = self._overlay_gen
+        self._still_decoding = True
+        threading.Thread(
+            target=self._decode_still_work,
+            args=(int(frame_idx), gen, w, h, float(t), ffmpeg_path,
+                  expected_bright),
+            daemon=True,
+        ).start()
+
+    def _expected_bright(self, frame_idx: int) -> bool:
+        """N 的分析器语境亮度类：暂停段内=暗帧，其余=亮帧。
+
+        原始容器存在刻度碰撞（两帧共用一个 pts，实测本源 24576 个共享
+        刻度、683 个保留岛起点中 83 个踩中）：时间寻址在碰撞 tick 上拿到
+        的第一帧可能是前一帧。抓 2 帧后按此语境挑对的那帧。
+        """
+        for seg in getattr(self, "pause_segments", []) or []:
+            try:
+                if int(seg.get("start", -1)) <= frame_idx <= int(seg.get("end", -1)):
+                    return False
+            except Exception:
+                continue
+        return True
+
+    def _decode_still_work(self, frame_idx: int, gen: int,
+                           w: int, h: int, t: float, ffmpeg_path,
+                           expected_bright: bool) -> None:
+        try:
+            # 解码后端优先级：PyAV（API 层计数定帧，表就绪时）→
+            # ffmpeg CLI 两段式（A_PT 工具链）→ OpenCV
+            img = None
+            if self._pyav_kf is not None:
+                img = self._still_decode_pyav(frame_idx, w, h, expected_bright)
+            if img is None:
+                img = self._still_decode_ffmpeg(frame_idx, w, h, t, ffmpeg_path,
+                                                expected_bright)
+            if img is None:
+                img = self._still_decode_opencv(frame_idx, w, h)
+            if img is None:
+                return
+            arr = np.asarray(img)
+            gray = cv2.cvtColor(cv2.resize(arr, (400, 225)),
+                                cv2.COLOR_RGB2GRAY).astype(np.float32)
+            # 工作线程不得调用 Tcl（非线程安全）：只写 pending 槽，
+            # 由渲染循环主线程排空贴图
+            self._still_pending = (img, gray, frame_idx, gen)
+        except Exception:
+            pass
+        finally:
+            self._still_decoding = False
+
+    def _still_decode_ffmpeg(self, frame_idx: int, w: int, h: int,
+                             t: float, ffmpeg_path, expected_bright: bool):
+        try:
+            ff = resolve_ffmpeg_path(ffmpeg_path)
+            # 两段式精确取帧：输入 -ss 在本仓源上实测会落在目标前几帧
+            # （解封装 seek 不精确，5409 落进前一段 PAUSE），所以退 0.5s
+            # 粗寻址 + -copyts 保留原始时间戳 + select 按 PTS 截取目标帧。
+            # 抓 2 帧：碰撞 tick 上两帧共用同一 pts，第一帧可能是前一段；
+            # 用分析器语境（该帧应为暗/亮）挑对的那帧。
+            back = max(0.0, float(t) - 0.5)
+            cmd = [str(ff), "-y", "-loglevel", "error", "-copyts",
+                   "-ss", f"{back:.6f}", "-i", str(self.video_path),
+                   "-vf", f"select=gte(t\\,{float(t):.6f}),scale={w}:{h}",
+                   "-vsync", "0", "-frames:v", "2",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            out = subprocess.run(cmd, capture_output=True, timeout=10).stdout
+            need = w * h * 3
+            if len(out) < need:
+                return None
+            imgs = [PIL.Image.frombytes("RGB", (w, h), bytes(out[i * need:(i + 1) * need]))
+                    for i in range(len(out) // need)]
+            if len(imgs) == 1:
+                return imgs[0]
+
+            def luma(im):
+                return float(np.asarray(im.convert("L")).mean())
+
+            want = 62.0 if expected_bright else 40.0
+            return min(imgs, key=lambda im: abs(luma(im) - want))
+        except Exception:
+            return None
+
+    def _still_decode_opencv(self, frame_idx: int, w: int, h: int):
+        try:
+            cap = cv2.VideoCapture(str(self.video_path))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            cap.release()
+            if not ok or frame is None:
+                return None
+            rgb = cv2.cvtColor(cv2.resize(frame, (w, h)), cv2.COLOR_BGR2RGB)
+            return PIL.Image.fromarray(rgb)
+        except Exception:
+            return None
+
+    def _blit_still(self, img, gray, frame_idx: int, gen: int) -> None:
+        if gen != self._overlay_gen or self._closing or self.is_playing:
+            return
+        if self._still_overlay is None:
+            self._still_overlay = tk.Frame(self.video_surface, bg="black")
+            self._still_label = tk.Label(self._still_overlay, bg="black")
+            self._still_label.pack(fill=tk.BOTH, expand=True)
+            # mpv 的帧号 OSD 画在 mpv 窗口内，会被本覆盖层盖住；
+            # 暂停态在覆盖层上自绘同样的左上角帧号
+            self._still_osd = tk.Label(
+                self._still_overlay, bg="black", fg="white", anchor="w")
+            self._still_osd.place(x=8, y=6)
+            self._still_overlay.pack(fill=tk.BOTH, expand=True)
+        self._still_photo = PIL.ImageTk.PhotoImage(img)
+        self._still_label.config(image=self._still_photo)
+        self._still_overlay.lift()
+        try:
+            if bool(self.show_frame_osd_var.get()):
+                self._still_osd.config(
+                    text=f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}")
+            else:
+                self._still_osd.config(text="")
+        except Exception:
+            pass
+        self._still_last_gray = gray
+        self._still_frame_idx = frame_idx
+
+    def _drain_still_pending(self) -> None:
+        item = self._still_pending
+        if item is None:
+            return
+        self._still_pending = None
+        self._blit_still(*item)
+
+    def _drop_still_overlay(self) -> None:
+        self._overlay_gen += 1
+        self._still_pending = None
+        self._still_last_gray = None
+        ov = self._still_overlay
+        self._still_overlay = None
+        if ov is not None:
+            try:
+                ov.destroy()
+            except Exception:
+                pass
+
+    # ---- PyAV 静帧解码（API 层主选，MLT 计数式定帧 + 指纹验戳） ----
+
+    @staticmethod
+    def _pyav_frame_hash64(frame):
+        """帧指纹：Y 平面 [::16,::16] 子采样的 blake2b-64（零拷贝直读平面）。
+
+        建表（全片顺序解码）与查帧（seek 后计数）必须走同一函数，指纹
+        才可用于把计数结果与账本逐位对账。实测单帧开销 ~0.02ms。
+        """
+        try:
+            p = frame.planes[0]
+            w, ls, hgt = p.width, p.line_size, frame.height
+            buf = (ctypes.c_ubyte * p.buffer_size).from_address(p.buffer_ptr)
+            y = np.frombuffer(buf, dtype=np.uint8).reshape(hgt, ls)[:, :w]
+            small = np.ascontiguousarray(y[::16, ::16])
+            return int.from_bytes(
+                hashlib.blake2b(small.tobytes(), digest_size=8).digest(),
+                "little")
+        except Exception:
+            return None
+
+    def _pyav_table_path(self):
+        if not self.video_path:
+            return None
+        base = Path(__file__).resolve().parent / ".cache" / "pyav_kf"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            st = os.stat(self.video_path)
+            key = f"{Path(self.video_path).stem}_{st.st_size}_{int(st.st_mtime)}.npz"
+            return base / key
+        except OSError:
+            return None
+
+    def _pyav_reset(self) -> None:
+        self._pyav_kf = None
+        self._pyav_state = "idle"
+        c = self._pyav_container
+        self._pyav_container = None
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def _start_pyav_table_build(self) -> None:
+        """后台构建关键帧索引表（一次全片解码，npz 缓存按 大小+mtime 失效）。"""
+        if self._pyav_state != "idle" or self._pyav_kf is not None:
+            return
+        try:
+            import av  # noqa: F401
+        except Exception:
+            return  # 未安装 PyAV：静帧走 CLI/OpenCV 回退
+        path = self._pyav_table_path()
+        if path is None:
+            return
+        if path.exists():
+            try:
+                d = np.load(path)
+                # v2 表必须带逐帧指纹；旧 v1 缓存缺 key 会在此抛错，
+                # 落到下方重建（同路径覆盖升级）
+                self._pyav_kf = (d["kf_indices"], d["kf_pts"],
+                                 d["frame_hashes"])
+                self._pyav_state = "ready"
+                return
+            except Exception:
+                pass
+        self._pyav_state = "building"
+        video_path = str(self.video_path)
+        threading.Thread(target=self._pyav_table_build_work,
+                         args=(video_path, path), daemon=True).start()
+
+    def _pyav_table_build_work(self, video_path: str, path) -> None:
+        try:
+            import av
+            container = av.open(video_path)
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            kf_idx, kf_pts, hashes = [], [], []
+            i = 0
+            for frame in container.decode(stream):
+                if frame.pict_type == 1 and frame.pts is not None:
+                    kf_idx.append(i)
+                    kf_pts.append(int(frame.pts))
+                h64 = self._pyav_frame_hash64(frame)
+                hashes.append(0 if h64 is None else h64)
+                i += 1
+            container.close()
+            if i < 2 or not kf_idx or self._closing \
+                    or video_path != str(self.video_path):
+                self._pyav_state = "idle"
+                return
+            st = os.stat(video_path)
+            np.savez(path,
+                     kf_indices=np.asarray(kf_idx, dtype=np.int64),
+                     kf_pts=np.asarray(kf_pts, dtype=np.int64),
+                     frame_hashes=np.asarray(hashes, dtype=np.uint64),
+                     src_size=np.int64(st.st_size),
+                     src_mtime=np.float64(st.st_mtime))
+            if video_path == str(self.video_path) and not self._closing:
+                self._pyav_kf = (np.asarray(kf_idx, dtype=np.int64),
+                                 np.asarray(kf_pts, dtype=np.int64),
+                                 np.asarray(hashes, dtype=np.uint64))
+                self._pyav_state = "ready"
+        except Exception:
+            self._pyav_state = "idle"
+
+    def _still_decode_pyav(self, frame_idx: int, w: int, h: int,
+                           expected_bright: bool):
+        """MLT 计数式定帧 + 指纹验戳：计数给唯一答案，指纹只做裁判。
+
+        PyAV(FFmpeg 8) 的 pts 标签与认证账本在碰撞处不一致（实测 0~2 帧
+        浮动），所以不按 pts 匹配目标：关键帧表只用于定位 seek 起点，
+        之后纯计数到第 N 帧。计数结果与建表时的逐帧指纹对账——相等即
+        精确命中；不等（关键帧踩碰撞刻度导致计数基准 ±1）则在 ±2 邻域
+        找指纹相等者校正。指纹缺失（旧缓存过渡期）才退回邻域亮度语境
+        挑选。seek 落点有内部错位（可能落上一 GOP）：越过 K 时退一个
+        GOP 重试。
+        """
+        import bisect
+        if self._pyav_kf is None:
+            return None
+        kf_idx, kf_pts = self._pyav_kf[0], self._pyav_kf[1]
+        hashes = self._pyav_kf[2] if len(self._pyav_kf) > 2 else None
+        j = bisect.bisect_right(kf_idx, frame_idx) - 1
+        if j < 0:
+            return None
+        K, kpts = int(kf_idx[j]), int(kf_pts[j])
+        container = self._pyav_container
+        if container is None:
+            try:
+                import av
+                container = av.open(str(self.video_path))
+            except Exception:
+                return None
+            self._pyav_container = container
+        stream = container.streams.video[0]
+        offset = kpts
+        cand, count = [], 0
+        aligned, overshoot = False, False
+        for _ in range(2):
+            container.seek(offset, stream=stream, backward=True)
+            cand, count = [], 0
+            aligned, overshoot = False, False
+            for f in container.decode(stream):
+                if f.pts is None:
+                    continue
+                if not aligned:
+                    if int(f.pts) < kpts:
+                        continue
+                    if int(f.pts) > kpts + 512:
+                        overshoot = True
+                        break
+                    aligned = True
+                cand.append(f)
+                if count >= (frame_idx - K) + 2:
+                    break
+                count += 1
+            if not overshoot:
+                break
+            offset = kpts - 3072  # 越过 K：退一个 GOP 重来
+        rel = frame_idx - K
+        if not aligned or len(cand) < rel + 1:
+            return None
+        best = None
+        if hashes is not None and 0 <= frame_idx < len(hashes):
+            want_h = int(hashes[frame_idx])
+            if want_h:
+                for o in (rel, rel - 1, rel + 1, rel - 2, rel + 2):
+                    if 0 <= o < len(cand):
+                        fh = self._pyav_frame_hash64(cand[o])
+                        if fh is not None and fh == want_h:
+                            best = cand[o]
+                            break
+        if best is None:
+            # 指纹缺失/不可用的过渡期兜底：邻域 3 帧按暗/亮语境挑
+            lo = max(0, rel - 1)
+            group = cand[lo:rel + 2]
+            want = 62.0 if expected_bright else 40.0
+
+            def fluma(f):
+                g = cv2.cvtColor(cv2.resize(f.to_ndarray(format="rgb24"),
+                                            (400, 225)),
+                                 cv2.COLOR_RGB2GRAY)
+                return float(g.mean())
+
+            best = min(group, key=lambda f: abs(fluma(f) - want))
+        rgb = best.to_ndarray(format="rgb24")
+        return PIL.Image.fromarray(rgb).resize((w, h))
 
     def _seek(self, frame_idx: int, skip_trim: bool = False):
         self._auto_rate_clear()
@@ -2358,6 +2754,20 @@ class VideoPreviewPlayer(tk.Frame):
             self._render_after_id = None
             return
         self._reclaim_focus_from_native_child()
+        # 暂停静帧覆盖层生命周期：播放上升沿撤覆盖层，下降沿（含片尾
+        # 自动停播）贴当前帧静帧
+        if bool(getattr(self._io, "native_rendering", False)):
+            if self.is_playing and not self._was_playing:
+                self._drop_still_overlay()
+            elif not self.is_playing and self._was_playing:
+                self._show_paused_still(self.current_frame_idx)
+            self._was_playing = self.is_playing
+            self._drain_still_pending()
+            # 追帧：节流跳过的寻址在这里补齐——暂停态覆盖层始终收敛到当前帧号
+            if (not self.is_playing and not self._still_decoding
+                    and self._still_pending is None
+                    and getattr(self, "_still_frame_idx", None) != self.current_frame_idx):
+                self._show_paused_still(self.current_frame_idx)
         if self._io is not None:
             events = ()
             try:

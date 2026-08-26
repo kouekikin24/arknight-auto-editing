@@ -4,7 +4,9 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from fractions import Fraction
 
+from certified_edl import _fraction_seconds
 from mpv_engine import MpvEngine
 from preview_engine import CertifiedEdlRequest, PreviewEngineError, SourceSeekRequest
 from timeline_plan import TimelinePlan
@@ -292,7 +294,12 @@ class MpvEngineContractTests(unittest.TestCase):
             )
             engine.poll_events()
             seek_commands = [command for command in player.commands if command[0] == "seek"]
-            self.assertEqual(seek_commands[-1], ("seek", "0.12", "absolute+exact"))
+            # Paused exact seeks carry the half-tick boundary nudge.
+            self.assertEqual(
+                seek_commands[-1],
+                ("seek", _fraction_seconds(Fraction(12, 100) + Fraction(5, 120)),
+                 "absolute+exact"),
+            )
             self.assertEqual(engine.snapshot_perf()["mode"], "edl")
 
             self.assertTrue(
@@ -315,7 +322,12 @@ class MpvEngineContractTests(unittest.TestCase):
             )
             engine.poll_events()
             seek_commands = [command for command in player.commands if command[0] == "seek"]
-            self.assertEqual(seek_commands[-1], ("seek", "0.24", "absolute+exact"))
+            # Paused exact seeks carry the half-tick boundary nudge.
+            self.assertEqual(
+                seek_commands[-1],
+                ("seek", _fraction_seconds(Fraction(24, 100) + Fraction(5, 120)),
+                 "absolute+exact"),
+            )
             self.assertEqual(engine.snapshot_perf()["mode"], "source")
             self.assertTrue(engine.close())
 
@@ -372,6 +384,7 @@ class MpvEngineContractTests(unittest.TestCase):
             loads_before = len([command for command in player.commands if command[0] == "play"])
             self.assertTrue(engine.seek_edl(5))
             seek_commands = [command for command in player.commands if command[0] == "seek"]
+            # Playing (unpaused) exact seeks carry no boundary nudge.
             self.assertEqual(seek_commands[-1], ("seek", "0.12", "absolute+exact"))
             self.assertEqual(engine.snapshot_perf()["mode"], "edl")
             self.assertEqual(

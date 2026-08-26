@@ -90,9 +90,9 @@ class SettingsPanel(ttk.LabelFrame):
         ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
             row=sep_r + 4, column=0, columnspan=2, sticky=tk.EW, pady=4)
 
-        # Decode backend for template analysis (preview/export still use OpenCV).
-        # Default remains OpenCV; ffmpeg_sw_passthrough is the verified A_PT path.
-        self.decode_backend_var = tk.StringVar(value="OpenCV（默认）")
+        # Decode backend for template analysis.  Owner premise: A_PT is the
+        # preferred production decode backend; OpenCV remains the fallback.
+        self.decode_backend_var = tk.StringVar(value="FFmpeg软件 A_PT（默认）")
         ttk.Label(tab_basic, text="分析解码后端:").grid(row=sep_r + 5, column=0, sticky=tk.W, pady=2)
         self.decode_backend_combo = ttk.Combobox(
             tab_basic,
@@ -100,8 +100,8 @@ class SettingsPanel(ttk.LabelFrame):
             state="readonly",
             width=22,
             values=(
-                "OpenCV（默认）",
-                "FFmpeg软件 A_PT（实验）",
+                "FFmpeg软件 A_PT（默认）",
+                "OpenCV（回退）",
             ),
         )
         self.decode_backend_combo.grid(row=sep_r + 5, column=1, sticky=tk.W, padx=4)

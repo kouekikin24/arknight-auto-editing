@@ -683,9 +683,26 @@ class MpvEngine:
                 pass
         player.play(source)
 
+    @staticmethod
+    def _is_paused_locked(player) -> bool:
+        try:
+            return bool(getattr(player, "pause", False))
+        except Exception:
+            return False
+
     def _command_seek_locked(self, seconds: Fraction, *, exact: bool) -> None:
         player = self._require_player_locked()
         mode = "absolute+exact" if exact else "absolute"
+        if exact and self._is_paused_locked(player):
+            # A paused exact seek presents a stale frame a couple of source
+            # ticks before the target at PTS/segment boundaries: the user
+            # sees the previous span's picture (e.g. a deleted PAUSE overlay
+            # at a kept-island start).  Measured landing curve on real data:
+            # +1.5 ticks still lands in the previous span at some boundaries,
+            # +2.5 ticks lands inside [target, target+1] at every boundary
+            # and mid-segment point (±1 within identical-looking content,
+            # counter stays authoritative).  Playback seeks are untouched.
+            seconds = seconds + Fraction(5, 120)
         player.command("seek", _fraction_seconds(seconds), mode)
         self._stats["seek_count"] += 1
         # The next time-pos update lands at the seek target; its delta from
@@ -734,6 +751,18 @@ class MpvEngine:
                 details={"frame": frame, "count": timeline.frame_count},
             )
         return timeline.rows[frame].pts * timeline.time_base
+
+    def source_time_for_frame(self, frame: int) -> float | None:
+        """Certified PTS seconds for a source frame, or None pre-certification.
+
+        Lets owners address the source with the same PTS semantics the engine
+        uses for exact seeks (e.g. the paused-still overlay decode).
+        """
+        with self._lock:
+            try:
+                return float(self._source_time_locked(int(frame), exact=True))
+            except Exception:
+                return None
 
     def seek_source(self, request: SourceSeekRequest) -> bool:
         with self._lock:
