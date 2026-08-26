@@ -1106,6 +1106,112 @@ def _verify_tool(path: Path, *, execute: Callable[..., Any], timeout_seconds: fl
     return _tool_info(path, version_line=version_line, verified=True)
 
 
+def _active_probe_backend() -> str:
+    """Metadata probe backend selector.
+
+    Defaults to the ffprobe CLI so behavior is unchanged; set
+    ARKNIGHT_MEDIA_PROBE=pyav to route metadata reading through PyAV while the
+    ffprobe/ffmpeg tool pair is still verified for frame-PTS oracle binding.
+    """
+    return os.environ.get("ARKNIGHT_MEDIA_PROBE", "ffprobe").strip().lower()
+
+
+def _round_to_microsecond(value: Fraction | None) -> Fraction | None:
+    """Round a seconds value onto the microsecond grid.
+
+    ffprobe prints stream/format times as %.6f decimals, so reproducing its
+    MediaInfo field-for-field requires the same rounding rather than the exact
+    duration_ts*time_base fraction PyAV exposes.
+    """
+    if value is None:
+        return None
+    scaled = value * 1_000_000
+    nearest = int(scaled + Fraction(1, 2)) if scaled >= 0 else int(scaled - Fraction(1, 2))
+    return Fraction(nearest, 1_000_000)
+
+
+def _pyav_probe_payload(source: Path) -> dict:
+    """Read container/stream metadata via PyAV and shape it like ffprobe JSON.
+
+    Feeding the result to parse_ffprobe_json reuses every validation rule, so a
+    PyAV probe yields a MediaInfo field-identical to the ffprobe path.
+    """
+    try:
+        import av
+    except Exception as exc:  # pragma: no cover - environment guard
+        raise MediaInfoError("PYAV_UNAVAILABLE", f"PyAV is required for the pyav probe backend: {exc}") from exc
+
+    container = av.open(str(source))
+    try:
+        streams: list[dict] = []
+        for s in container.streams.video:
+            cc = s.codec_context
+            time_base = s.time_base
+            start_s = None if (s.start_time is None or time_base is None) else s.start_time * time_base
+            dur_s = None if (s.duration is None or time_base is None) else s.duration * time_base
+            r_rate = getattr(s, "base_rate", None)
+            if r_rate in (None, 0) or r_rate == Fraction(0, 1):
+                r_rate = s.guessed_rate
+            streams.append({
+                "index": s.index,
+                "codec_type": "video",
+                "codec_name": cc.name,
+                "codec_long_name": getattr(getattr(cc, "codec", None), "long_name", None),
+                "width": cc.width,
+                "height": cc.height,
+                "pix_fmt": getattr(cc.format, "name", None),
+                "time_base": time_base,
+                "avg_frame_rate": s.average_rate,
+                "r_frame_rate": r_rate,
+                "nb_frames": s.frames if s.frames else None,
+                "start_pts": s.start_time,
+                "duration_ts": s.duration,
+                "start_time": _round_to_microsecond(start_s),
+                "duration": _round_to_microsecond(dur_s),
+            })
+        for s in container.streams.audio:
+            cc = s.codec_context
+            time_base = s.time_base
+            start_s = None if (s.start_time is None or time_base is None) else s.start_time * time_base
+            dur_s = None if (s.duration is None or time_base is None) else s.duration * time_base
+            try:
+                channels = cc.channels
+            except Exception:
+                channels = None
+            if not channels:
+                channels = getattr(getattr(cc, "layout", None), "nb_channels", None)
+            layout = getattr(cc, "layout", None)
+            streams.append({
+                "index": s.index,
+                "codec_type": "audio",
+                "codec_name": cc.name,
+                "codec_long_name": getattr(getattr(cc, "codec", None), "long_name", None),
+                "sample_rate": getattr(cc, "rate", None),
+                "channels": channels,
+                "channel_layout": getattr(layout, "name", None) if layout is not None else None,
+                "sample_fmt": getattr(cc.format, "name", None),
+                "time_base": time_base,
+                "bit_rate": cc.bit_rate,
+                "start_pts": s.start_time,
+                "duration_ts": s.duration,
+                "start_time": _round_to_microsecond(start_s),
+                "duration": _round_to_microsecond(dur_s),
+            })
+        fmt = container.format
+        payload = {
+            "streams": streams,
+            "format": {
+                "format_name": fmt.name,
+                "format_long_name": fmt.long_name,
+                "duration": None if container.duration is None else Fraction(container.duration, 1_000_000),
+                "start_time": None if container.start_time is None else Fraction(container.start_time, 1_000_000),
+            },
+        }
+        return payload
+    finally:
+        container.close()
+
+
 def probe_media(
     source_path: str | os.PathLike[str],
     *,
@@ -1114,6 +1220,14 @@ def probe_media(
     timeout_seconds: float = 15.0,
     runner: Callable[..., Any] | None = None,
 ) -> MediaInfo:
+    if _active_probe_backend() == "pyav":
+        return probe_media_pyav(
+            source_path,
+            ffprobe_path=ffprobe_path,
+            ffmpeg_path=ffmpeg_path,
+            timeout_seconds=timeout_seconds,
+            runner=runner,
+        )
     source = Path(source_path).expanduser().resolve()
     if not source.is_file():
         raise MediaInfoError("SOURCE_NOT_FOUND", f"source media not found: {source}")
@@ -1169,6 +1283,67 @@ def probe_media(
         raise MediaInfoError("PROBE_JSON_INVALID", "ffprobe returned empty JSON")
     return parse_ffprobe_json(
         output,
+        source,
+        ffprobe=ffprobe_tool,
+        ffmpeg=ffmpeg_tool,
+        source_sha256_before=source_sha256_before,
+    )
+
+
+def probe_media_pyav(
+    source_path: str | os.PathLike[str],
+    *,
+    ffprobe_path: str | os.PathLike[str] | None = None,
+    ffmpeg_path: str | os.PathLike[str] | None = None,
+    timeout_seconds: float = 15.0,
+    runner: Callable[..., Any] | None = None,
+) -> MediaInfo:
+    """Build the same MediaInfo as probe_media, reading metadata via PyAV.
+
+    The ffprobe/ffmpeg tool pair is still resolved, hashed and verified exactly
+    as in the CLI path, because frame-PTS certification binds both executables.
+    Only the metadata read itself moves from spawning ffprobe to PyAV.
+    """
+    source = Path(source_path).expanduser().resolve()
+    if not source.is_file():
+        raise MediaInfoError("SOURCE_NOT_FOUND", f"source media not found: {source}")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise MediaInfoError("PROBE_ARGUMENT_INVALID", "timeout_seconds must be finite and positive")
+    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
+    ffprobe = resolve_ffprobe_path(ffprobe_path, ffmpeg_path=ffmpeg)
+    execute = runner or subprocess.run
+    source_sha256_before = _sha256_file(source)
+    tool_error: MediaInfoError | None = None
+    try:
+        ffprobe_tool = _verify_tool(ffprobe, execute=execute, timeout_seconds=timeout_seconds)
+        ffmpeg_tool = _verify_tool(ffmpeg, execute=execute, timeout_seconds=timeout_seconds)
+        _require_tool_pair(ffprobe_tool, ffmpeg_tool)
+    except MediaInfoError as exc:
+        tool_error = exc
+        ffprobe_tool = None
+        ffmpeg_tool = None
+    try:
+        payload = _pyav_probe_payload(source)
+    except MediaInfoError:
+        raise
+    except Exception as exc:
+        raise MediaInfoError(
+            "PYAV_PROBE_FAILED",
+            f"PyAV metadata probe failed: {source}",
+            details={"error": str(exc)},
+        ) from exc
+    if tool_error is not None:
+        raise tool_error
+    for tool in (ffprobe_tool, ffmpeg_tool):
+        assert tool is not None
+        if _sha256_file(tool.path) != tool.sha256:
+            raise MediaInfoError(
+                "TOOL_CHANGED_DURING_PROBE",
+                f"tool changed after version verification: {tool.path}",
+                details={"path": str(tool.path)},
+            )
+    return parse_ffprobe_json(
+        payload,
         source,
         ffprobe=ffprobe_tool,
         ffmpeg=ffmpeg_tool,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from fractions import Fraction
@@ -678,6 +679,97 @@ class MediaInfoProbeTests(unittest.TestCase):
                     runner=runner,
                 )
         self.assertEqual(caught.exception.code, "SOURCE_CHANGED_DURING_PROBE")
+
+
+class MediaInfoPyAVProbeTests(unittest.TestCase):
+    """Regression coverage for the PyAV metadata probe backend (Phase 1)."""
+
+    _FFPROBE_VERSION = "ffprobe version 7.1-essentials_build-www.gyan.dev\n"
+    _FFMPEG_VERSION = "ffmpeg version 7.1-essentials_build-www.gyan.dev\n"
+
+    def test_round_to_microsecond_matches_ffprobe_repr(self) -> None:
+        # duration_ts*time_base exact fractions -> ffprobe %.6f microsecond grid.
+        self.assertEqual(
+            media_info._round_to_microsecond(Fraction(14903, 30)),
+            Fraction(496766667, 1_000_000),
+        )
+        self.assertEqual(
+            media_info._round_to_microsecond(Fraction(1151932, 375)),
+            Fraction(3071818667, 1_000_000),
+        )
+        self.assertEqual(media_info._round_to_microsecond(Fraction(0, 1)), Fraction(0, 1))
+        self.assertEqual(media_info._round_to_microsecond(Fraction(1, 100)), Fraction(1, 100))
+        self.assertIsNone(media_info._round_to_microsecond(None))
+
+    def test_probe_backend_env_selection(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(media_info._active_probe_backend(), "ffprobe")
+        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "pyav"}):
+            self.assertEqual(media_info._active_probe_backend(), "pyav")
+        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "  PYAV "}):
+            self.assertEqual(media_info._active_probe_backend(), "pyav")
+
+    def test_probe_media_dispatches_to_pyav_backend(self) -> None:
+        sentinel = mock.Mock(name="pyav-mediainfo")
+        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "pyav"}):
+            with mock.patch.object(media_info, "probe_media_pyav", return_value=sentinel) as pyav_probe:
+                result = media_info.probe_media("any.mp4", ffprobe_path="p", ffmpeg_path="f")
+        self.assertIs(result, sentinel)
+        pyav_probe.assert_called_once()
+
+    def test_probe_media_default_backend_stays_ffprobe(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(media_info, "probe_media_pyav") as pyav_probe:
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    source = root / "sample.mp4"
+                    source.write_bytes(b"fixture")
+                    (root / "ffprobe.exe").write_bytes(b"probe-tool")
+                    (root / "ffmpeg.exe").write_bytes(b"ffmpeg-tool")
+                    with mock.patch.object(media_info, "subprocess") as subprocess_mock:
+                        subprocess_mock.run.side_effect = [
+                            mock.Mock(returncode=0, stdout=self._FFPROBE_VERSION, stderr=""),
+                            mock.Mock(returncode=0, stdout=self._FFMPEG_VERSION, stderr=""),
+                            mock.Mock(returncode=0, stdout=json.dumps(_probe_payload()), stderr=""),
+                        ]
+                        result = media_info.probe_media(
+                            source,
+                            ffprobe_path=root / "ffprobe.exe",
+                            ffmpeg_path=root / "ffmpeg.exe",
+                        )
+        pyav_probe.assert_not_called()
+        self.assertEqual(subprocess_mock.run.call_count, 3)
+        self.assertEqual(result.format_name, _probe_payload()["format"]["format_name"])
+
+    def test_probe_media_pyav_binds_tool_pair_without_ffprobe_metadata_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.mp4"
+            ffprobe = root / "ffprobe.exe"
+            ffmpeg = root / "ffmpeg.exe"
+            source.write_bytes(b"fixture")
+            ffprobe.write_bytes(b"probe-tool")
+            ffmpeg.write_bytes(b"ffmpeg-tool")
+            with mock.patch.object(media_info, "subprocess") as subprocess_mock:
+                # Only the two tool -version calls; the PyAV path must not spawn
+                # ffprobe to read metadata.
+                subprocess_mock.run.side_effect = [
+                    mock.Mock(returncode=0, stdout=self._FFPROBE_VERSION, stderr=""),
+                    mock.Mock(returncode=0, stdout=self._FFMPEG_VERSION, stderr=""),
+                ]
+                with mock.patch.object(
+                    media_info, "_pyav_probe_payload", return_value=_probe_payload()
+                ) as payload:
+                    result = media_info.probe_media_pyav(
+                        source, ffprobe_path=ffprobe, ffmpeg_path=ffmpeg
+                    )
+            payload.assert_called_once_with(source.resolve())
+            self.assertEqual(subprocess_mock.run.call_count, 2)
+            self.assertTrue(result.tool_pair_verified)
+            self.assertEqual(result.ffprobe.path, ffprobe.resolve())
+            self.assertEqual(result.ffmpeg.path, ffmpeg.resolve())
+            self.assertEqual(result.video_streams[0].avg_frame_rate, Fraction(60, 1))
+            self.assertTrue(result.has_audio)
 
 
 if __name__ == "__main__":
