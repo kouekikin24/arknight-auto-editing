@@ -190,7 +190,6 @@ class CertifiedPtsTimeline:
         *,
         expected_source_sha256: str | None = None,
         expected_ffmpeg: ToolInfo | None = None,
-        expected_ffprobe: ToolInfo | None = None,
     ) -> "CertifiedPtsTimeline":
         if not isinstance(certification, FramePtsCertification):
             raise MediaInfoError(
@@ -213,7 +212,6 @@ class CertifiedPtsTimeline:
         raw_rows, head_anomaly_limit = _load_certification_evidence(
             certification,
             expected_ffmpeg=expected_ffmpeg,
-            expected_ffprobe=expected_ffprobe,
         )
         rows = tuple(
             FramePtsRow(
@@ -285,7 +283,6 @@ class CertifiedPtsTimeline:
             certification,
             expected_source_sha256=media.source_sha256,
             expected_ffmpeg=media.ffmpeg,
-            expected_ffprobe=media.ffprobe,
         )
 
     @property

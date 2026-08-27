@@ -118,17 +118,6 @@ class SettingsPanel(ttk.LabelFrame):
             foreground="#666666",
         ).grid(row=sep_r + 7, column=0, columnspan=2, sticky=tk.W)
 
-        self.ffprobe_path_var = tk.StringVar(value="auto")
-        ttk.Label(tab_basic, text="FFprobe 路径:").grid(row=sep_r + 8, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(tab_basic, textvariable=self.ffprobe_path_var, width=18).grid(
-            row=sep_r + 8, column=1, sticky=tk.W, padx=4
-        )
-        ttk.Label(
-            tab_basic,
-            text="auto=FFmpeg 同目录；未指定时才查 PATH",
-            foreground="#666666",
-        ).grid(row=sep_r + 9, column=0, columnspan=2, sticky=tk.W)
-
         ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
             row=sep_r + 10, column=0, columnspan=2, sticky=tk.EW, pady=4)
 
@@ -428,8 +417,6 @@ class SettingsPanel(ttk.LabelFrame):
     def get_params(self) -> dict:
         ffmpeg_raw = (self.ffmpeg_path_var.get() or "auto").strip()
         ffmpeg_path = None if ffmpeg_raw.lower() in ("", "auto") else ffmpeg_raw
-        ffprobe_raw = (self.ffprobe_path_var.get() or "auto").strip()
-        ffprobe_path = None if ffprobe_raw.lower() in ("", "auto") else ffprobe_raw
         return {
             'batch': self.batch_size_var.get(),
             'proc_res': (self.proc_w_var.get(), self.proc_h_var.get()),
@@ -440,7 +427,6 @@ class SettingsPanel(ttk.LabelFrame):
             'key_repeat_speed': self.key_repeat_speed_var.get(),
             'decode_backend': self._decode_backend_key(),
             'ffmpeg_path': ffmpeg_path,
-            'ffprobe_path': ffprobe_path,
             'thresholds': {
                 'pause': self.thr_pause_var.get(),
                 'speed_1x': self.thr_1x_var.get(),

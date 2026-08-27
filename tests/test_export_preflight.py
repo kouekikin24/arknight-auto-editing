@@ -79,24 +79,24 @@ class ExportPreflightTests(unittest.TestCase):
         self.assertFalse(plan["audio_drop_requires_confirmation"])
         self.assertEqual(plan["audio_probe"]["present"], False)
 
-    def test_explicit_ffmpeg_audio_probe_uses_sibling_ffprobe(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            ffmpeg = root / "ffmpeg.exe"
-            ffprobe = root / "ffprobe.exe"
-            ffmpeg.write_bytes(b"ffmpeg-tool")
-            ffprobe.write_bytes(b"ffprobe-tool")
-            completed = mock.Mock(returncode=0, stdout="1\n", stderr="")
-            with mock.patch.object(analyzer, "subprocess") as subprocess_mock:
-                subprocess_mock.run.return_value = completed
-                result = analyzer._probe_audio_stream(
-                    "source.mp4",
-                    ffmpeg_path=str(ffmpeg),
-                )
-            self.assertEqual(result["method"], "ffprobe")
-            self.assertTrue(result["present"])
-            command = subprocess_mock.run.call_args.args[0]
-            self.assertEqual(command[0], str(ffprobe))
+    def test_audio_probe_reads_stream_metadata_via_pyav(self) -> None:
+        fake_stream = mock.Mock()
+        fake_container = mock.Mock()
+        fake_container.streams.audio = [fake_stream]
+        with mock.patch("av.open", return_value=fake_container):
+            result = analyzer._probe_audio_stream("source.mp4")
+        self.assertEqual(result["method"], "pyav")
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["present"])
+
+    def test_audio_probe_reports_absent_audio_stream_via_pyav(self) -> None:
+        fake_container = mock.Mock()
+        fake_container.streams.audio = []
+        with mock.patch("av.open", return_value=fake_container):
+            result = analyzer._probe_audio_stream("source.mp4")
+        self.assertEqual(result["method"], "pyav")
+        self.assertEqual(result["status"], "pass")
+        self.assertFalse(result["present"])
 
     def test_missing_ffmpeg_blocks_export_when_audio_is_requested(self) -> None:
         mask = np.zeros(10, dtype=bool)

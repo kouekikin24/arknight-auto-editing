@@ -6,35 +6,39 @@
 
 ---
 
-## 0. 一句话现状（2026-08-26 收尾）
+## 0. 一句话现状（2026-08-27：ffprobe 已彻底退役）
 
-整合**已完成并提交**。元数据探测与分析解码都已默认走 PyAV，帧 oracle 与导出仍留
-ffmpeg.exe，OpenCV 解码后端已标注冻结。**关键实证**：av 13.1（FFmpeg 7.x，libswscale 8）
-与打包 ffmpeg.exe 7.1 的 `scale=area+gray` 输出**逐位一致**（全片 184293 帧
-states/diffs 完全相同）；而 av 18（FFmpeg 8.x，libswscale 9）有 ±1 灰阶缩放漂移
-（虽未造成任何分类翻转，仍按预案锁定 13.x 以求逐位一致）。全程单测绿（415 + 90 子测试）。
-帧 oracle 把两个工具的 sha256 写进认证，**二进制不能删**——本次整合 = 统一"调用方式"
-到 PyAV，不是删工具。
+整合**已完成**，且 **ffprobe.exe 已彻底退役**：元数据探测、分析解码、音轨探测全部走
+PyAV；帧 oracle 与导出仍留 ffmpeg.exe；OpenCV 解码后端冻结。**认证从"双工具配对
+(ffmpeg+ffprobe)"改绑为"仅 ffmpeg"**，schema 由 1→2，既有 4 张证已**就地重编码迁移**
+（不重跑 oracle，逐字节保留 oracle 报告/pts 表/判定），迁移后全部 `certified=True`。
+av 13.1（FFmpeg 7.x）与打包 ffmpeg.exe 7.1 的 `scale=area+gray` 输出逐位一致。
+全程单测绿（408 + 90 子测试）。
+**注意**：`tools/.../ffprobe.exe` 是 gitignored 的 87MB 本地二进制，代码已完全不引用；
+是否物理删除留给 owner 决定（见 §10）。
 
 ---
 
 ## 1. 任务目标与已拍板的决定
 
-**目标**：把 `ffprobe.exe` 的探测、以及 `ffmpeg.exe` 除"导出/帧 oracle"外的用途整合进 PyAV；OpenCV 解码后端冻结不再维护。
+**目标**：把 `ffprobe.exe` 彻底退役；`ffmpeg.exe` 除"导出/帧 oracle"外的用途整合进 PyAV；OpenCV 解码后端冻结不再维护。
 
-| 决定 | owner 拍板 |
-|---|---|
-| 帧 PTS oracle / 认证表 | **留 ffmpeg.exe**（稳；防篡改地基） |
-| 分析解码 | **迁 PyAV** + 分类一致性验证 |
-| PyAV 版本 | **降到 13.x 对齐 ffmpeg.exe 7.1**（"按你的建议"） |
-| 导出 | **留 ffmpeg.exe** |
-| OpenCV 解码后端 | **冻结**（保留代码、不维护；cv2.matchTemplate 例外照旧） |
+| 决定 | owner 拍板 | 落地状态 |
+|---|---|---|
+| 帧 PTS oracle / 认证表 | **留 ffmpeg.exe** | ✅（认证改绑仅 ffmpeg，schema v2） |
+| 分析解码 | **迁 PyAV** | ✅ |
+| 元数据探测 / 音轨探测 | **迁 PyAV** | ✅ |
+| ffprobe.exe | **彻底退役** | ✅（代码清零 + 4 证迁移） |
+| PyAV 版本 | **锁 13.x 对齐 ffmpeg.exe 7.1** | ✅ |
+| 导出 | **留 ffmpeg.exe** | ✅ |
+| OpenCV 解码后端 | **冻结** | ✅ |
 
-### 关键约束（必须认清，别踩）
-帧 oracle 认证把 **ffmpeg.exe 与 ffprobe.exe 的 sha256 都写进认证文件名**
-（`frame_pts_certifier.py:105-106`），且强制 `tool_pair_verified`（`frame_pts_certifier.py:73`）。
-所以只要 oracle 保留，**这两个二进制必须继续随包**。
-→ 整合的本质 = 减少"要维护的 CLI 命令图 / 调用方式"，不是删二进制。这是保留 oracle 的固有代价，已告知 owner。
+### 关键约束（历史 → 现状）
+历史：帧 oracle 认证把 **ffmpeg+ffprobe 两个 sha256 都写进认证文件名**，强制双工具配对，故"二进制不能删"。
+**现状（2026-08-27 已改）**：认证改绑**仅 ffmpeg**（`_ffmpeg_tool_verified`），文件名去掉
+ffprobe 段、schema 1→2；既有 4 证已就地重编码迁移（`.cache/migrate_certs_v2.py`，不重跑
+oracle）。帧 oracle 本身只用 `verify_mpv_frames.build_ffmpeg_command`（ffmpeg-only），
+所以去 ffprobe 不影响 oracle 证据。
 
 ---
 
@@ -231,7 +235,7 @@ states/diffs 完全相同）；而 av 18（FFmpeg 8.x，libswscale 9）有 ±1 �
 - **阶段二缩放漂移**：已实证——av13.1 与 7.1 逐位一致（全片 184293 帧），风险消除。
   av18 有 ±1 灰阶漂移（0 分类翻转），故锁定 13.x。
 - **PyAV 元数据差异**：已实证——坏时间戳 2.mp4 上 fps/帧数/时基与 ffprobe 完全一致，无差异。
-- **二进制不能删**：oracle 绑两工具 sha256（已说明；两 exe 继续随包）。
+- **ffprobe 退役**：完成（代码清零 + 4 证迁移）；认证现仅绑 ffmpeg。
 - **指纹链兼容**：av 降级后复跑 27 点验证已绿（含跨版本账本）。
 - **长期约束**：解码后端优先 A_PT；0.2X/夹心推迟；不 push upstream；不用 `git reset --hard` 等；
   owner"主动停止"即停且清后台进程。
@@ -243,6 +247,18 @@ states/diffs 完全相同）；而 av 18（FFmpeg 8.x，libswscale 9）有 ±1 �
   positioning; A_PT default backend（6 文件 + 3 文档，排除 .zcode/）。
 - **阶段一**：`bd8628f` feat: PyAV metadata probe backend with field-identical MediaInfo and
   env rollback switch（media_info.py + test_media_info.py）。
-- **阶段二+三+依赖锁**：见最新提交（analyzer.py PyAV 分析解码/回退开关/冻结标注、
-  media_info.py 探测默认切 PyAV、pyproject.toml 锁 av~=13.1、测试更新）。
-- 验证探针在 `.cache/`（.gitignore，不入库）。测试基线：415 passed + 90 subtests。
+- **阶段二+三+依赖锁**：`937645e` / `43ea61b`（analyzer.py PyAV 分析解码、冻结标注、
+  pyproject 锁 av~=13.1、media_info 默认切 PyAV）。
+- **ffprobe 退役**：本次提交（认证改绑仅 ffmpeg/schema v2、4 证迁移、删全部代码/测试/脚本的
+  ffprobe、音轨探测迁 PyAV）。
+- 验证探针 + 迁移脚本在 `.cache/`（.gitignore，不入库）。测试基线：408 passed + 90 subtests。
+
+---
+
+## 10. 遗留给 owner 的决定（2026-08-27）
+1. **是否物理删除 `tools/.../ffprobe.exe`（gitignored，87MB）**：代码已完全不引用，它现在是
+   孤儿文件。我未删除（非我创建、删除不可逆）——留/删由你定；留也无害。
+2. **帧数权威保留 OpenCV `CAP_PROP_FRAME_COUNT`**（未迁 PyAV）：PyAV `stream.frames` 可能
+   **低估**实际帧数 → 会截断分析；而 cv2 只会高估、靠 EOF 兜底，安全。若你要彻底去这个
+   OpenCV 依赖，需先验证 PyAV frames≥实际（否则回退），可后续做。
+3. **0.2X 裁剪 / 夹心并入**：仍为后续方向，未动。

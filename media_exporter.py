@@ -92,7 +92,6 @@ class ExportRequest:
     use_gpu: bool = False
     gpu_encoder: str = ""
     ffmpeg_path: str | None = None
-    ffprobe_path: str | None = None
     include_audio: bool = True
     allow_audio_drop: bool = False
     media_info: MediaInfo | None = None
@@ -186,7 +185,6 @@ class ExportValidationSnapshot:
     source_size: int
     source_mtime_ns: int
     ffmpeg: ToolInfo
-    ffprobe: ToolInfo
     certification: FramePtsCertification
     pts_timeline: CertifiedPtsTimeline
     effective_ranges: tuple[Range, ...]
@@ -235,7 +233,7 @@ class ExportValidationSnapshot:
                 "source media changed after export validation",
                 details={"path": str(self.source_path)},
             )
-        for tool, name in ((self.ffmpeg, "ffmpeg"), (self.ffprobe, "ffprobe")):
+        for tool, name in ((self.ffmpeg, "ffmpeg"),):
             try:
                 tool_current = (
                     tool.path.is_file()
@@ -282,9 +280,7 @@ class ExportValidationSnapshot:
             ),
             "certified_frame_count": self.certification.frame_count,
             "ffmpeg_path": str(self.ffmpeg.path),
-            "ffprobe_path": str(self.ffprobe.path),
             "ffmpeg_sha256": self.ffmpeg.sha256,
-            "ffprobe_sha256": self.ffprobe.sha256,
             "head_anomaly_adjudication": {
                 "policy": "head-restricted-2026-08-16",
                 "head_frame_limit": HEAD_ANOMALY_FRAME_LIMIT,
@@ -351,7 +347,6 @@ class MediaExporter:
             )
         for requested, bound, label in (
             (request.ffmpeg_path, media.ffmpeg, "ffmpeg"),
-            (request.ffprobe_path, media.ffprobe, "ffprobe"),
         ):
             if bound is None:
                 raise MediaInfoError(
@@ -384,14 +379,13 @@ class MediaExporter:
         tick_collision_drops = _head_tick_collision_drops(
             pts_timeline, effective_ranges, pts_intervals
         )
-        assert media.ffmpeg is not None and media.ffprobe is not None
+        assert media.ffmpeg is not None
         return ExportValidationSnapshot(
             source_path=media.source_path,
             source_sha256=media.source_sha256,
             source_size=media.source_size,
             source_mtime_ns=media.source_mtime_ns,
             ffmpeg=media.ffmpeg,
-            ffprobe=media.ffprobe,
             certification=certification,
             pts_timeline=pts_timeline,
             effective_ranges=tuple(effective_ranges),
@@ -431,7 +425,6 @@ class MediaExporter:
             certification = validation_snapshot.certification
             for key, bound in (
                 ("ffmpeg_path", validation_snapshot.ffmpeg.path),
-                ("ffprobe_path", validation_snapshot.ffprobe.path),
             ):
                 if preflight is not None and preflight.get(key):
                     if Path(preflight[key]).expanduser().resolve() != bound:
@@ -511,7 +504,6 @@ class MediaExporter:
                         "pts_table_consumed": True,
                         "timeline_fingerprint": request.timeline_plan.fingerprint,
                         "ffmpeg_path": str(validation_snapshot.ffmpeg.path),
-                        "ffprobe_path": str(validation_snapshot.ffprobe.path),
                     },
                 )
             finally:
@@ -532,7 +524,6 @@ class MediaExporter:
                 use_gpu=request.use_gpu,
                 gpu_encoder=request.gpu_encoder,
                 ffmpeg_path=request.ffmpeg_path,
-                ffprobe_path=request.ffprobe_path,
                 include_audio=request.include_audio,
                 allow_audio_drop=request.allow_audio_drop,
                 cancel_cb=cancel_cb,
@@ -562,7 +553,6 @@ class MediaExporter:
                 "use_gpu": request.use_gpu,
                 "gpu_encoder": request.gpu_encoder,
                 "ffmpeg_path": request.ffmpeg_path,
-                "ffprobe_path": request.ffprobe_path,
                 "cancel_cb": cancel_cb,
             }
             if progress_cb is not None:
@@ -591,7 +581,6 @@ class MediaExporter:
                 {
                     **authority_metadata,
                     "audio_mode": "disabled",
-                    "ffprobe_path": request.ffprobe_path,
                     "timeline_fingerprint": request.timeline_plan.fingerprint,
                 },
             )

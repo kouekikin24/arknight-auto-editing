@@ -2,7 +2,7 @@
 
 Chain per sample: repo FFmpeg pair -> MediaInfo -> full FramePtsCertification
 (with B' head-anomaly adjudication) -> TimelinePlan from the real business
-skip segments -> MediaExporter full export -> ffprobe frame-count verdict
+skip segments -> MediaExporter full export -> PyAV frame-count verdict
 against the adjudicated expectation.
 
 Only reads existing skip-segment evidence (.cache/preview_fluency); the
@@ -31,7 +31,6 @@ FFMPEG = (
     / "bin"
     / "ffmpeg.exe"
 )
-FFPROBE = FFMPEG.with_name("ffprobe.exe")
 
 SAMPLES = {
     1: Path(r"D:\qq下载\920\1.mp4"),
@@ -42,29 +41,19 @@ SAMPLES = {
 
 
 def _count_output_frames(output: Path) -> int:
-    result = subprocess.run(
-        [
-            str(FFPROBE),
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-count_frames",
-            "-show_entries",
-            "stream=nb_read_frames",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(output),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=600,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed: {result.stderr[:500]}")
-    return int(result.stdout.strip())
+    """Count decoded output frames via PyAV (ffprobe.exe retired)."""
+    import av
+
+    container = av.open(str(output))
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        n = 0
+        for _ in container.decode(stream):
+            n += 1
+        return n
+    finally:
+        container.close()
 
 
 def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, include_audio: bool = True) -> dict:
@@ -90,7 +79,7 @@ def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, incl
 
     print(f"[{stem}] probe_media ...", flush=True)
     media = media_info.probe_media(
-        source, ffprobe_path=FFPROBE, ffmpeg_path=FFMPEG
+        source, ffmpeg_path=FFMPEG
     )
     print(
         f"[{stem}] probed: {len(media.video_streams)} video, "
@@ -131,7 +120,6 @@ def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, incl
         media_info=certified,
         include_audio=bool(certified.has_audio and include_audio),
         ffmpeg_path=str(FFMPEG),
-        ffprobe_path=str(FFPROBE),
     )
     print(f"[{stem}] exporting {len(plan.kept_ranges)} kept ranges "
           f"({expected_written} frames) ...", flush=True)
@@ -155,7 +143,7 @@ def run(stem: int, output_root: Path, decode_threads: int, quality: int, *, incl
     print(f"[{stem}] export done: written={result.written_frames} "
           f"expected={expected_written} drops={drops}", flush=True)
 
-    print(f"[{stem}] counting output frames with ffprobe ...", flush=True)
+    print(f"[{stem}] counting output frames with PyAV ...", flush=True)
     actual_frames = _count_output_frames(output)
     verdict = "PASS" if actual_frames in accepted_counts else "FAIL"
 

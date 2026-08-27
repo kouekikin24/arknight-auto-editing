@@ -23,19 +23,11 @@ class MediaExporterTests(unittest.TestCase):
         adjudicated: bool = False,
     ) -> media_info.MediaInfo:
         source = root / "source.mp4"
-        ffprobe = root / "ffprobe.exe"
         ffmpeg = root / "ffmpeg.exe"
         evidence = root / "frame-pts.json"
         source.write_bytes(b"source")
-        ffprobe.write_bytes(b"ffprobe-tool")
         ffmpeg.write_bytes(b"ffmpeg-tool")
         source_sha256 = media_info._sha256_file(source)
-        ffprobe_info = media_info.ToolInfo(
-            ffprobe,
-            media_info._sha256_file(ffprobe),
-            "ffprobe version 7.1-essentials_build-www.gyan.dev",
-            True,
-        )
         ffmpeg_info = media_info.ToolInfo(
             ffmpeg,
             media_info._sha256_file(ffmpeg),
@@ -47,7 +39,7 @@ class MediaExporterTests(unittest.TestCase):
             for n in range(frame_count)
         ]
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "production_frame_pts_certification",
             "status": (
                 media_info.ADJUDICATED_EVIDENCE_STATUS
@@ -70,7 +62,6 @@ class MediaExporterTests(unittest.TestCase):
             "frame_pts_status": "vfr" if adjudicated else "cfr",
             "frame_count": len(rows),
             "tools": {
-                "ffprobe": ffprobe_info.as_dict(),
                 "ffmpeg": ffmpeg_info.as_dict(),
             },
             "pts_table_sha256": media_info._canonical_pts_table_sha256(rows),
@@ -112,7 +103,6 @@ class MediaExporterTests(unittest.TestCase):
             video_streams=(video,),
             audio_streams=(),
             vfr_status="rate_match",
-            ffprobe=ffprobe_info,
             ffmpeg=ffmpeg_info,
         )
         certification = media_info.FramePtsCertification.from_evidence(
@@ -199,7 +189,6 @@ class MediaExporterTests(unittest.TestCase):
                 quality=8,
                 media_info=media,
                 ffmpeg_path=str(media.ffmpeg.path),
-                ffprobe_path=str(media.ffprobe.path),
             )
             def fake_pts_export(_source, staging, _intervals, **_kwargs):
                 Path(staging).write_bytes(b"pts-output")
@@ -244,7 +233,7 @@ class MediaExporterTests(unittest.TestCase):
             with mock.patch("analyzer.export_pts_schedule", side_effect=fake_pts_export):
                 result = MediaExporter().export(request)
             self.assertEqual(result.metadata["ffmpeg_path"], str(media.ffmpeg.path))
-            self.assertEqual(result.metadata["ffprobe_path"], str(media.ffprobe.path))
+            self.assertEqual(result.metadata["ffmpeg_sha256"], media.ffmpeg.sha256)
 
     def test_certified_export_builds_one_snapshot_for_full_and_ranges(self) -> None:
         plan = TimelinePlan.from_deleted_ranges(4, [])

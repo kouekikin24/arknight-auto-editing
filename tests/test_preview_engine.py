@@ -30,19 +30,11 @@ def _certified_media(
     source = root / "源 sample.mp4"
     source.write_bytes(b"source")
     ffmpeg = root / "ffmpeg.exe"
-    ffprobe = root / "ffprobe.exe"
     ffmpeg.write_bytes(b"ffmpeg")
-    ffprobe.write_bytes(b"ffprobe")
     ffmpeg_info = media_info.ToolInfo(
         ffmpeg,
         media_info._sha256_file(ffmpeg),
         "ffmpeg version 7.1.1-test",
-        True,
-    )
-    ffprobe_info = media_info.ToolInfo(
-        ffprobe,
-        media_info._sha256_file(ffprobe),
-        "ffprobe version 7.1.1-test",
         True,
     )
     source_sha = media_info._sha256_file(source)
@@ -50,7 +42,7 @@ def _certified_media(
     evidence.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "production_frame_pts_certification",
                 "status": "PASS_WITH_HEAD_ANOMALIES"
                 if head_anomaly_limit
@@ -68,7 +60,6 @@ def _certified_media(
                 "frame_count": len(rows),
                 "tools": {
                     "ffmpeg": ffmpeg_info.as_dict(),
-                    "ffprobe": ffprobe_info.as_dict(),
                 },
                 "pts_table_sha256": media_info._canonical_pts_table_sha256(rows),
                 "pts_table": rows,
@@ -120,7 +111,6 @@ def _certified_media(
         video_streams=(stream,),
         audio_streams=(),
         vfr_status="vfr",
-        ffprobe=ffprobe_info,
         ffmpeg=ffmpeg_info,
     )
     return media.certify_frame_pts(certification)

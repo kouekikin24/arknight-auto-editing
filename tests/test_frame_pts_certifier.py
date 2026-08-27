@@ -17,20 +17,12 @@ class FramePtsCertifierTests(unittest.TestCase):
     def _media(root: Path, *, frame_count: int = 4) -> media_info.MediaInfo:
         source = root / "source.mp4"
         ffmpeg_path = root / "ffmpeg.exe"
-        ffprobe_path = root / "ffprobe.exe"
         source.write_bytes(b"source-media")
         ffmpeg_path.write_bytes(b"ffmpeg-tool")
-        ffprobe_path.write_bytes(b"ffprobe-tool")
         ffmpeg = media_info.ToolInfo(
             ffmpeg_path,
             media_info._sha256_file(ffmpeg_path),
             "ffmpeg version 7.1-essentials_build-www.gyan.dev",
-            True,
-        )
-        ffprobe = media_info.ToolInfo(
-            ffprobe_path,
-            media_info._sha256_file(ffprobe_path),
-            "ffprobe version 7.1-essentials_build-www.gyan.dev",
             True,
         )
         video = media_info.VideoStreamInfo(
@@ -62,7 +54,6 @@ class FramePtsCertifierTests(unittest.TestCase):
             video_streams=(video,),
             audio_streams=(),
             vfr_status="rate_match",
-            ffprobe=ffprobe,
             ffmpeg=ffmpeg,
         )
 

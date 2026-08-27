@@ -22,7 +22,6 @@ class _Context:
 class _Settings:
     def get_params(self) -> dict:
         return {
-            "ffprobe_path": "D:/tools/ffprobe.exe",
             "ffmpeg_path": "D:/tools/ffmpeg.exe",
         }
 
@@ -32,7 +31,6 @@ class PreviewMediaInfoTests(unittest.TestCase):
         context = _Context()
         snapshot = {
             "video_path": "D:/media/source.mp4",
-            "ffprobe_path": "D:/tools/ffprobe.exe",
             "ffmpeg_path": "D:/tools/ffmpeg.exe",
         }
         expected = object()
@@ -44,7 +42,6 @@ class PreviewMediaInfoTests(unittest.TestCase):
         self.assertEqual(context.checkpoints, 2)
         probe.assert_called_once_with(
             "D:/media/source.mp4",
-            ffprobe_path="D:/tools/ffprobe.exe",
             ffmpeg_path="D:/tools/ffmpeg.exe",
         )
 

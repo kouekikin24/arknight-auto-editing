@@ -418,14 +418,6 @@ def resolve_ffmpeg_path(ffmpeg_path: str | None = None) -> str:
         raise FileNotFoundError(str(exc)) from exc
 
 
-def resolve_ffprobe_path(ffprobe_path: str | None = None,
-                         *, ffmpeg_path: str | None = None) -> str:
-    try:
-        return str(media_info.resolve_ffprobe_path(ffprobe_path, ffmpeg_path=ffmpeg_path))
-    except media_info.MediaInfoError as exc:
-        raise FileNotFoundError(str(exc)) from exc
-
-
 def _read_exact(stream, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
@@ -1350,8 +1342,7 @@ def _kept_frame_ranges(to_del: np.ndarray) -> list[tuple[int, int]]:
 
 def inspect_export_plan(to_del, include_audio: bool = True, *,
                         video_path: str | None = None,
-                        ffmpeg_path: str | None = None,
-                        ffprobe_path: str | None = None) -> dict:
+                        ffmpeg_path: str | None = None) -> dict:
     """Return a preflight plan without conflating probe failure with no audio."""
     if isinstance(to_del, TimelinePlan):
         plan = to_del
@@ -1385,7 +1376,6 @@ def inspect_export_plan(to_del, include_audio: bool = True, *,
             audio_probe = _probe_audio_stream(
                 video_path,
                 ffmpeg_path=resolved_ffmpeg,
-                ffprobe_path=ffprobe_path,
             )
             if audio_probe["present"] is None:
                 drop_reasons.append("audio_probe_inconclusive")
@@ -1401,11 +1391,6 @@ def inspect_export_plan(to_del, include_audio: bool = True, *,
         ),
         "audio_limit": audio_limit,
         "ffmpeg_path": resolved_ffmpeg,
-        "ffprobe_path": (
-            os.path.normcase(os.path.abspath(ffprobe_path))
-            if ffprobe_path is not None
-            else None
-        ),
         "audio_probe": audio_probe,
         "export_block_reasons": list(dict.fromkeys(block_reasons)),
         "export_blocked": bool(block_reasons),
@@ -1415,36 +1400,25 @@ def inspect_export_plan(to_del, include_audio: bool = True, *,
 
 
 def _probe_audio_stream(video_path: str,
-                        ffmpeg_path: str | None = None,
-                        ffprobe_path: str | None = None) -> dict:
+                        ffmpeg_path: str | None = None) -> dict:
     errors = []
+    # Primary: PyAV reads container metadata in-process (ffprobe.exe retired).
     try:
-        ffprobe = resolve_ffprobe_path(
-            ffprobe_path,
-            ffmpeg_path=ffmpeg_path,
-        )
-    except FileNotFoundError as exc:
-        ffprobe = None
-        errors.append(str(exc))
-    if ffprobe:
+        import av
+
+        container = av.open(str(video_path))
         try:
-            result = subprocess.run(
-                [ffprobe, "-v", "error", "-select_streams", "a:0",
-                 "-show_entries", "stream=index", "-of", "csv=p=0", video_path],
-                check=False, capture_output=True, text=True, timeout=15,
-                creationflags=_NO_WINDOW)
-            if result.returncode == 0:
-                return {
-                    "status": "pass",
-                    "present": bool(result.stdout.strip()),
-                    "method": "ffprobe",
-                    "errors": errors,
-                }
-            errors.append(
-                f"ffprobe rc={result.returncode}: {(result.stderr or '').strip()[:500]}"
-            )
-        except Exception as exc:
-            errors.append(f"ffprobe: {type(exc).__name__}: {exc}")
+            present = len(container.streams.audio) > 0
+        finally:
+            container.close()
+        return {
+            "status": "pass",
+            "present": present,
+            "method": "pyav",
+            "errors": errors,
+        }
+    except Exception as exc:
+        errors.append(f"pyav: {type(exc).__name__}: {exc}")
 
     try:
         ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
@@ -2185,7 +2159,6 @@ def _export_video_impl(video_path: str, output_path: str, to_del,
                  fps: float, quality: int, progress_cb=None,
                   use_gpu: bool = False, gpu_encoder: str = "",
                   ffmpeg_path: str | None = None,
-                  ffprobe_path: str | None = None,
                   include_audio: bool = True,
                  allow_audio_drop: bool = False,
                  cancel_cb=None,
@@ -2242,7 +2215,6 @@ def _export_video_impl(video_path: str, output_path: str, to_del,
             include_audio=include_audio,
             video_path=video_path,
             ffmpeg_path=ffmpeg_path,
-            ffprobe_path=ffprobe_path,
         )
     else:
         plan = dict(preflight)
@@ -2328,7 +2300,6 @@ def _export_video_impl(video_path: str, output_path: str, to_del,
             "audio_drop_reasons": drop_reasons,
             "audio_probe_status": audio_probe.get("status"),
             "ffmpeg_path": plan.get("ffmpeg_path"),
-            "ffprobe_path": plan.get("ffprobe_path"),
         }
 
     # ---- 路径 A：FFmpeg 滤镜（不占 OpenCV cap）----
@@ -2481,7 +2452,6 @@ def export_video(video_path: str, output_path: str, to_del,
                  fps: float, quality: int, progress_cb=None,
                  use_gpu: bool = False, gpu_encoder: str = "",
                  ffmpeg_path: str | None = None,
-                 ffprobe_path: str | None = None,
                  include_audio: bool = True,
                  allow_audio_drop: bool = False,
                  cancel_cb=None,
@@ -2526,11 +2496,6 @@ def export_video(video_path: str, output_path: str, to_del,
             use_gpu=use_gpu,
             gpu_encoder=gpu_encoder,
             ffmpeg_path=ffmpeg_bin,
-            ffprobe_path=(
-                str(preflight["ffprobe_path"])
-                if preflight is not None and preflight.get("ffprobe_path")
-                else ffprobe_path
-            ),
             include_audio=include_audio,
             allow_audio_drop=allow_audio_drop,
             cancel_cb=cancel_cb,
@@ -2557,7 +2522,6 @@ def export_ranges(video_path: str, output_path: str, ranges: list,
                   fps: float, quality: int, progress_cb=None,
                    use_gpu: bool = False, gpu_encoder: str = "",
                    ffmpeg_path: str | None = None,
-                   ffprobe_path: str | None = None,
                    cancel_cb=None):
     """Export source-frame ranges using strict half-open intervals.
 

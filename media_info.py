@@ -88,7 +88,7 @@ class ToolInfo:
 
 
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
-_FRAME_PTS_EVIDENCE_SCHEMA_VERSION = 1
+_FRAME_PTS_EVIDENCE_SCHEMA_VERSION = 2
 _FRAME_PTS_EVIDENCE_KIND = "production_frame_pts_certification"
 
 
@@ -261,7 +261,6 @@ def _load_certification_evidence(
     expected_source_path: Path | None = None,
     expected_source_size: int | None = None,
     expected_ffmpeg: "ToolInfo | None" = None,
-    expected_ffprobe: "ToolInfo | None" = None,
 ) -> tuple[list[Mapping[str, Any]], int]:
     path = certification.evidence_path
     if not path.is_file():
@@ -356,10 +355,8 @@ def _load_certification_evidence(
             details={"path": str(path)},
         )
     ffmpeg_binding = _tool_binding_from_evidence(payload, "ffmpeg")
-    ffprobe_binding = _tool_binding_from_evidence(payload, "ffprobe")
     for binding, expected, name in (
         (ffmpeg_binding, expected_ffmpeg, "ffmpeg"),
-        (ffprobe_binding, expected_ffprobe, "ffprobe"),
     ):
         if expected is None:
             continue
@@ -516,41 +513,30 @@ def _version_token(version_line: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def _tool_pair_verified(ffprobe: ToolInfo | None, ffmpeg: ToolInfo | None) -> bool:
-    """Require a single immutable FFmpeg build for both CLI tools."""
-    if ffprobe is None or ffmpeg is None:
+def _ffmpeg_tool_verified(ffmpeg: ToolInfo | None) -> bool:
+    """Require the single ffmpeg oracle/export executable to be verified and intact.
+
+    ffprobe.exe is retired: metadata now reads via PyAV and the frame-PTS oracle
+    runs through ffmpeg.exe, so the tamper-evident binding anchors on the ffmpeg
+    executable alone (source sha256 + producer sha256 + ffmpeg sha256 + pts table).
+    """
+    if ffmpeg is None:
         return False
-    if not ffprobe.verified or not ffmpeg.verified:
+    if not ffmpeg.verified:
         return False
-    if not ffprobe.version_line or not ffmpeg.version_line:
+    if not ffmpeg.version_line:
         return False
-    if ffprobe.path.resolve().parent != ffmpeg.path.resolve().parent:
-        return False
-    if ffprobe.path.resolve() == ffmpeg.path.resolve():
-        return False
-    if not re.fullmatch(r"[0-9a-f]{64}", ffprobe.sha256.lower()):
-        return False
-    if not re.fullmatch(r"[0-9a-f]{64}", ffmpeg.sha256.lower()):
-        return False
-    if ffprobe.sha256.lower() == ffmpeg.sha256.lower():
-        return False
-    probe_token = _version_token(ffprobe.version_line)
-    ffmpeg_token = _version_token(ffmpeg.version_line)
-    if probe_token is None or ffmpeg_token is None:
-        return False
-    return probe_token == ffmpeg_token
+    return bool(re.fullmatch(r"[0-9a-f]{64}", ffmpeg.sha256.lower()))
 
 
-def _require_tool_pair(ffprobe: ToolInfo, ffmpeg: ToolInfo) -> None:
-    if _tool_pair_verified(ffprobe, ffmpeg):
+def _require_ffmpeg_tool(ffmpeg: ToolInfo) -> None:
+    if _ffmpeg_tool_verified(ffmpeg):
         return
     raise MediaInfoError(
-        "TOOL_PAIR_MISMATCH",
-        "ffprobe and ffmpeg must be verified tools from the same bundle and version",
+        "FFMPEG_TOOL_MISMATCH",
+        "ffmpeg must be a verified executable with a stable identity",
         details={
-            "ffprobe_path": str(ffprobe.path),
             "ffmpeg_path": str(ffmpeg.path),
-            "ffprobe_version": ffprobe.version_line,
             "ffmpeg_version": ffmpeg.version_line,
         },
     )
@@ -646,7 +632,6 @@ class MediaInfo:
     frame_pts_authoritative: bool = False
     frame_pts_certification: FramePtsCertification | None = None
     validation_errors: tuple[str, ...] = ()
-    ffprobe: ToolInfo | None = None
     ffmpeg: ToolInfo | None = None
 
     @property
@@ -654,8 +639,8 @@ class MediaInfo:
         return bool(self.audio_streams)
 
     @property
-    def tool_pair_verified(self) -> bool:
-        return _tool_pair_verified(self.ffprobe, self.ffmpeg)
+    def ffmpeg_verified(self) -> bool:
+        return _ffmpeg_tool_verified(self.ffmpeg)
 
     def source_is_current(self) -> bool:
         """Return whether the probed source still has the registered identity."""
@@ -675,14 +660,10 @@ class MediaInfo:
     @property
     def complete_for_export(self) -> bool:
         tool_ok = (
-            self.ffprobe is not None
-            and self.ffmpeg is not None
-            and self.ffprobe.verified
+            self.ffmpeg is not None
             and self.ffmpeg.verified
-            and bool(self.ffprobe.version_line)
             and bool(self.ffmpeg.version_line)
-            and self.tool_pair_verified
-            and self.ffprobe.is_current()
+            and self.ffmpeg_verified
             and self.ffmpeg.is_current()
         )
         ticks_ok = all(
@@ -716,7 +697,6 @@ class MediaInfo:
                 expected_source_path=self.source_path,
                 expected_source_size=self.source_size,
                 expected_ffmpeg=self.ffmpeg,
-                expected_ffprobe=self.ffprobe,
             )
         except (MediaInfoError, OSError, TypeError, ValueError):
             return False
@@ -744,7 +724,6 @@ class MediaInfo:
             expected_source_path=self.source_path,
             expected_source_size=self.source_size,
             expected_ffmpeg=self.ffmpeg,
-            expected_ffprobe=self.ffprobe,
         )
         return replace(
             self,
@@ -779,8 +758,7 @@ class MediaInfo:
             ),
             "validation_errors": list(self.validation_errors),
             "complete_for_export": self.complete_for_export,
-            "tool_pair_verified": self.tool_pair_verified,
-            "ffprobe": self.ffprobe.as_dict() if self.ffprobe else None,
+            "ffmpeg_verified": self.ffmpeg_verified,
             "ffmpeg": self.ffmpeg.as_dict() if self.ffmpeg else None,
         }
 
@@ -973,7 +951,6 @@ def parse_ffprobe_json(
     payload: Mapping[str, Any] | str | bytes,
     source_path: str | os.PathLike[str],
     *,
-    ffprobe: ToolInfo | None = None,
     ffmpeg: ToolInfo | None = None,
     source_sha256_before: str | None = None,
 ) -> MediaInfo:
@@ -1022,37 +999,8 @@ def parse_ffprobe_json(
         audio_streams=audios,
         vfr_status=vfr_status,
         validation_errors=tuple(dict.fromkeys(errors)),
-        ffprobe=ffprobe,
         ffmpeg=ffmpeg,
     )
-
-
-def resolve_ffprobe_path(ffprobe_path: str | os.PathLike[str] | None = None, *, ffmpeg_path: str | os.PathLike[str] | None = None) -> Path:
-    if ffprobe_path:
-        requested = os.path.expanduser(str(ffprobe_path))
-        candidate = Path(requested)
-        if candidate.is_file():
-            return candidate.resolve()
-        raise MediaInfoError("FFPROBE_UNAVAILABLE", "requested ffprobe executable was not found", details={"requested": requested})
-    if ffmpeg_path:
-        ffmpeg = Path(os.path.expanduser(str(ffmpeg_path)))
-        sibling = ffmpeg.with_name("ffprobe.exe" if ffmpeg.suffix.lower() == ".exe" else "ffprobe")
-        if sibling.is_file():
-            return sibling.resolve()
-        raise MediaInfoError(
-            "FFPROBE_UNAVAILABLE",
-            "ffprobe was not found beside the explicitly selected ffmpeg",
-            details={"ffmpeg_path": str(ffmpeg), "expected_ffprobe": str(sibling)},
-        )
-    bundled = _bundled_tool_path("ffprobe.exe")
-    if bundled is not None:
-        return bundled
-    found = shutil.which("ffprobe")
-    if found:
-        candidate = Path(found)
-        if candidate.is_file():
-            return candidate.resolve()
-    raise MediaInfoError("FFPROBE_UNAVAILABLE", "ffprobe executable was not found", details={"requested": str(ffprobe_path) if ffprobe_path else None})
 
 
 def resolve_ffmpeg_path(ffmpeg_path: str | os.PathLike[str] | None = None) -> Path:
@@ -1104,17 +1052,6 @@ def _verify_tool(path: Path, *, execute: Callable[..., Any], timeout_seconds: fl
     if not version_line:
         raise MediaInfoError("TOOL_VERSION_MISSING", f"tool returned no version text: {path}", details={"path": str(path)})
     return _tool_info(path, version_line=version_line, verified=True)
-
-
-def _active_probe_backend() -> str:
-    """Metadata probe backend selector.
-
-    Defaults to the in-process PyAV reader (field-identical to ffprobe on all
-    production samples); the ffprobe/ffmpeg tool pair is still verified for
-    frame-PTS oracle binding. Set ARKNIGHT_MEDIA_PROBE=ffprobe to restore the
-    CLI metadata spawn as a rollback.
-    """
-    return os.environ.get("ARKNIGHT_MEDIA_PROBE", "pyav").strip().lower()
 
 
 def _round_to_microsecond(value: Fraction | None) -> Fraction | None:
@@ -1216,94 +1153,15 @@ def _pyav_probe_payload(source: Path) -> dict:
 def probe_media(
     source_path: str | os.PathLike[str],
     *,
-    ffprobe_path: str | os.PathLike[str] | None = None,
     ffmpeg_path: str | os.PathLike[str] | None = None,
     timeout_seconds: float = 15.0,
     runner: Callable[..., Any] | None = None,
 ) -> MediaInfo:
-    if _active_probe_backend() == "pyav":
-        return probe_media_pyav(
-            source_path,
-            ffprobe_path=ffprobe_path,
-            ffmpeg_path=ffmpeg_path,
-            timeout_seconds=timeout_seconds,
-            runner=runner,
-        )
-    source = Path(source_path).expanduser().resolve()
-    if not source.is_file():
-        raise MediaInfoError("SOURCE_NOT_FOUND", f"source media not found: {source}")
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise MediaInfoError("PROBE_ARGUMENT_INVALID", "timeout_seconds must be finite and positive")
-    ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
-    ffprobe = resolve_ffprobe_path(ffprobe_path, ffmpeg_path=ffmpeg)
-    execute = runner or subprocess.run
-    source_sha256_before = _sha256_file(source)
-    tool_error: MediaInfoError | None = None
-    try:
-        ffprobe_tool = _verify_tool(ffprobe, execute=execute, timeout_seconds=timeout_seconds)
-        ffmpeg_tool = _verify_tool(ffmpeg, execute=execute, timeout_seconds=timeout_seconds)
-        _require_tool_pair(ffprobe_tool, ffmpeg_tool)
-    except MediaInfoError as exc:
-        # Still run the requested probe so media failures retain their specific
-        # FFPROBE_* diagnostic instead of being masked by tool provenance.
-        tool_error = exc
-        ffprobe_tool = None
-        ffmpeg_tool = None
-    try:
-        completed = execute(
-            [str(ffprobe), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(source)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise MediaInfoError("FFPROBE_TIMEOUT", "ffprobe did not finish before the timeout", details={"timeout_seconds": timeout_seconds, "path": str(ffprobe)}) from exc
-    except OSError as exc:
-        raise MediaInfoError("FFPROBE_EXECUTION_FAILED", f"ffprobe could not be started: {ffprobe}", details={"path": str(ffprobe), "os_error": str(exc)}) from exc
-    if completed.returncode != 0:
-        raise MediaInfoError(
-            "FFPROBE_FAILED",
-            f"ffprobe failed with return code {completed.returncode}",
-            details={"stderr": (completed.stderr or "")[-2000:]},
-        )
-    if tool_error is not None:
-        raise tool_error
-    for tool in (ffprobe_tool, ffmpeg_tool):
-        assert tool is not None
-        if _sha256_file(tool.path) != tool.sha256:
-            raise MediaInfoError(
-                "TOOL_CHANGED_DURING_PROBE",
-                f"tool changed after version verification: {tool.path}",
-                details={"path": str(tool.path)},
-            )
-    output = completed.stdout
-    if not output:
-        raise MediaInfoError("PROBE_JSON_INVALID", "ffprobe returned empty JSON")
-    return parse_ffprobe_json(
-        output,
-        source,
-        ffprobe=ffprobe_tool,
-        ffmpeg=ffmpeg_tool,
-        source_sha256_before=source_sha256_before,
-    )
+    """Build a MediaInfo, reading container/stream metadata via PyAV.
 
-
-def probe_media_pyav(
-    source_path: str | os.PathLike[str],
-    *,
-    ffprobe_path: str | os.PathLike[str] | None = None,
-    ffmpeg_path: str | os.PathLike[str] | None = None,
-    timeout_seconds: float = 15.0,
-    runner: Callable[..., Any] | None = None,
-) -> MediaInfo:
-    """Build the same MediaInfo as probe_media, reading metadata via PyAV.
-
-    The ffprobe/ffmpeg tool pair is still resolved, hashed and verified exactly
-    as in the CLI path, because frame-PTS certification binds both executables.
-    Only the metadata read itself moves from spawning ffprobe to PyAV.
+    ffprobe.exe is retired: metadata no longer spawns any CLI tool. The
+    ffmpeg.exe oracle/export executable is still resolved, hashed and verified,
+    because frame-PTS certification binds that tool.
     """
     source = Path(source_path).expanduser().resolve()
     if not source.is_file():
@@ -1311,17 +1169,14 @@ def probe_media_pyav(
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise MediaInfoError("PROBE_ARGUMENT_INVALID", "timeout_seconds must be finite and positive")
     ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
-    ffprobe = resolve_ffprobe_path(ffprobe_path, ffmpeg_path=ffmpeg)
     execute = runner or subprocess.run
     source_sha256_before = _sha256_file(source)
     tool_error: MediaInfoError | None = None
     try:
-        ffprobe_tool = _verify_tool(ffprobe, execute=execute, timeout_seconds=timeout_seconds)
         ffmpeg_tool = _verify_tool(ffmpeg, execute=execute, timeout_seconds=timeout_seconds)
-        _require_tool_pair(ffprobe_tool, ffmpeg_tool)
+        _require_ffmpeg_tool(ffmpeg_tool)
     except MediaInfoError as exc:
         tool_error = exc
-        ffprobe_tool = None
         ffmpeg_tool = None
     try:
         payload = _pyav_probe_payload(source)
@@ -1335,18 +1190,16 @@ def probe_media_pyav(
         ) from exc
     if tool_error is not None:
         raise tool_error
-    for tool in (ffprobe_tool, ffmpeg_tool):
-        assert tool is not None
-        if _sha256_file(tool.path) != tool.sha256:
-            raise MediaInfoError(
-                "TOOL_CHANGED_DURING_PROBE",
-                f"tool changed after version verification: {tool.path}",
-                details={"path": str(tool.path)},
-            )
+    assert ffmpeg_tool is not None
+    if _sha256_file(ffmpeg_tool.path) != ffmpeg_tool.sha256:
+        raise MediaInfoError(
+            "TOOL_CHANGED_DURING_PROBE",
+            f"tool changed after version verification: {ffmpeg_tool.path}",
+            details={"path": str(ffmpeg_tool.path)},
+        )
     return parse_ffprobe_json(
         payload,
         source,
-        ffprobe=ffprobe_tool,
         ffmpeg=ffmpeg_tool,
         source_sha256_before=source_sha256_before,
     )

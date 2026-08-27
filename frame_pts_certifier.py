@@ -14,7 +14,7 @@ import uuid
 import media_info
 
 
-EVIDENCE_SCHEMA_VERSION = 1
+EVIDENCE_SCHEMA_VERSION = 2
 EVIDENCE_KIND = "production_frame_pts_certification"
 CertificationStatus = Literal["PASS", "PASS_WITH_HEAD_ANOMALIES", "BLOCKED"]
 Checkpoint = Callable[[], Any]
@@ -70,18 +70,17 @@ def _require_media_prerequisites(value: media_info.MediaInfo) -> None:
             "FRAME_PTS_TIME_BASE_MISSING",
             "frame PTS certification requires the primary video time_base",
         )
-    if value.ffmpeg is None or value.ffprobe is None or not value.tool_pair_verified:
+    if value.ffmpeg is None or not value.ffmpeg_verified:
         raise media_info.MediaInfoError(
-            "TOOL_PAIR_MISMATCH",
-            "frame PTS certification requires the verified MediaInfo tool pair",
+            "FFMPEG_TOOL_MISMATCH",
+            "frame PTS certification requires the verified MediaInfo ffmpeg tool",
         )
-    for tool, name in ((value.ffmpeg, "ffmpeg"), (value.ffprobe, "ffprobe")):
-        if not tool.is_current():
-            raise media_info.MediaInfoError(
-                "TOOL_CHANGED_AFTER_PROBE",
-                f"registered {name} executable changed after MediaInfo probing",
-                details={"path": str(tool.path)},
-            )
+    if not value.ffmpeg.is_current():
+        raise media_info.MediaInfoError(
+            "TOOL_CHANGED_AFTER_PROBE",
+            "registered ffmpeg executable changed after MediaInfo probing",
+            details={"path": str(value.ffmpeg.path)},
+        )
 
 
 def default_evidence_path(
@@ -90,7 +89,7 @@ def default_evidence_path(
     cache_root: str | os.PathLike[str] | None = None,
 ) -> Path:
     _require_media_prerequisites(value)
-    assert value.ffmpeg is not None and value.ffprobe is not None
+    assert value.ffmpeg is not None
     producer_sha256 = media_info._sha256_file(Path(__file__).resolve())
     root = (
         Path(cache_root).expanduser().resolve()
@@ -102,8 +101,7 @@ def default_evidence_path(
         / value.source_sha256
         / (
             f"v{EVIDENCE_SCHEMA_VERSION}-{producer_sha256[:16]}-"
-            f"{value.ffmpeg.sha256[:16]}-"
-            f"{value.ffprobe.sha256[:16]}.json"
+            f"{value.ffmpeg.sha256[:16]}.json"
         )
     )
 
@@ -302,7 +300,7 @@ def _build_evidence(
     retry_of: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     _validate_oracle_identity(report, value)
-    assert value.ffmpeg is not None and value.ffprobe is not None
+    assert value.ffmpeg is not None
     primary_time_base = value.video_streams[0].time_base
     assert primary_time_base is not None
 
@@ -456,8 +454,7 @@ def _build_evidence(
         },
         "tools": {
             "ffmpeg": _tool_record(value.ffmpeg),
-            "ffprobe": _tool_record(value.ffprobe),
-            "pair_verified": value.tool_pair_verified,
+            "ffmpeg_verified": value.ffmpeg_verified,
         },
         "producer": {
             "path": str(producer_path),
@@ -573,12 +570,12 @@ def _require_bound_evidence(
             "cached frame PTS evidence belongs to a different source",
         )
     tools = payload.get("tools")
-    if not isinstance(tools, Mapping) or value.ffmpeg is None or value.ffprobe is None:
+    if not isinstance(tools, Mapping) or value.ffmpeg is None:
         raise media_info.MediaInfoError(
             "FRAME_PTS_EVIDENCE_TOOL_MISMATCH",
-            "cached frame PTS evidence has no complete tool pair binding",
+            "cached frame PTS evidence has no ffmpeg tool binding",
         )
-    for name, expected in (("ffmpeg", value.ffmpeg), ("ffprobe", value.ffprobe)):
+    for name, expected in (("ffmpeg", value.ffmpeg),):
         record = tools.get(name)
         if not isinstance(record, Mapping) or dict(record) != expected.as_dict():
             raise media_info.MediaInfoError(
@@ -728,10 +725,9 @@ def produce_frame_pts_certification(
         path = _retry_evidence_path(path)
     if checkpoint is not None:
         checkpoint()
-    assert value.ffmpeg is not None and value.ffprobe is not None
+    assert value.ffmpeg is not None
     source_hash_before = media_info._sha256_file(value.source_path)
     ffmpeg_hash_before = media_info._sha256_file(value.ffmpeg.path)
-    ffprobe_hash_before = media_info._sha256_file(value.ffprobe.path)
     probe = oracle_probe
     if probe is None:
         report, exit_code = _default_oracle_probe(
@@ -759,12 +755,10 @@ def produce_frame_pts_certification(
     if (
         media_info._sha256_file(value.ffmpeg.path) != ffmpeg_hash_before
         or ffmpeg_hash_before != value.ffmpeg.sha256
-        or media_info._sha256_file(value.ffprobe.path) != ffprobe_hash_before
-        or ffprobe_hash_before != value.ffprobe.sha256
     ):
         raise media_info.MediaInfoError(
             "TOOL_CHANGED_DURING_FRAME_PTS_PROBE",
-            "FFmpeg tool pair changed while frame PTS evidence was generated",
+            "ffmpeg executable changed while frame PTS evidence was generated",
         )
     evidence = _build_evidence(
         report,

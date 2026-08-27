@@ -34,7 +34,6 @@ FFMPEG = (
     / "bin"
     / "ffmpeg.exe"
 )
-FFPROBE = FFMPEG.with_name("ffprobe.exe")
 MPV_DIR = REPO / "tools" / "libmpv" / "dll"
 
 SAMPLES = {
@@ -61,7 +60,7 @@ def build_certified_edl(stem: int) -> dict:
     from timeline_plan import TimelinePlan
 
     source = SAMPLES[stem]
-    media = media_info.probe_media(source, ffprobe_path=FFPROBE, ffmpeg_path=FFMPEG)
+    media = media_info.probe_media(source, ffmpeg_path=FFMPEG)
     outcome = frame_pts_certifier.produce_frame_pts_certification(
         media, decode_threads=4
     )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from fractions import Fraction
@@ -57,26 +56,15 @@ def _probe_payload(*, vfr: bool = False, audio: bool = True, start: str = "0/1",
     }
 
 
-def _test_tool_pair(root: Path) -> tuple[media_info.ToolInfo, media_info.ToolInfo]:
-    ffprobe_path = root / "ffprobe.exe"
+def _test_ffmpeg_tool(root: Path) -> media_info.ToolInfo:
     ffmpeg_path = root / "ffmpeg.exe"
-    if not ffprobe_path.exists():
-        ffprobe_path.write_bytes(b"probe-tool")
     if not ffmpeg_path.exists():
         ffmpeg_path.write_bytes(b"ffmpeg-tool")
-    return (
-        media_info.ToolInfo(
-            ffprobe_path,
-            media_info._sha256_file(ffprobe_path),
-            "ffprobe version 7.1-essentials_build-www.gyan.dev",
-            True,
-        ),
-        media_info.ToolInfo(
-            ffmpeg_path,
-            media_info._sha256_file(ffmpeg_path),
-            "ffmpeg version 7.1-essentials_build-www.gyan.dev",
-            True,
-        ),
+    return media_info.ToolInfo(
+        ffmpeg_path,
+        media_info._sha256_file(ffmpeg_path),
+        "ffmpeg version 7.1-essentials_build-www.gyan.dev",
+        True,
     )
 
 
@@ -87,14 +75,13 @@ def _production_evidence(
     source_sha256: str,
     source_size: int,
     time_base: Fraction,
-    ffprobe: media_info.ToolInfo,
     ffmpeg: media_info.ToolInfo,
     status: str = "cfr",
     reason_codes: list[str] | None = None,
 ) -> dict:
     reasons = list(reason_codes or [])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "production_frame_pts_certification",
         "status": "PASS",
         "authoritative_frame_timeline": True,
@@ -113,7 +100,6 @@ def _production_evidence(
         "frame_pts_status": status,
         "frame_count": len(rows),
         "tools": {
-            "ffprobe": ffprobe.as_dict(),
             "ffmpeg": ffmpeg.as_dict(),
         },
         "pts_table_sha256": media_info._canonical_pts_table_sha256(rows),
@@ -142,7 +128,7 @@ class MediaInfoParsingTests(unittest.TestCase):
             {"n": n, "pts": n * 100, "duration": 100}
             for n in range(frame_count)
         ]
-        assert result.ffprobe is not None and result.ffmpeg is not None
+        assert result.ffmpeg is not None
         time_base = result.video_streams[0].time_base
         assert time_base is not None
         evidence = root / "frame-pts.json"
@@ -154,7 +140,6 @@ class MediaInfoParsingTests(unittest.TestCase):
                     source_sha256=result.source_sha256,
                     source_size=result.source_size,
                     time_base=time_base,
-                    ffprobe=result.ffprobe,
                     ffmpeg=result.ffmpeg,
                     status=status,
                 )
@@ -281,20 +266,12 @@ class MediaInfoParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
             ffmpeg = root / "ffmpeg.exe"
             source.write_bytes(b"fixture")
-            ffprobe.write_bytes(b"probe-tool")
             ffmpeg.write_bytes(b"ffmpeg-tool")
             result = media_info.parse_ffprobe_json(
                 payload,
                 source,
-                ffprobe=media_info.ToolInfo(
-                    ffprobe,
-                    media_info._sha256_file(ffprobe),
-                    "ffprobe version 7.1-essentials_build-www.gyan.dev",
-                    True,
-                ),
                 ffmpeg=media_info.ToolInfo(
                     ffmpeg,
                     media_info._sha256_file(ffmpeg),
@@ -329,21 +306,13 @@ class MediaInfoParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
             ffmpeg = root / "ffmpeg.exe"
             evidence = root / "frame-pts.json"
             source.write_bytes(b"fixture")
-            ffprobe.write_bytes(b"probe-tool")
             ffmpeg.write_bytes(b"ffmpeg-tool")
             result = media_info.parse_ffprobe_json(
                 payload,
                 source,
-                ffprobe=media_info.ToolInfo(
-                    ffprobe,
-                    media_info._sha256_file(ffprobe),
-                    "ffprobe version 7.1-essentials_build-www.gyan.dev",
-                    True,
-                ),
                 ffmpeg=media_info.ToolInfo(
                     ffmpeg,
                     media_info._sha256_file(ffmpeg),
@@ -362,7 +331,6 @@ class MediaInfoParsingTests(unittest.TestCase):
                         source_sha256=result.source_sha256,
                         source_size=source.stat().st_size,
                         time_base=result.video_streams[0].time_base,
-                        ffprobe=result.ffprobe,
                         ffmpeg=result.ffmpeg,
                     )
                 ),
@@ -386,7 +354,7 @@ class MediaInfoParsingTests(unittest.TestCase):
                     root = Path(temporary)
                     source = root / "sample.mp4"
                     source.write_bytes(b"fixture")
-                    ffprobe, ffmpeg = _test_tool_pair(root)
+                    ffmpeg = _test_ffmpeg_tool(root)
                     evidence = root / "frame-pts.json"
                     rows = [
                         {"n": n, "pts": pts, "duration": 100}
@@ -400,7 +368,6 @@ class MediaInfoParsingTests(unittest.TestCase):
                                 source_sha256=media_info._sha256_file(source),
                                 source_size=source.stat().st_size,
                                 time_base=Fraction(1, 1000),
-                                ffprobe=ffprobe,
                                 ffmpeg=ffmpeg,
                             )
                         ),
@@ -420,7 +387,7 @@ class MediaInfoParsingTests(unittest.TestCase):
             root = Path(temporary)
             source = root / "sample.mp4"
             source.write_bytes(b"fixture")
-            ffprobe, ffmpeg = _test_tool_pair(root)
+            ffmpeg = _test_ffmpeg_tool(root)
             rows = [
                 {"n": 0, "pts": 0, "duration": 100},
                 {"n": 1, "pts": 100, "duration": 100},
@@ -434,7 +401,6 @@ class MediaInfoParsingTests(unittest.TestCase):
                         source_sha256=media_info._sha256_file(source),
                         source_size=source.stat().st_size,
                         time_base=Fraction(1, 1000),
-                        ffprobe=ffprobe,
                         ffmpeg=ffmpeg,
                         reason_codes=["PTS_DUPLICATE"],
                     )
@@ -458,20 +424,12 @@ class MediaInfoParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
             ffmpeg = root / "ffmpeg.exe"
             source.write_bytes(b"fixture-before")
-            ffprobe.write_bytes(b"probe-tool")
             ffmpeg.write_bytes(b"ffmpeg-tool")
             result = media_info.parse_ffprobe_json(
                 payload,
                 source,
-                ffprobe=media_info.ToolInfo(
-                    ffprobe,
-                    media_info._sha256_file(ffprobe),
-                    "ffprobe version 7.1-essentials_build-www.gyan.dev",
-                    True,
-                ),
                 ffmpeg=media_info.ToolInfo(
                     ffmpeg,
                     media_info._sha256_file(ffmpeg),
@@ -489,13 +447,6 @@ class MediaInfoParsingTests(unittest.TestCase):
             ):
                 certified.assert_source_current()
 
-    def test_explicit_tool_path_does_not_fall_back(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            missing = Path(temporary) / "missing-ffprobe"
-            with self.assertRaises(media_info.MediaInfoError) as caught:
-                media_info.resolve_ffprobe_path(missing)
-        self.assertEqual(caught.exception.code, "FFPROBE_UNAVAILABLE")
-
     def test_auto_resolver_prefers_repository_bundle(self) -> None:
         expected = (
             Path(__file__).resolve().parents[1]
@@ -507,19 +458,6 @@ class MediaInfoParsingTests(unittest.TestCase):
             / "ffmpeg.exe"
         ).resolve()
         self.assertEqual(media_info.resolve_ffmpeg_path(), expected)
-        self.assertEqual(
-            media_info.resolve_ffprobe_path(),
-            expected.with_name("ffprobe.exe"),
-        )
-
-    def test_explicit_ffmpeg_does_not_fall_back_to_path_ffprobe(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            ffmpeg = Path(temporary) / "ffmpeg.exe"
-            ffmpeg.write_bytes(b"ffmpeg-tool")
-            with mock.patch.object(media_info.shutil, "which", return_value="old-ffprobe"):
-                with self.assertRaises(media_info.MediaInfoError) as caught:
-                    media_info.resolve_ffprobe_path(ffmpeg_path=ffmpeg)
-        self.assertEqual(caught.exception.code, "FFPROBE_UNAVAILABLE")
 
     def test_negative_start_pts_is_preserved(self) -> None:
         payload = _probe_payload(start="-5/2")
@@ -532,174 +470,110 @@ class MediaInfoParsingTests(unittest.TestCase):
         self.assertEqual(result.video_streams[0].start_pts, -120)
         self.assertEqual(result.audio_streams[0].start_pts, -480)
 
-    def test_mixed_tool_versions_are_not_export_ready(self) -> None:
+    def test_ffmpeg_tool_not_current_is_not_export_ready(self) -> None:
         payload = _probe_payload()
         for stream in payload["streams"]:
             stream.update({"start_pts": "0", "duration_ts": "480000"})
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
             ffmpeg = root / "ffmpeg.exe"
             source.write_bytes(b"fixture")
-            ffprobe.write_bytes(b"probe-tool")
             ffmpeg.write_bytes(b"ffmpeg-tool")
+            # ToolInfo whose recorded sha256 no longer matches the file on disk
+            # is "not current"; a stale ffmpeg must not be export-ready.
+            stale_tool = media_info.ToolInfo(
+                ffmpeg,
+                "0" * 64,
+                "ffmpeg version 7.1-essentials_build-www.gyan.dev",
+                True,
+            )
             result = media_info.parse_ffprobe_json(
                 payload,
                 source,
-                ffprobe=media_info.ToolInfo(
-                    ffprobe,
-                    media_info._sha256_file(ffprobe),
-                    "ffprobe version 7.1-essentials_build-www.gyan.dev",
-                    True,
-                ),
-                ffmpeg=media_info.ToolInfo(
-                    ffmpeg,
-                    media_info._sha256_file(ffmpeg),
-                    "ffmpeg version 7.1.1-essentials_build-www.gyan.dev",
-                    True,
-                ),
+                ffmpeg=stale_tool,
             )
-            self.assertFalse(result.tool_pair_verified)
+            self.assertFalse(result.ffmpeg.is_current())
             certification = self._certification(result, root)
             self.assertFalse(result.certify_frame_pts(certification).complete_for_export)
 
 
 class MediaInfoProbeTests(unittest.TestCase):
-    # These tests exercise the ffprobe CLI metadata path via a mocked
-    # subprocess. The production default is now the PyAV reader, so pin this
-    # class to the ffprobe rollback to keep the CLI-path assertions valid.
-    def setUp(self) -> None:
-        self._env_patch = mock.patch.dict(
-            os.environ, {"ARKNIGHT_MEDIA_PROBE": "ffprobe"}
-        )
-        self._env_patch.start()
+    """The single PyAV metadata path. ffprobe.exe is retired: probe_media reads
+    metadata via PyAV and binds only the ffmpeg oracle/export tool."""
 
-    def tearDown(self) -> None:
-        self._env_patch.stop()
+    _FFMPEG_VERSION = "ffmpeg version 7.1-essentials_build-www.gyan.dev\n"
 
-    def test_probe_binds_tool_paths_and_hashes(self) -> None:
+    def test_probe_binds_ffmpeg_and_spawns_only_version_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
             ffmpeg = root / "ffmpeg.exe"
             source.write_bytes(b"fixture")
-            ffprobe.write_bytes(b"probe-tool")
             ffmpeg.write_bytes(b"ffmpeg-tool")
-            completed = mock.Mock(returncode=0, stdout=json.dumps(_probe_payload()), stderr="")
-            ffprobe_version = mock.Mock(
-                returncode=0,
-                stdout="ffprobe version 7.1-essentials_build-www.gyan.dev\n",
-                stderr="",
-            )
-            ffmpeg_version = mock.Mock(
-                returncode=0,
-                stdout="ffmpeg version 7.1-essentials_build-www.gyan.dev\n",
-                stderr="",
-            )
             with mock.patch.object(media_info, "subprocess") as subprocess_mock:
-                subprocess_mock.run.side_effect = [ffprobe_version, ffmpeg_version, completed]
-                result = media_info.probe_media(source, ffprobe_path=ffprobe, ffmpeg_path=ffmpeg)
-            self.assertEqual(result.ffprobe.path, ffprobe.resolve())
-            self.assertEqual(result.ffmpeg.path, ffmpeg.resolve())
-            self.assertEqual(result.ffprobe.sha256, media_info._sha256_file(ffprobe))
-            self.assertEqual(result.ffmpeg.sha256, media_info._sha256_file(ffmpeg))
-            self.assertTrue(result.ffprobe.verified)
-            self.assertTrue(result.ffmpeg.verified)
-            self.assertTrue(result.ffprobe.version_line)
-            self.assertTrue(result.ffmpeg.version_line)
-            self.assertFalse(result.complete_for_export)
-            command = subprocess_mock.run.call_args.args[0]
-            self.assertIn("-show_format", command)
-            self.assertIn("-show_streams", command)
-
-    def test_probe_failure_has_structured_code(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
-            ffmpeg = root / "ffmpeg.exe"
-            source.write_bytes(b"fixture")
-            ffprobe.write_bytes(b"probe-tool")
-            ffmpeg.write_bytes(b"ffmpeg-tool")
-            completed = mock.Mock(returncode=1, stdout="", stderr="invalid media")
-            with mock.patch.object(media_info, "subprocess") as subprocess_mock:
-                subprocess_mock.run.return_value = completed
-                with self.assertRaises(media_info.MediaInfoError) as caught:
-                    media_info.probe_media(source, ffprobe_path=ffprobe, ffmpeg_path=ffmpeg)
-            self.assertEqual(caught.exception.code, "FFPROBE_FAILED")
-
-    def test_probe_rejects_mixed_tool_versions(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
-            ffmpeg = root / "ffmpeg.exe"
-            source.write_bytes(b"fixture")
-            ffprobe.write_bytes(b"probe-tool")
-            ffmpeg.write_bytes(b"ffmpeg-tool")
-
-            def runner(command, **_kwargs):
-                if command[0] == str(ffprobe):
-                    return mock.Mock(
-                        returncode=0,
-                        stdout="ffprobe version 7.1-essentials_build-www.gyan.dev\n",
-                        stderr="",
-                    )
-                if command[0] == str(ffmpeg):
-                    return mock.Mock(
-                        returncode=0,
-                        stdout="ffmpeg version 7.1.1-essentials_build-www.gyan.dev\n",
-                        stderr="",
-                    )
-                return mock.Mock(returncode=0, stdout=json.dumps(_probe_payload()), stderr="")
-
-            with self.assertRaises(media_info.MediaInfoError) as caught:
-                media_info.probe_media(
-                    source,
-                    ffprobe_path=ffprobe,
-                    ffmpeg_path=ffmpeg,
-                    runner=runner,
+                subprocess_mock.run.return_value = mock.Mock(
+                    returncode=0, stdout=self._FFMPEG_VERSION, stderr=""
                 )
-        self.assertEqual(caught.exception.code, "TOOL_PAIR_MISMATCH")
+                with mock.patch.object(
+                    media_info, "_pyav_probe_payload", return_value=_probe_payload()
+                ) as payload:
+                    result = media_info.probe_media(source, ffmpeg_path=ffmpeg)
+            payload.assert_called_once_with(source.resolve())
+            # Only the ffmpeg -version check spawns a subprocess; metadata is PyAV.
+            self.assertEqual(subprocess_mock.run.call_count, 1)
+            self.assertEqual(result.ffmpeg.path, ffmpeg.resolve())
+            self.assertEqual(result.ffmpeg.sha256, media_info._sha256_file(ffmpeg))
+            self.assertTrue(result.ffmpeg.verified)
+            self.assertTrue(result.ffmpeg_verified)
+            self.assertTrue(result.has_audio)
+            self.assertEqual(result.video_streams[0].avg_frame_rate, Fraction(60, 1))
+            self.assertFalse(result.complete_for_export)
+
+    def test_probe_payload_failure_has_structured_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.mp4"
+            ffmpeg = root / "ffmpeg.exe"
+            source.write_bytes(b"fixture")
+            ffmpeg.write_bytes(b"ffmpeg-tool")
+            with mock.patch.object(media_info, "subprocess") as subprocess_mock:
+                subprocess_mock.run.return_value = mock.Mock(
+                    returncode=0, stdout=self._FFMPEG_VERSION, stderr=""
+                )
+                with mock.patch.object(
+                    media_info, "_pyav_probe_payload", side_effect=RuntimeError("boom")
+                ):
+                    with self.assertRaises(media_info.MediaInfoError) as caught:
+                        media_info.probe_media(source, ffmpeg_path=ffmpeg)
+            self.assertEqual(caught.exception.code, "PYAV_PROBE_FAILED")
 
     def test_source_mutation_during_probe_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
             ffmpeg = root / "ffmpeg.exe"
             source.write_bytes(b"fixture-before")
-            ffprobe.write_bytes(b"probe-tool")
             ffmpeg.write_bytes(b"ffmpeg-tool")
-            calls = 0
 
-            def runner(command, **_kwargs):
-                nonlocal calls
-                calls += 1
-                if calls <= 2:
-                    return mock.Mock(returncode=0, stdout="tool version 1\n", stderr="")
+            def _mutating_payload(_path):
                 source.write_bytes(b"fixture-after")
-                return mock.Mock(returncode=0, stdout=json.dumps(_probe_payload()), stderr="")
+                return _probe_payload()
 
-            with self.assertRaises(media_info.MediaInfoError) as caught:
-                media_info.probe_media(
-                    source,
-                    ffprobe_path=ffprobe,
-                    ffmpeg_path=ffmpeg,
-                    runner=runner,
+            with mock.patch.object(media_info, "subprocess") as subprocess_mock:
+                subprocess_mock.run.return_value = mock.Mock(
+                    returncode=0, stdout=self._FFMPEG_VERSION, stderr=""
                 )
-        self.assertEqual(caught.exception.code, "SOURCE_CHANGED_DURING_PROBE")
+                with mock.patch.object(
+                    media_info, "_pyav_probe_payload", side_effect=_mutating_payload
+                ):
+                    with self.assertRaises(media_info.MediaInfoError) as caught:
+                        media_info.probe_media(source, ffmpeg_path=ffmpeg)
+            self.assertEqual(caught.exception.code, "SOURCE_CHANGED_DURING_PROBE")
 
 
-class MediaInfoPyAVProbeTests(unittest.TestCase):
-    """Regression coverage for the PyAV metadata probe backend (Phase 1)."""
-
-    _FFPROBE_VERSION = "ffprobe version 7.1-essentials_build-www.gyan.dev\n"
-    _FFMPEG_VERSION = "ffmpeg version 7.1-essentials_build-www.gyan.dev\n"
-
-    def test_round_to_microsecond_matches_ffprobe_repr(self) -> None:
+class MediaInfoRoundingTests(unittest.TestCase):
+    def test_round_to_microsecond_matches_probe_repr(self) -> None:
         # duration_ts*time_base exact fractions -> ffprobe %.6f microsecond grid.
         self.assertEqual(
             media_info._round_to_microsecond(Fraction(14903, 30)),
@@ -712,84 +586,6 @@ class MediaInfoPyAVProbeTests(unittest.TestCase):
         self.assertEqual(media_info._round_to_microsecond(Fraction(0, 1)), Fraction(0, 1))
         self.assertEqual(media_info._round_to_microsecond(Fraction(1, 100)), Fraction(1, 100))
         self.assertIsNone(media_info._round_to_microsecond(None))
-
-    def test_probe_backend_env_selection(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(media_info._active_probe_backend(), "pyav")
-        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "ffprobe"}):
-            self.assertEqual(media_info._active_probe_backend(), "ffprobe")
-        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "  PYAV "}):
-            self.assertEqual(media_info._active_probe_backend(), "pyav")
-
-    def test_probe_media_dispatches_to_pyav_backend(self) -> None:
-        sentinel = mock.Mock(name="pyav-mediainfo")
-        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "pyav"}):
-            with mock.patch.object(media_info, "probe_media_pyav", return_value=sentinel) as pyav_probe:
-                result = media_info.probe_media("any.mp4", ffprobe_path="p", ffmpeg_path="f")
-        self.assertIs(result, sentinel)
-        pyav_probe.assert_called_once()
-
-    def test_probe_media_dispatches_to_pyav_backend_by_default(self) -> None:
-        sentinel = mock.Mock(name="pyav-mediainfo")
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch.object(media_info, "probe_media_pyav", return_value=sentinel) as pyav_probe:
-                result = media_info.probe_media("any.mp4", ffprobe_path="p", ffmpeg_path="f")
-        self.assertIs(result, sentinel)
-        pyav_probe.assert_called_once()
-
-    def test_probe_media_ffprobe_rollback_backend(self) -> None:
-        with mock.patch.dict(os.environ, {"ARKNIGHT_MEDIA_PROBE": "ffprobe"}):
-            with mock.patch.object(media_info, "probe_media_pyav") as pyav_probe:
-                with tempfile.TemporaryDirectory() as temporary:
-                    root = Path(temporary)
-                    source = root / "sample.mp4"
-                    source.write_bytes(b"fixture")
-                    (root / "ffprobe.exe").write_bytes(b"probe-tool")
-                    (root / "ffmpeg.exe").write_bytes(b"ffmpeg-tool")
-                    with mock.patch.object(media_info, "subprocess") as subprocess_mock:
-                        subprocess_mock.run.side_effect = [
-                            mock.Mock(returncode=0, stdout=self._FFPROBE_VERSION, stderr=""),
-                            mock.Mock(returncode=0, stdout=self._FFMPEG_VERSION, stderr=""),
-                            mock.Mock(returncode=0, stdout=json.dumps(_probe_payload()), stderr=""),
-                        ]
-                        result = media_info.probe_media(
-                            source,
-                            ffprobe_path=root / "ffprobe.exe",
-                            ffmpeg_path=root / "ffmpeg.exe",
-                        )
-        pyav_probe.assert_not_called()
-        self.assertEqual(subprocess_mock.run.call_count, 3)
-        self.assertEqual(result.format_name, _probe_payload()["format"]["format_name"])
-
-    def test_probe_media_pyav_binds_tool_pair_without_ffprobe_metadata_spawn(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "sample.mp4"
-            ffprobe = root / "ffprobe.exe"
-            ffmpeg = root / "ffmpeg.exe"
-            source.write_bytes(b"fixture")
-            ffprobe.write_bytes(b"probe-tool")
-            ffmpeg.write_bytes(b"ffmpeg-tool")
-            with mock.patch.object(media_info, "subprocess") as subprocess_mock:
-                # Only the two tool -version calls; the PyAV path must not spawn
-                # ffprobe to read metadata.
-                subprocess_mock.run.side_effect = [
-                    mock.Mock(returncode=0, stdout=self._FFPROBE_VERSION, stderr=""),
-                    mock.Mock(returncode=0, stdout=self._FFMPEG_VERSION, stderr=""),
-                ]
-                with mock.patch.object(
-                    media_info, "_pyav_probe_payload", return_value=_probe_payload()
-                ) as payload:
-                    result = media_info.probe_media_pyav(
-                        source, ffprobe_path=ffprobe, ffmpeg_path=ffmpeg
-                    )
-            payload.assert_called_once_with(source.resolve())
-            self.assertEqual(subprocess_mock.run.call_count, 2)
-            self.assertTrue(result.tool_pair_verified)
-            self.assertEqual(result.ffprobe.path, ffprobe.resolve())
-            self.assertEqual(result.ffmpeg.path, ffmpeg.resolve())
-            self.assertEqual(result.video_streams[0].avg_frame_rate, Fraction(60, 1))
-            self.assertTrue(result.has_audio)
 
 
 if __name__ == "__main__":

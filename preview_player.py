@@ -136,7 +136,6 @@ def _run_media_info_task(context: TaskContext, snapshot: dict):
     context.checkpoint()
     result = media_info.probe_media(
         snapshot["video_path"],
-        ffprobe_path=snapshot.get("ffprobe_path"),
         ffmpeg_path=snapshot.get("ffmpeg_path"),
     )
     context.checkpoint()
@@ -773,7 +772,6 @@ class VideoPreviewPlayer(tk.Frame):
         project_generation, _timeline_revision = self._task_scope()
         snapshot = {
             "video_path": source_path,
-            "ffprobe_path": params.get("ffprobe_path"),
             "ffmpeg_path": params.get("ffmpeg_path"),
             "frame_pts_evidence_path": params.get("frame_pts_evidence_path"),
             "frame_pts_cache_root": params.get("frame_pts_cache_root"),
@@ -1815,7 +1813,6 @@ class VideoPreviewPlayer(tk.Frame):
         use_gpu = bool(p.get("export_use_gpu", False))
         gpu_encoder = str(p.get("gpu_encoder", ""))
         ffmpeg_path = p.get("ffmpeg_path")
-        ffprobe_path = p.get("ffprobe_path")
         include_audio = bool(p.get("export_keep_audio", True))
         enforce_media_certification = bool(
             p.get("enforce_media_certification", False)
@@ -1842,7 +1839,6 @@ class VideoPreviewPlayer(tk.Frame):
                 include_audio=include_audio,
                 video_path=video_path,
                 ffmpeg_path=ffmpeg_path,
-                ffprobe_path=ffprobe_path,
             )
         except Exception as exc:
             return messagebox.showerror("导出准备失败", str(exc))
@@ -1895,7 +1891,6 @@ class VideoPreviewPlayer(tk.Frame):
             use_gpu=use_gpu,
             gpu_encoder=gpu_encoder,
             ffmpeg_path=ffmpeg_path,
-            ffprobe_path=ffprobe_path,
             include_audio=include_audio,
             allow_audio_drop=allow_audio_drop,
             media_info=getattr(self, "media_info", None),
@@ -3017,7 +3012,7 @@ class VideoPreviewPlayer(tk.Frame):
         project_generation, timeline_revision = self._task_scope()
         decode_backend = p.get("decode_backend", "opencv")
         ffmpeg_path = p.get("ffmpeg_path")
-        ffprobe_path = p.get("ffprobe_path")
+        ffmpeg_path = p.get("ffmpeg_path")
         backend_note = ""
         try:
             backend_key = analyzer.normalize_decode_backend(decode_backend)
@@ -3041,7 +3036,6 @@ class VideoPreviewPlayer(tk.Frame):
             "backend_label": backend_label,
             "backend_note": backend_note,
             "ffmpeg_path": ffmpeg_path,
-            "ffprobe_path": ffprobe_path,
         }
 
         self.btn_analyze.config(state=tk.DISABLED, text="Analyzing...")
@@ -3318,7 +3312,6 @@ class VideoPreviewPlayer(tk.Frame):
         use_gpu = bool(p.get("export_use_gpu", False))
         gpu_encoder = str(p.get("gpu_encoder", ""))
         ffmpeg_path = p.get("ffmpeg_path")
-        ffprobe_path = p.get("ffprobe_path")
         enforce_media_certification = bool(
             p.get("enforce_media_certification", False)
         )
@@ -3396,7 +3389,6 @@ class VideoPreviewPlayer(tk.Frame):
                         use_gpu=use_gpu,
                         gpu_encoder=gpu_encoder,
                         ffmpeg_path=ffmpeg_path,
-                        ffprobe_path=ffprobe_path,
                         include_audio=False,
                         media_info=getattr(self, "media_info", None),
                         enforce_media_certification=enforce_media_certification,

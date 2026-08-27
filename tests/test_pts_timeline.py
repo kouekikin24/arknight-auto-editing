@@ -20,25 +20,17 @@ class CertifiedPtsTimelineTests(unittest.TestCase):
         source_path = root / "source.mp4"
         source_path.write_bytes(b"source")
         ffmpeg = root / "ffmpeg.exe"
-        ffprobe = root / "ffprobe.exe"
         ffmpeg.write_bytes(b"ffmpeg-tool")
-        ffprobe.write_bytes(b"ffprobe-tool")
         ffmpeg_info = media_info.ToolInfo(
             ffmpeg,
             media_info._sha256_file(ffmpeg),
             "ffmpeg version 7.1.1-essentials_build-www.gyan.dev",
             True,
         )
-        ffprobe_info = media_info.ToolInfo(
-            ffprobe,
-            media_info._sha256_file(ffprobe),
-            "ffprobe version 7.1.1-essentials_build-www.gyan.dev",
-            True,
-        )
         evidence.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "kind": "production_frame_pts_certification",
                     "status": "PASS",
                     "authoritative_frame_timeline": True,
@@ -54,7 +46,6 @@ class CertifiedPtsTimelineTests(unittest.TestCase):
                     "frame_count": len(rows),
                     "tools": {
                         "ffmpeg": ffmpeg_info.as_dict(),
-                        "ffprobe": ffprobe_info.as_dict(),
                     },
                     "pts_table_sha256": media_info._canonical_pts_table_sha256(rows),
                     "pts_table": rows,
