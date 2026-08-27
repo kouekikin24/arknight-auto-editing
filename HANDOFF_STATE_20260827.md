@@ -1,0 +1,126 @@
+# HANDOFF — 当前状态（2026-08-27，上下文压缩前快照）
+
+> 本文是**压缩上下文前的权威现状文档**，自包含。接手人先读这一份；
+> 细节可再查 `HANDOFF_PYAV_CONSOLIDATION.md`（整合+退役全过程）、
+> `HANDOFF_PREVIEW_ACCURACY.md`（预览定帧+指纹）、`RESEARCH_TIMESTAMP_PANORAMA.md`（时间戳调研）。
+> `HANDOFF_CURRENT.md` / `HANDOFF_TIMING.md` 为更早期的历史快照，内容部分已过时。
+
+---
+
+## 0. 一句话现状
+
+**ffprobe.exe 已彻底退役并提交**。元数据探测、分析解码、音轨探测全部走 **PyAV**；
+帧 oracle 与导出仍留 **ffmpeg.exe**；OpenCV 解码后端冻结。帧认证从"双工具配对
+(ffmpeg+ffprobe)"改绑为"**仅 ffmpeg**"（schema 1→2），4 张生产证已**就地迁移**
+（不重跑 oracle）。全量单测 **408 + 90 子测试**绿。工作区干净（仅 `.zcode/` 未跟踪）。
+
+---
+
+## 1. 提交记录（分支 `fix/preview-pacing-metrics`，新→旧）
+
+| 提交 | 内容 |
+|---|---|
+| `f8d96c8` | docs：标注整合手账 §3-§5 为退役前快照；记录孤儿夹具证 + 退役决定 |
+| `068b5e5` | **refactor：退役 ffprobe**——元数据/分析/音轨走 PyAV；认证改绑仅 ffmpeg（schema v2）；就地迁移 4 证 |
+| `43ea61b` | 元数据探测默认切 PyAV（逐字段一致已验） |
+| `937645e` | PyAV 分析解码后端（av.filter area+gray，与 ffmpeg 7.1 逐位一致）；冻结 OpenCV 解码；锁 av~=13.1 |
+| `bd8628f` | PyAV 元数据探测后端（字段一致的 MediaInfo） |
+| `bf621f2` | 指纹验戳暂停静帧（PyAV 计数+哈希定位）；A_PT 默认后端 |
+| `3e672bb` 及更早 | 预览步进 / FPS 上限 / EDL 预览 / mpv 引擎等（本轮之前） |
+
+---
+
+## 2. 现在的架构分工（"谁干什么"）
+
+| 角色 | 干什么 |
+|---|---|
+| **PyAV (av 13.1)** | 元数据探测（`probe_media` 唯一入口）、分析解码（`_analyze_video_pyav_filter`）、音轨探测（`_probe_audio_stream` 主）、预览静帧定帧（`_still_decode_pyav`） |
+| **ffmpeg.exe 7.1** | 帧 PTS oracle（`verify_mpv_frames.build_ffmpeg_command`）、导出（3 模式）、`_verify_tool` 验签 |
+| **OpenCV (cv2)** | 识别本体 `cv2.matchTemplate`（暂停/变速）、成像（resize/cvtColor/absdiff/mean）、帧数权威 `CAP_PROP_FRAME_COUNT`、冻结的解码后端 `_analyze_video_opencv`、CvEngine |
+| **ffprobe.exe** | **已无代码引用**。二进制仍在盘上（87MB、gitignored），待 owner 决定是否删 |
+
+---
+
+## 3. 认证方案（这次改动的核心，务必看清）
+
+- **旧**：认证文件名嵌 `v1-{producer}-{ffmpeg}-{ffprobe}`，强制 `_tool_pair_verified`（双工具）。
+- **新**：文件名 `v2-{producer16}-{ffmpeg16}.json`；`MediaInfo` 去掉 `ffprobe` 字段；
+  `_tool_pair_verified` → `_ffmpeg_tool_verified`（只验 ffmpeg：verified+version_line+合法 sha256）。
+- **`MediaInfo` 现字段**：`... , ffmpeg: ToolInfo | None`（**没有** `ffprobe` 了）。
+  `complete_for_export` 只查 `ffmpeg.is_current()` 等。
+- **迁移**：4 张生产证（1/2/3/4.mp4）已用 `.cache/migrate_certs_v2.py` 就地重编码为 v2，
+  **逐字节保留** oracle 报告 / pts 表 / 头部判定，迁移后全 `certified=True`。
+  **producer sha256 = 当前 `frame_pts_certifier.py` 的哈希**（前 16 位 `def34eddc6ac3507`）。
+  ⚠️ **以后若改 `frame_pts_certifier.py`，producer 哈希变 → 所有证失效 → 需重迁**。
+- **帧 oracle 本身只用 ffmpeg**，所以去 ffprobe 不影响 oracle 证据。
+
+---
+
+## 4. 关键技术事实
+
+- **PyAV 版本**：`av 13.1.0`（libavcodec 61 = FFmpeg 7.x，libswscale 8）。`pyproject.toml` 锁 `av~=13.1`。
+  **勿升到 14+**：av14+（FFmpeg 8.x，libswscale 9）的 `scale=area` 相对打包的 7.1 有 ±1 灰阶
+  缩放漂移（虽不翻分类，但破坏"逐位一致"）。
+- **逐位一致已实证**：av13.1 与 ffmpeg.exe 7.1 的 `scale={pw}:{ph}:flags=area,format=gray` 输出
+  全片（2.mp4 184293 帧）`states/diffs` 完全相同。
+- **回退开关**：仅 `ARKNIGHT_A_PT_IMPL=ffmpeg`（分析解码回退 ffmpeg CLI）。**元数据无回退**
+  （PyAV 唯一；原 `ARKNIGHT_MEDIA_PROBE=ffprobe` 已随退役删除，代码里也删了 `_active_probe_backend`）。
+- **样本**：`D:\qq下载\920\{1,2,3,4}.mp4`；2.mp4 为坏时间戳主样本。
+- **打包二进制**：`tools/ffmpeg-7.1.0/bundle/ffmpeg-7.1-essentials_build/bin/`（ffmpeg.exe 在用；
+  ffprobe.exe 已无引用，待处理）。
+
+---
+
+## 5. 留给 owner 的决定（都在 `HANDOFF_PYAV_CONSOLIDATION.md` §10）
+
+1. **是否物理删 `ffprobe.exe`**（gitignored，87MB，代码已不用；我未删，留/删你定）。
+2. **帧数权威保留 OpenCV `CAP_PROP_FRAME_COUNT`**（未迁 PyAV）：PyAV `stream.frames` 可能低估
+   → 截断分析；cv2 只会高估、有 EOF 兜底更安全。若要彻底去这个 OpenCV 依赖，需先验证。
+3. **第 5 张孤儿证**：`.cache/.../frame_pts/38edc85f.../v1-*.json` 对应
+   `.cache/mpv_spike/pts_fixtures/cfr.mp4`（12 帧开发夹具，非生产样本）。未迁；无测试加载；
+   无害遗留。要彻底就补迁（12 帧很快）或删除。
+4. **0.2X 裁剪 / 夹心并入**：仍为后续方向，未动。
+
+---
+
+## 6. 长期约束（逐字保留，别踩）
+
+- 不直接 push upstream；不用 `git reset --hard` / `git checkout --` / `git clean`。
+- owner"主动停止"即停，且不留 FFmpeg/mpv/Python 媒体后台进程。
+- **不重跑四个完整 frame oracle 长扫描**（迁移之所以"就地重编码"就是为了守这条）。
+- 不放宽 10ms 内容阈值；禁止 frame/fps 时间戳回退造正式 EDL/媒体时间。
+- CvEngine/VideoIOThread 保留；不运行未审计的 `arknight-preview-pack.zip`。
+- 解码后端优先 A_PT；导出与帧 oracle 留 ffmpeg.exe。
+
+---
+
+## 7. 验证 / 运行
+
+- 全量单测：`python -m pytest tests/ -q` → **408 passed + 90 subtests**。
+- 收口探针（4 证在 PyAV 默认下 `certified=True`）：`.cache/probe_certify_pyav.py`。
+- 迁移脚本（已跑过，可复跑）：`.cache/migrate_certs_v2.py [--write]`。
+- 其它探针在 `.cache/`（gitignored）：`probe_pyav_metadata.py` / `probe_mediainfo_backend_diff.py` /
+  `probe_scale_area_drift.py` / `probe_analyze_fullfile_equiv.py` / `probe_hash_verify.py`（指纹链 27 点）。
+
+---
+
+## 8. 文件地图（本轮改过的）
+
+| 文件 | 改动 |
+|---|---|
+| `media_info.py` | 删 `ffprobe` 字段/`resolve_ffprobe_path`/`_active_probe_backend`；`probe_media` 唯一 PyAV 入口；`_ffmpeg_tool_verified` |
+| `frame_pts_certifier.py` | 认证改绑仅 ffmpeg；schema→2；文件名去 ffprobe |
+| `media_exporter.py` / `pts_timeline.py` | 去 ffprobe 校验/溯源 |
+| `analyzer.py` | `_probe_audio_stream` 改 PyAV 主；删 ffprobe_path 参数；帧数权威保留 cv2 |
+| `preview_player.py` / `settings_panel.py` | 拆 ffprobe_path 管线；删设置里 "FFprobe 路径" 输入框 |
+| `scripts/{certified_edl_preview,run_production_pts_golden,run_real_sample_certified_export}.py` | 去 `--ffprobe` / ffprobe 输出探测改 PyAV |
+| `tests/*` | 7 个测试文件重写为单工具/PyAV |
+| `pyproject.toml` | 锁 `av~=13.1` |
+
+---
+
+## 9. 下一步候选（按价值）
+
+1. 若 owner 点头：物理删 `ffprobe.exe`、补迁/删第 5 张夹具证（.cache 彻底无 v1）。
+2. 后续方向：0.2X 裁剪 / 夹心并入（检测侧规则）；时间戳半无损注入（mkvmerge，外部需求触发）。
+3. 可选加固：指纹报警器、新视频建表提示。
