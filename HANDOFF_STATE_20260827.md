@@ -7,6 +7,29 @@
 
 ---
 
+## 项目速览（接手先看这里）
+
+**这个项目是什么**：明日方舟可视化"剪暂停 + 变速"工具（纯 Python + Tk GUI，入口 `main.py`）。
+用文件夹里的模板图片识别视频每一帧的状态（暂停/1x/2x/0.2x/正常），按暂停前后帧差异决定
+暂停是否保留，然后自动剪掉无效片段并导出。详见 `README.md`。
+**怎么跑**：`python main.py`（依赖见 `pyproject.toml`，`av` 锁 13.1；GUI 需 Tk）。
+
+**运行管线（一次完整流程的顺序）**：
+打开视频 → **探测**（PyAV 出 `MediaInfo`）→ **认证**（ffmpeg oracle 出帧 PTS 证）→
+**分析**（PyAV 解码 + `cv2.matchTemplate` 模板匹配，出 `states`/`diffs`）→
+**预览**（mpv / Cv 引擎）→ **导出**（ffmpeg 按删除区间拼接出片）。
+
+**名词**：`A_PT` = 分析解码后端 "ffmpeg_sw_passthrough" 的别名，**现在底层已是 PyAV**
+（`_analyze_video_pyav_filter`），`ARKNIGHT_A_PT_IMPL=ffmpeg` 可切回 ffmpeg CLI。
+
+**文档导航**：本文件 = 权威现状。`HANDOFF_PYAV_CONSOLIDATION.md`（整合+退役细节）
+与 `HANDOFF_PREVIEW_ACCURACY.md`（预览定帧+指纹）是配套细节；
+`HANDOFF_CURRENT.md` / `HANDOFF_TIMING.md` / `HANDOFF_PREVIEW.md` /
+`AV_REVIEW_AUTOVERIFICATION.md` / `CLAUDE_*.md` 均为**更早期历史快照，多处已过时**，
+与本文件冲突时**以本文件为准**。
+
+---
+
 ## 0. 一句话现状
 
 **ffprobe.exe 已彻底退役并提交**。元数据探测、分析解码、音轨探测全部走 **PyAV**；
@@ -68,6 +91,21 @@
 - **样本**：`D:\qq下载\920\{1,2,3,4}.mp4`；2.mp4 为坏时间戳主样本。
 - **打包二进制**：`tools/ffmpeg-7.1.0/bundle/ffmpeg-7.1-essentials_build/bin/`（ffmpeg.exe 在用；
   ffprobe.exe 已无引用，待处理）。
+
+---
+
+## 4.5 ⚠️ 运行时产物依赖（新克隆/换机必看）
+
+以下关键产物**都是 gitignored**、不在版本库。**同一台机器上压缩上下文不受影响**
+（工作区保留）；但**新克隆/换机则全部缺失**，需要重建或自带：
+- `.cache/media_info/frame_pts/*/v2-*.json` —— 4 张已迁移的 v2 认证。缺了要**重新认证**
+  （重跑 ffmpeg oracle，受"不重跑长扫描"约束，慎）。
+- `.cache/pyav_kf/*.npz` —— 预览指纹关键帧表（每视频首次建表约 75–85s）。缺了预览自动重建。
+- `.cache/migrate_certs_v2.py` 等探针/迁移脚本 —— 不入库；迁移**已跑完**，一般不再需要。
+- `tools/ffmpeg-7.1.0/.../bin/ffmpeg.exe` —— 导出/认证/oracle 都靠它；新克隆须自行放置
+  （provenance 见 `tools/opencv-runtime-manifest.json`）。`ffprobe.exe` 同目录、代码已不用。
+- `tools/libmpv/` —— 预览用的 libmpv（gitignored）。
+- 样本视频在 `D:\qq下载\920\`（仓库外路径），验证要用。
 
 ---
 
