@@ -65,24 +65,28 @@ oracle）。帧 oracle 本身只用 `verify_mpv_frames.build_ffmpeg_command`（f
 
 ## 3. 三阶段实施计划（全部完成 ✅）
 
-> 落地摘要：元数据探测与分析解码都默认走 PyAV，各带环境变量回退开关；
-> 帧 oracle、导出、打包二进制、CvEngine、预览静帧链均未动。
-> - **回退开关**：`ARKNIGHT_MEDIA_PROBE=ffprobe`（元数据）、`ARKNIGHT_A_PT_IMPL=ffmpeg`（分析解码）。
+> ⚠️ **本节及 §4/§5 是"退役前"的设计快照**（当时还保留 ffprobe 元数据回退与双工具配对）。
+> 2026-08-27 之后已**彻底退役 ffprobe**：元数据/分析/音轨全走 PyAV，无元数据 CLI 回退，
+> 认证改绑仅 ffmpeg（schema v2）。**当前真实状态以 §0 / §1 / §10 为准。**
+>
+> 落地摘要：元数据探测与分析解码都默认走 PyAV；帧 oracle、导出、CvEngine、预览静帧链未动。
+> - **回退开关**：仅 `ARKNIGHT_A_PT_IMPL=ffmpeg`（分析解码回退到 ffmpeg.exe CLI）。
+>   元数据无回退（PyAV 唯一；原 `ARKNIGHT_MEDIA_PROBE=ffprobe` 已随退役删除）。
 > - **后端标签**（settings_panel.py）：维持 "FFmpeg软件 A_PT（默认）" 不改名——PyAV 即 FFmpeg
 >   库，名义成立；分发逻辑（`"A_PT"/"FFmpeg" in label`）不受影响。
 > - **验证探针**（在 `.cache/`，已 .gitignore，不进版本库）：
 >   `probe_pyav_metadata.py`、`probe_mediainfo_backend_diff.py`、`probe_scale_area_drift.py`、
->   `probe_analyze_fullfile_equiv.py`。
+>   `probe_analyze_fullfile_equiv.py`、`probe_certify_pyav.py`、`migrate_certs_v2.py`。
 
-### 阶段一｜元数据探测：ffprobe → PyAV ✅
-- 新增 PyAV 探测，产出与 `parse_ffprobe_json` **逐字段一致**的 `MediaInfo`。
-- **保留** `_verify_tool`(ffprobe+ffmpeg) 的 ToolInfo 采集（供 oracle 绑定），只是**不再 spawn ffprobe 读元数据**。
-- **落地**：`probe_media_pyav` + `_pyav_probe_payload`（media_info.py），把 PyAV 元数据拼成
-  ffprobe 形状的 dict 喂给现有 `parse_ffprobe_json`，复用全部校验。`_active_probe_backend()`
-  默认 `pyav`，`ARKNIGHT_MEDIA_PROBE=ffprobe` 回退。流/容器 `duration` 用
-  `_round_to_microsecond` 对齐 ffprobe 的 µs 表示。
+### 阶段一｜元数据探测：ffprobe → PyAV（现已唯一走 PyAV）✅
+- PyAV 探测，产出与旧 `parse_ffprobe_json` **逐字段一致**的 `MediaInfo`。
+- **只保留** `_verify_tool`(ffmpeg) 的 ToolInfo 采集（供认证绑定）；**退役时连 ffprobe 元数据
+  回退也一并删除**（见 §0）。
+- **落地**：`probe_media`（唯一入口）+ `_pyav_probe_payload`（media_info.py），把 PyAV 元数据
+  拼成 ffprobe 形状的 dict 喂给现有 `parse_ffprobe_json`，复用全部校验。流/容器 `duration` 用
+  `_round_to_microsecond` 对齐 µs 表示。
 - **验收（实测）**：1/2/3/4.mp4 四个样本（含坏时间戳 2.mp4）ffprobe 路径与 PyAV 路径的
-  `MediaInfo.as_dict()` **逐字段 IDENTICAL**，两路 `tool_pair_verified` 均为 True。
+  `MediaInfo.as_dict()` **逐字段 IDENTICAL**（退役前的对照验证）。
 
 ### 阶段二｜分析解码：A_PT(ffmpeg CLI) → PyAV + 一致性验证 ✅
 - 已实现 `_analyze_video_pyav_filter`（analyzer.py），经 `analyze_video_with_context` 分发；
@@ -261,4 +265,7 @@ oracle）。帧 oracle 本身只用 `verify_mpv_frames.build_ffmpeg_command`（f
 2. **帧数权威保留 OpenCV `CAP_PROP_FRAME_COUNT`**（未迁 PyAV）：PyAV `stream.frames` 可能
    **低估**实际帧数 → 会截断分析；而 cv2 只会高估、靠 EOF 兜底，安全。若你要彻底去这个
    OpenCV 依赖，需先验证 PyAV frames≥实际（否则回退），可后续做。
-3. **0.2X 裁剪 / 夹心并入**：仍为后续方向，未动。
+3. **第 5 张孤儿证**：`.cache/.../frame_pts/38edc85f.../v1-*.json` 对应
+   `.cache/mpv_spike/pts_fixtures/cfr.mp4`（12 帧测试夹具，非生产样本）。迁移脚本只处理了
+   4 个生产样本，这张未迁。无测试加载它（单测全绿），属无害遗留；若要彻底可补迁或删除。
+4. **0.2X 裁剪 / 夹心并入**：仍为后续方向，未动。
