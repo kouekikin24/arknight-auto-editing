@@ -32,10 +32,12 @@
 
 ## 0. 一句话现状
 
-**ffprobe.exe 已彻底退役并提交**。元数据探测、分析解码、音轨探测全部走 **PyAV**；
+**ffprobe.exe 已彻底退役并物理删除**。元数据探测、分析解码、音轨探测全部走 **PyAV**；
 帧 oracle 与导出仍留 **ffmpeg.exe**；OpenCV 解码后端冻结。帧认证从"双工具配对
-(ffmpeg+ffprobe)"改绑为"**仅 ffmpeg**"（schema 1→2），4 张生产证已**就地迁移**
-（不重跑 oracle）。全量单测 **408 + 90 子测试**绿。工作区干净（仅 `.zcode/` 未跟踪）。
+(ffmpeg+ffprobe)"改绑为"**仅 ffmpeg**"（schema 1→2），**5 张证（4 生产 + 1 夹具）全部
+v2，旧 v1 证已清零**（就地重编码，不重跑 oracle）。随后做了一轮空间清理：项目体积
+**25G → 5.6G**（回收 ~19.4G 调试缓存/实验视频/闲置 bundle，详见 §4.6）。全量单测
+**408 + 90 子测试**绿。工作区干净（仅 `.zcode/` 未跟踪）。
 
 ---
 
@@ -43,6 +45,7 @@
 
 | 提交 | 内容 |
 |---|---|
+| 本提交（HEAD） | docs：记录空间清理（25G→5.6G）、ffprobe/ffplay 物理删除、夹具证迁移、v1 证清零 |
 | `f8d96c8` | docs：标注整合手账 §3-§5 为退役前快照；记录孤儿夹具证 + 退役决定 |
 | `068b5e5` | **refactor：退役 ffprobe**——元数据/分析/音轨走 PyAV；认证改绑仅 ffmpeg（schema v2）；就地迁移 4 证 |
 | `43ea61b` | 元数据探测默认切 PyAV（逐字段一致已验） |
@@ -109,14 +112,29 @@
 
 ---
 
+## 4.6 空间清理记录（2026-08-27，25G → 5.6G）
+
+| 已删除 | 回收 | 说明 |
+|---|---|---|
+| `.cache/mpv_spike/certified_edl/{3_frames,3_ref}` | 12.5G | 3 号样本调试逐帧 PNG（3801 张），一次性诊断产物 |
+| `.cache/norm_test` | 5.5G | 时间戳归一化实验对照视频（A–G + raw.h264），实验已结案 |
+| `tools/ffmpeg-7.1.1` | 349M | 零引用的第二个 bundle（代码硬编码用 7.1.0，见 `media_info.py:27`） |
+| `.cache/pycache-codex-*` ×10 | 148M | 历史审计 pycache 快照 |
+| `tools/ffmpeg-7.1.0/.../{ffprobe,ffplay}.exe` | ~85M | 代码零引用；ffprobe 物理删除=owner 决定 1 落地 |
+
+未删：`PRODUCTION_REAL_SAMPLE_20260816/1/1_certified_export.mp4`（1.5G 认证成品实物，
+owner 拍板留）。剩余 5.6G = `.cache` 3.2G（frame_shots/证书/oracle 证据等运行中有用的）
++ 导出产物 2.1G + tools 303M + .git 40M。清理后全量单测复跑 408+90 绿。
+
+---
+
 ## 5. 留给 owner 的决定（都在 `HANDOFF_PYAV_CONSOLIDATION.md` §10）
 
-1. **是否物理删 `ffprobe.exe`**（gitignored，87MB，代码已不用；我未删，留/删你定）。
+1. ~~是否物理删 `ffprobe.exe`~~ **已落地（2026-08-27 空间清理时删除，含 ffplay.exe）**。
 2. **帧数权威保留 OpenCV `CAP_PROP_FRAME_COUNT`**（未迁 PyAV）：PyAV `stream.frames` 可能低估
    → 截断分析；cv2 只会高估、有 EOF 兜底更安全。若要彻底去这个 OpenCV 依赖，需先验证。
-3. **第 5 张孤儿证**：`.cache/.../frame_pts/38edc85f.../v1-*.json` 对应
-   `.cache/mpv_spike/pts_fixtures/cfr.mp4`（12 帧开发夹具，非生产样本）。未迁；无测试加载；
-   无害遗留。要彻底就补迁（12 帧很快）或删除。
+3. ~~第 5 张孤儿证~~ **已迁移（2026-08-27）**：cfr.mp4 夹具证已重编码为 v2 并自校验
+   certified=True（PASS，12 帧）；同时删除全部 5 张旧 v1 证，`.cache` 已无 v1。
 4. **0.2X 裁剪 / 夹心并入**：仍为后续方向，未动。
 
 ---
@@ -159,6 +177,6 @@
 
 ## 9. 下一步候选（按价值）
 
-1. 若 owner 点头：物理删 `ffprobe.exe`、补迁/删第 5 张夹具证（.cache 彻底无 v1）。
+1. ~~物理删 `ffprobe.exe`、补迁第 5 张夹具证~~ **均已完成（2026-08-27）**。
 2. 后续方向：0.2X 裁剪 / 夹心并入（检测侧规则）；时间戳半无损注入（mkvmerge，外部需求触发）。
 3. 可选加固：指纹报警器、新视频建表提示。
