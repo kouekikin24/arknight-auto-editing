@@ -45,7 +45,8 @@ v2，旧 v1 证已清零**（就地重编码，不重跑 oracle）。随后做�
 
 | 提交 | 内容 |
 |---|---|
-| 本提交（HEAD） | docs：记录空间清理（25G→5.6G）、ffprobe/ffplay 物理删除、夹具证迁移、v1 证清零 |
+| 本提交（HEAD） | build：锁 opencv-python==4.13.0.92（本机验证版，非上游 5.0.0.93）；docs：记录锁定理由 + 样本 2/3 导出冒烟 PASS |
+| `f2582bb` | docs：记录空间清理（25G→5.6G）、ffprobe/ffplay 物理删除、夹具证迁移、v1 证清零 |
 | `f8d96c8` | docs：标注整合手账 §3-§5 为退役前快照；记录孤儿夹具证 + 退役决定 |
 | `068b5e5` | **refactor：退役 ffprobe**——元数据/分析/音轨走 PyAV；认证改绑仅 ffmpeg（schema v2）；就地迁移 4 证 |
 | `43ea61b` | 元数据探测默认切 PyAV（逐字段一致已验） |
@@ -125,6 +126,24 @@ v2，旧 v1 证已清零**（就地重编码，不重跑 oracle）。随后做�
 未删：`PRODUCTION_REAL_SAMPLE_20260816/1/1_certified_export.mp4`（1.5G 认证成品实物，
 owner 拍板留）。剩余 5.6G = `.cache` 3.2G（frame_shots/证书/oracle 证据等运行中有用的）
 + 导出产物 2.1G + tools 303M + .git 40M。清理后全量单测复跑 408+90 绿。
+
+---
+
+## 4.7 版本锁定收尾 + 真实导出冒烟（2026-08-27）
+
+**OpenCV 锁版本（纠偏后的决定）**：`pyproject.toml` 锁 `opencv-python==4.13.0.92`。
+注意这与上游 `requirements.txt`/`uv.lock` 写的 5.0.0.93 **不同**——本机 uv.lock 是从上游
+带过来的旧锁（连 pyproject 里的 av/imageio-ffmpeg 都没有，早已脱节），实际运行环境
+（系统 Python 3.11.9）装的是 4.13.0.92，**全部一致性证据（指纹链 27 点、bit-identical
+探针、408+90 单测、golden）都在它下面产出**。锁 5.0.0.93 反而会强制升级到未验证版本。
+若日后要对齐上游 5.x，必须先复跑一致性探针再换锁。uv.lock 待有 uv 环境时 `uv lock` 重生。
+
+**真实导出冒烟（ffprobe 物理删除后的首次真实链路验证）**：
+`scripts/run_real_sample_certified_export.py --stems 3,2 --output-root .cache/smoke_export_20260827`
+- 样本 3：PASS——证书直接命中 v2（PASS_WITH_HEAD_ANOMALIES，不重扫），导出 1901/1901 帧，
+  PyAV 数帧验收 PASS。
+- 样本 2（坏时间戳）：PASS——683 段 16973/16973 帧，头部 [0,5) 丢 2 帧属既有
+  head-anomaly 裁决的预期行为，验收 PASS。
 
 ---
 

@@ -5,7 +5,12 @@ description = "明日方舟剪辑工具"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
-    "opencv-python",
+    # 锁死在本机实际验证版本：全部一致性证据（指纹链/bit-identical 探针/单测）均在
+    # opencv-python 4.13.0.92 下产出。上游 requirements.txt 与 uv.lock 写的是 5.0.0.93，
+    # 但本机从未按该 lock 同步（uv.lock 本身已与 pyproject 脱节，无 av/imageio-ffmpeg 条目）；
+    # 模板匹配数值随 OpenCV 版本可能漂移，边界帧判定有翻转风险。若日后对齐上游 5.x，
+    # 须先复跑一致性探针再换锁。
+    "opencv-python==4.13.0.92",
     "pillow",
     "imageio-ffmpeg",
     # av 13.x 与打包的 ffmpeg.exe 7.1 同代（libswscale 8），scale=area 输出逐位一致；
