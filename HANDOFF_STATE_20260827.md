@@ -63,7 +63,7 @@ v2，旧 v1 证已清零**（就地重编码，不重跑 oracle）。随后做�
 | **PyAV (av 13.1)** | 元数据探测（`probe_media` 唯一入口）、分析解码（`_analyze_video_pyav_filter`）、音轨探测（`_probe_audio_stream` 主）、预览静帧定帧（`_still_decode_pyav`） |
 | **ffmpeg.exe 7.1** | 帧 PTS oracle（`verify_mpv_frames.build_ffmpeg_command`）、导出（3 模式）、`_verify_tool` 验签 |
 | **OpenCV (cv2)** | 识别本体 `cv2.matchTemplate`（暂停/变速）、成像（resize/cvtColor/absdiff/mean）、帧数权威 `CAP_PROP_FRAME_COUNT`、冻结的解码后端 `_analyze_video_opencv`、CvEngine |
-| **ffprobe.exe** | **已无代码引用**。二进制仍在盘上（87MB、gitignored），待 owner 决定是否删 |
+| **ffprobe.exe** | **已彻底退役**：代码零引用，二进制已物理删除（2026-08-27 空间清理） |
 
 ---
 
