@@ -138,12 +138,22 @@ owner 拍板留）。剩余 5.6G = `.cache` 3.2G（frame_shots/证书/oracle 证
 探针、408+90 单测、golden）都在它下面产出**。锁 5.0.0.93 反而会强制升级到未验证版本。
 若日后要对齐上游 5.x，必须先复跑一致性探针再换锁。uv.lock 待有 uv 环境时 `uv lock` 重生。
 
+**uv.lock 已重新生成（2026-08-28）**：`pip install --user uv`（uv 0.12.7）后 `uv lock`
+从 pyproject 重解析——修正项目版本 0.1.0→26.7.10、补入 `av 13.1.0` 与 `imageio-ffmpeg 0.6.0`、
+opencv-python 按新锁定 5.0.0.93→4.13.0.92。旧锁备份在 `.cache/uv.lock.bak`。
+注意：**本机环境由 pip 手工维护（2026-05-29 装机的 cv2 4.13.0.92），从未 uv sync 过**；
+uv.lock 只服务新环境复现。
+
 **真实导出冒烟（ffprobe 物理删除后的首次真实链路验证）**：
-`scripts/run_real_sample_certified_export.py --stems 3,2 --output-root .cache/smoke_export_20260827`
+`scripts/run_real_sample_certified_export.py --stems 3,2,1,4 --output-root .cache/smoke_export_20260827`
 - 样本 3：PASS——证书直接命中 v2（PASS_WITH_HEAD_ANOMALIES，不重扫），导出 1901/1901 帧，
   PyAV 数帧验收 PASS。
 - 样本 2（坏时间戳）：PASS——683 段 16973/16973 帧，头部 [0,5) 丢 2 帧属既有
   head-anomaly 裁决的预期行为，验收 PASS。
+- 样本 1：PASS——2312 段 81375/81375 帧（验收计数 81376 ∈ {81375,81376}），无丢帧。
+- 样本 4：**撞 3 小时 ffmpeg 超时被杀（非回归）**——2623 段 × 424k 帧的
+  O(段数)/帧 滤镜表达式成本（≈2.2B 次求值/帧），与 2026-08-17 旧档记录完全一致；
+  该样本从未成功导出过，等待"分批寻址导出"（batched-seek export）性能专项。
 
 ---
 
@@ -197,5 +207,7 @@ owner 拍板留）。剩余 5.6G = `.cache` 3.2G（frame_shots/证书/oracle 证
 ## 9. 下一步候选（按价值）
 
 1. ~~物理删 `ffprobe.exe`、补迁第 5 张夹具证~~ **均已完成（2026-08-27）**。
-2. 后续方向：0.2X 裁剪 / 夹心并入（检测侧规则）；时间戳半无损注入（mkvmerge，外部需求触发）。
-3. 可选加固：指纹报警器、新视频建表提示。
+2. **样本 4 导出性能专项：分批寻址导出（batched-seek export）**——当前滤镜方案
+   O(段数)/帧，2623 段规模下超 3h 超时；这是唯一未通过端到端导出的样本。
+3. 后续方向：0.2X 裁剪 / 夹心并入（检测侧规则）；时间戳半无损注入（mkvmerge，外部需求触发）。
+4. 可选加固：指纹报警器、新视频建表提示。
