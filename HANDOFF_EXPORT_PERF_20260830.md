@@ -25,6 +25,14 @@
 
 样本在 `D:\qq下载\920\{1,2,3,4}.mp4`。4 号最长（117.8 分钟、424176 帧、2623 个保留段）。
 
+**代码血统**：owner 即 fork 作者（kouekikin24）。A_PT 是其贡献，已被上游 liemark 合并（PR #9，
+merge commit `ce10360` = 上游 v26.7.23）。主项目 remote：`origin`=kouekikin24（你的 fork）、
+`upstream`=liemark。上游克隆（`arknight-auto-editing-upstream`）的 remote：`origin`=liemark。
+**注意**：打包成品是**上游** build（预览走 cv2 VideoIOThread，无 mpv/PTS 认证）；你的工作区是 fork
+（有 CvEngine/MpvEngine/PTS 认证导出）。分批寻址要进的是 fork 的 `export_pts_schedule`。
+
+**待清理**：`D:\qq下载\920\4_clipped.mp4` 是打包版逐帧导出留下的 5.6 分钟半成品（无音轨），可删。
+
 ---
 
 ## 2. 样本 4 导出性能专项（核心工作）
@@ -39,6 +47,19 @@
 - 3 号（干净 VFR）逐帧一致 PASS；**2 号（坏时间戳）FAIL**：帧数错、输出被压成匀速、内容错位。
 - 原因：trim/concat 依赖 ffmpeg 逐段整理时间戳，坏时间戳源上会自作主张补匀速；**平铺 select 用
   认证 tick 做显式算术，就是为扛坏时间戳设计的，不可替换**。
+
+### 2.2.5 为什么是"自己做"而不是用现成工具 + 与上游速度对比
+
+**成熟方案调研**（结论：没有开箱即用的）：LosslessCut 默认只对齐关键帧（不帧精确）、其 smart-cut
+是实验性；mkvmerge 拆分只能在关键帧；MoviePy 逐帧 Python 解码（更慢）；MLT/GStreamer 是重型 C 框架且
+会把 VFR 归一化成匀速（破坏我们的 PTS 精确）。所以**分批寻址不是重复造轮子**——它就是转码行业标准的
+"分块编码 + 无损拼接"模式，积木全是 ffmpeg 现成的（`-ss` 寻址、concat demuxer `-c copy`）。
+
+**速度对比（实测）**：上游的 trim/concat 滤镜路径在 2 号（683 段）就 **30 分钟超时报废**；我们分批
+8 分钟完成。3 号（108 段）两家都快（~45s vs ~25s）。**段数越多我们越占优**——4 号上游根本出不来。
+
+**ffprobe 删除后的生产导出回归**：1/2/3 号用当前项目（fork）的认证导出冒烟全部 PASS（帧数精确、
+证书命中 v2、无 ffprobe 残留调用）。4 号因段数超时（正是本专项要修的）。
 
 ### 2.3 分批寻址（保留平铺 select 语义，按批寻址）——已实测，**成立**
 原理：把 2623 段切成每批 ~100 段，每批 `-ss` 跳到批首 + `-copyts` 保原始 PTS + 批内平铺
@@ -60,6 +81,16 @@ select/setpts（只含批内段、只减批内间隙），各自编码后 `conca
 把分批寻址整合进 `export_pts_schedule`：① VFR 大段数时启用分批路；② 音频同步分批（批内
 atrim/concat）；③ 可选并行批编码（50 分钟→十几分钟）；④ 回归 1/2/3 号 + 全量 pytest。
 
+**实现要点（原型已趟平，照抄即可）**：
+- 批内视频滤镜直接复用 `analyzer._pts_select_setpts_video_filter(批的子schedule)` —— 它天然就是
+  "相对子schedule首段起点归零、只减批内间隙"，正好是批内语义。
+- **`tpad` 克隆哨兵只加在最后一批**；中间的批不加（否则批间多出重复帧）。
+- 每批寻址：`-ss {批首段start_tick×time_base − 安全裕量~1s} -copyts -i 源`，select 用整数 tick 精确匹配。
+- 拼接：`ffmpeg -f concat -safe 0 -i list.txt -c copy`，list 里给每批（除最后）写
+  `duration {按全局公式算出的批跨度/15360}`——**不写会漂 1 帧**（已踩过）。
+- 原型产物在 `.cache/exp_batched_seek/`（`4_batched.mp4` + `batch_*.mp4`）；对照基准在
+  `.cache/exp_trim_concat_vfr/`（2/3 号有基准）。
+
 ---
 
 ## 3. 版本排查结论（都已定论，别再纠结）
@@ -77,6 +108,17 @@ atrim/concat）；③ 可选并行批编码（50 分钟→十几分钟）；④ 
 ---
 
 ## 4. 环境/工具现状（本次有变化）
+
+### 4.0 ⚠️ 现在有三个不同的 OpenCV 版本在环境里，别搞混
+
+| 在哪 | OpenCV 版本 | 说明 |
+|---|---|---|
+| 本机当前项目实际运行（pyproject 锁定） | **4.13.0.92** | 所有一致性证据（指纹链/golden/单测）都在它下面产出 |
+| 两个打包成品 exe 捆绑 | **4.12.0.88** | 上游构建时打包的，跟运行它的机器无关 |
+| 上游克隆 `.venv`（我建的）+ 上游 requirements.txt | **5.0.0.93** | 上游锁定值 |
+
+含义：测"上游/打包版"用的是 4.12 或 5.0，测"当前项目"用 4.13——比较行为前先确认用的是哪个 cv2。
+OpenCV 5 对齐任务的目标版本是 **5.0.0.93**。
 
 - **OpenCV 锁定 `==4.13.0.92`**（pyproject.toml）——本机实际运行版本，所有一致性证据都在它下面产出。
   上游锁 5.0.0.93，但本机 5/29 装的 4.13，uv.lock 是从上游带过来的旧文件，本机从未按它同步。
@@ -117,4 +159,5 @@ CvEngine/VideoIOThread 保留；解码后端优先 A_PT；导出与帧 oracle �
 | `exp_trim_concat_vfr.py` | 轻方案 trim/concat 对照实验（已证 2 号失败） |
 | `probe_seek_pts.py` | 验证 -ss+-copyts 保原始 PTS |
 | `bench_upstream_speed.py` / `run_upstream_export.py` | 上游导出速度对比 / 手动跑上游 |
-| `monitor_export.ps1` | 加固版导出监控 |
+| `monitor_export.ps1` | 加固版导出监控（**用这个**） |
+| `monitor_analysis.py` | ⚠️ 旧监控（每20s起子进程，会挂死），**别再用** |
