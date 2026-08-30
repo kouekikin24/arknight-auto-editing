@@ -27,6 +27,8 @@
 `HANDOFF_CURRENT.md` / `HANDOFF_TIMING.md` / `HANDOFF_PREVIEW.md` /
 `AV_REVIEW_AUTOVERIFICATION.md` / `CLAUDE_*.md` 均为**更早期历史快照，多处已过时**，
 与本文件冲突时**以本文件为准**。
+`HANDOFF_EXPORT_PERF_20260830.md`（2026-08-30 会话：样本4导出性能专项——分批寻址方案已验证、
+阶段三待做；含大量版本/环境排查结论）是**最新的后续会话交接**，与本文件互补。
 
 ---
 
