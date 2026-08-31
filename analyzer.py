@@ -1630,12 +1630,16 @@ def _pts_bframe_args(encoder_args: list[str]) -> list[str]:
     B-frames were originally disabled (-bf 0) because the container
     post-check read packet-order PTS as the presentation timeline.  The
     post-check now uses order-free invariants, so reordering is safe:
-    2 on NVENC (OBS default), 3 elsewhere (libx264 default).  Measured gain
-    on action-heavy 1080p60 content: ~13-14% smaller files at equal SSIM.
+    2 on NVENC (OBS default), 3 on libx264 (its default).  Other encoders
+    keep -bf 0 — their B-frame support is unverified in this pipeline.
+    Measured gain on action-heavy 1080p60 content: ~13-14% smaller files
+    at equal SSIM.
     """
     if "h264_nvenc" in encoder_args:
         return ["-bf", "2"]
-    return ["-bf", "3"]
+    if "libx264" in encoder_args:
+        return ["-bf", "3"]
+    return ["-bf", "0"]
 
 
 
@@ -2373,7 +2377,8 @@ def _export_pts_video_batched(
         ]
         if last_batch:
             cmd += _pts_sentinel_fix_args(sub)
-        cmd += ["-an", "-movflags", "+faststart", batch_path]
+        # Intermediates feed the concat demuxer, not streaming: no faststart.
+        cmd += ["-an", batch_path]
         _export_progress(
             progress_cb,
             0.01 + 0.84 * (batch_index / len(batches)),

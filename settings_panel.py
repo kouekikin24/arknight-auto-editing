@@ -300,7 +300,7 @@ class SettingsPanel(ttk.LabelFrame):
         self.export_keep_audio_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             tab_export,
-            text="导出时保留音频（段过多时自动跳过精混音，仍出画面）",
+            text="导出时保留音频（段过多时自动分批混音，不影响画面）",
             variable=self.export_keep_audio_var,
         ).grid(row=r + 1, column=0, columnspan=3, sticky=tk.W, pady=(2, 2))
 

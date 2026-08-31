@@ -247,6 +247,10 @@ class AnalyzerPtsExportTests(unittest.TestCase):
         self.assertEqual(
             analyzer._pts_bframe_args(["-c:v", "libx264"]), ["-bf", "3"]
         )
+        # Unverified encoders (qsv/amf/...) keep the legacy safe behavior.
+        self.assertEqual(
+            analyzer._pts_bframe_args(["-c:v", "h264_amf"]), ["-bf", "0"]
+        )
 
     def test_container_postcheck_tolerates_bframe_packet_reorder(self) -> None:
         # With B-frames the packet order is the decode order, so packet-level
