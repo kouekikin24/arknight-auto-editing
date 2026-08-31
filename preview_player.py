@@ -1952,6 +1952,7 @@ class VideoPreviewPlayer(tk.Frame):
             audio_mode = meta.get("audio_mode", "")
             audio_line = {
                 "muxed": "音频：已按保留段混音",
+                "failed_video_only": "音频：混音失败，已降级为无声视频（视频完整）",
                 "skipped_segments": "音频：保留段过多，已按确认导出无声视频",
                 "skipped_unavailable": "音频：FFmpeg 不可用，已按确认导出无声视频",
                 "skipped_probe": "音频：音轨探测失败，已按确认导出无声视频",
