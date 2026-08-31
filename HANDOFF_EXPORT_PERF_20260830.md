@@ -77,19 +77,31 @@ select/setpts（只含批内段、只减批内间隙），各自编码后 `conca
 
 **设计文档**：`DESIGN_EXPORT_BATCHED_SEEK.md`（含阶段二全部实测结论）。
 
-### 2.4 阶段三（未做，下一步）
-把分批寻址整合进 `export_pts_schedule`：① VFR 大段数时启用分批路；② 音频同步分批（批内
-atrim/concat）；③ 可选并行批编码（50 分钟→十几分钟）；④ 回归 1/2/3 号 + 全量 pytest。
+### 2.4 阶段三（2026-08-31 已实施，方案经调研修订为"视频不动 + 音频分批"）
 
-**实现要点（原型已趟平，照抄即可）**：
-- 批内视频滤镜直接复用 `analyzer._pts_select_setpts_video_filter(批的子schedule)` —— 它天然就是
-  "相对子schedule首段起点归零、只减批内间隙"，正好是批内语义。
-- **`tpad` 克隆哨兵只加在最后一批**；中间的批不加（否则批间多出重复帧）。
-- 每批寻址：`-ss {批首段start_tick×time_base − 安全裕量~1s} -copyts -i 源`，select 用整数 tick 精确匹配。
-- 拼接：`ffmpeg -f concat -safe 0 -i list.txt -c copy`，list 里给每批（除最后）写
-  `duration {按全局公式算出的批跨度/15360}`——**不写会漂 1 帧**（已踩过）。
-- 原型产物在 `.cache/exp_batched_seek/`（`4_batched.mp4` + `batch_*.mp4`）；对照基准在
-  `.cache/exp_trim_concat_vfr/`（2/3 号有基准）。
+**重要修订**：调研（`RESEARCH_PHASE3_20260831.md`）证明视频平铺 select 在 2623 段
+**不爆炸**（求值近乎免费，单趟 11 分钟），爆炸的是音频 atrim/concat 图（400 段 120s、
+800 段 >600s）。因此阶段三**没有**做视频分批寻址整合，而是：
+
+1. **音频分批（路线 B）**：`export_pts_schedule` 段数 >400（`_MAX_PTS_SINGLE_GRAPH_AUDIO_RANGES`）
+   且有音轨时，视频单趟照常（`-an`），音频走 `_export_audio_pts_batched()`——每 100 段一批
+   `-ss` 寻址 + 批内 atrim/concat → 无损 PCM（.nut）→ concat 清单写精确 duration →
+   混流时一遍 AAC。音频失败**降级为无声成片**（audio_mode=failed_video_only），不删视频；
+   取消（TaskCancelled）仍传播并清理。
+2. **容器时长地雷修复（既有生产 bug，新发现）**：tpad 克隆哨兵继承源帧病态 duration →
+   幻影包 + 容器声明时长垃圾值（2_baseline 声明 383s 实际 283s）。修复 = 编码命令加
+   `-bsf:v setts` 把克隆帧钉到分析坐标（`_pts_sentinel_fix_args`，按 PTS 阈值识别，
+   不按包序号，健康源上为 no-op）；导出后跑 `_verify_pts_export_container` 容器后检
+   （克隆位/声明时长/尾部单调为硬检查；包数在坏时间戳源上允许 ±2 软差异——muxer 对
+   非单调 pts 会去重，既有行为）。
+3. **等价性验证**：样本 2 全量（683 段）带音频端到端——视频与基准逐帧一致（16973/16973，
+   内容差 0.0000）；音频分批 vs 老单图样本级 A/B：长度完全一致、最大差 -96dB（0.3% 样本，
+   seek 解码噪声，AAC 重编码后不可闻）；pytest 全量 **415 passed + 90 subtests**（基线
+   408 + 新增 7）。样本 4 端到端（2623 段带音频 + 对照 A2a 基准）进行中。
+
+**未做/可选**：视频分批寻址 + 并行编码（编码 2-4 倍加速，现总耗时已被"视频单趟 11 分钟"
+覆盖，优先级降）；CFR 分支千段同样有病（调研 B），留给未来 CFR 源出现时再处理；
+真实 5.6 分钟剪法重建（对齐 v3）放弃（内容对齐被 imageio 0.74% 拉伸破坏）。
 
 ---
 

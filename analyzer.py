@@ -37,6 +37,15 @@ _MAX_FILTER_EXPORT_RANGES_AUDIO = 80
 # 2623 kept ranges (sample 4).
 _MAX_PTS_EXPORT_RANGES = 4000
 
+# The video side of the VFR branch (one flat select + gap-sum setpts) stays
+# cheap into the thousands of segments; the AUDIO side does not: a single
+# atrim/concat graph grows superlinearly with segment count (measured: 400
+# segments ≈ 120 s, 800 segments > 600 s).  Beyond this threshold the audio
+# therefore leaves the shared graph and is built by batched passes instead
+# (see _export_audio_pts_batched).
+_MAX_PTS_SINGLE_GRAPH_AUDIO_RANGES = 400
+_PTS_AUDIO_BATCH_SIZE = 100
+
 
 @dataclass
 class _FFmpegPipe:
@@ -1893,6 +1902,216 @@ def _pts_select_setpts_video_filter(
     )
 
 
+def _pts_sentinel_clone_position(
+    schedule: Sequence[tuple[int, int, int, int]],
+) -> tuple[int, int, int]:
+    """Compute where the terminal tpad clone MUST sit on the output timeline.
+
+    Returns ``(scheduled, clone_pts, step)``: the real frame count, the clone's
+    output-timeline position (right after the last real frame), and the last
+    segment's average frame step.  ``tpad`` computes the clone position from
+    the *source* frame's duration metadata, which on bad-timestamp VFR sources
+    can be pathological (observed 41,743,872 ticks ≈ 44 min on sample 2),
+    producing a far-future phantom packet and a garbage container duration.
+    The encode therefore pins the clone with an absolute ``setts`` bitstream
+    filter override built from these values.
+    """
+    scheduled = sum(end - start for start, end, _st, _et in schedule)
+    first_tick = schedule[0][2]
+    clone_pts = schedule[-1][3] - first_tick
+    for index in range(len(schedule) - 1):
+        gap_start = schedule[index][3]
+        gap_end = schedule[index + 1][2]
+        if gap_end > gap_start:
+            clone_pts -= gap_end - gap_start
+    last_sf, last_ef, last_st, last_et = schedule[-1]
+    step = max(1, round((last_et - last_st) / (last_ef - last_sf)))
+    return scheduled, clone_pts, step
+
+
+def _pts_sentinel_fix_args(
+    schedule: Sequence[tuple[int, int, int, int]],
+) -> list[str]:
+    """``-bsf:v setts`` args pinning the terminal clone to its analytic slot.
+
+    The clone is identified by *position* (the only packet beyond
+    ``clone_pts - 1``), not by packet index: real output frames never exceed
+    ``clone_pts - step``, so the rewrite is a no-op on healthy sources and
+    stays correct even if a pathological source shifts the packet count.
+    """
+    _scheduled, clone_pts, step = _pts_sentinel_clone_position(schedule)
+    threshold = clone_pts - 1
+    expression = (
+        f"setts=pts='if(gt(PTS,{threshold}),{clone_pts},PTS)'"
+        f":duration='if(gt(PTS,{threshold}),{step},DURATION)'"
+    )
+    return ["-bsf:v", expression]
+
+
+def _verify_pts_export_container(
+    output_path: str,
+    schedule: Sequence[tuple[int, int, int, int]],
+    *,
+    time_base: Fraction,
+) -> None:
+    """Container-level post-check for the VFR PTS export.
+
+    Decode-level checks cannot see the phantom packet the tpad clone becomes
+    on bad-timestamp sources (it is skipped by decoders in a standalone file
+    but turns into a real frame after concat).  Verify the packet table
+    directly: clone position, monotonic tail, and a sane declared stream
+    duration.
+
+    Packet count is intentionally a soft check: on badly non-monotonic
+    sources the muxer clamps/drops duplicate-PTS frames (observed on sample
+    2, pre-existing and content-identical to the accepted baseline), so the
+    count may differ from ``scheduled + 1`` by a small bounded amount.  The
+    anti-phantom invariants (clone position, declared duration) stay exact.
+    """
+    import av
+
+    scheduled, clone_pts, step = _pts_sentinel_clone_position(schedule)
+    container = av.open(output_path)
+    try:
+        video = container.streams.video[0]
+        declared = video.duration
+        count = 0
+        prev_pts = None
+        last_pts = None
+        for packet in container.demux(video):
+            if packet.pts is None:
+                continue
+            count += 1
+            prev_pts, last_pts = last_pts, packet.pts
+    finally:
+        container.close()
+    problems: list[str] = []
+    if abs(count - (scheduled + 1)) > 2:
+        problems.append(f"包数 {count} 与预期 {scheduled + 1} 偏差超过 2")
+    elif count != scheduled + 1:
+        print(
+            f"[analyzer] 容器后检提示：包数 {count}，预期 {scheduled + 1}，"
+            "差值在坏时间戳源的已知 muxer 行为范围内"
+        )
+    if last_pts != clone_pts:
+        problems.append(f"末包 pts {last_pts} != 预期克隆位 {clone_pts}")
+    if prev_pts is not None and last_pts is not None and last_pts <= prev_pts:
+        problems.append(f"PTS 非单调: {prev_pts} -> {last_pts}")
+    if declared is not None and abs(declared - (clone_pts + step)) > max(step, 1):
+        problems.append(
+            f"容器声明时长 {declared} 与预期 {clone_pts + step} 不符"
+            f"（time_base={time_base}）"
+        )
+    if problems:
+        raise RuntimeError("PTS 导出容器后检失败: " + "; ".join(problems))
+
+
+def _export_audio_pts_batched(
+    video_path: str,
+    schedule: Sequence[tuple[int, int, int, int]],
+    *,
+    time_base: Fraction,
+    ffmpeg: str,
+    tmpdir: str,
+    progress_cb=None,
+    cancel_cb=None,
+    ffmpeg_timeout: float = 1800.0,
+) -> str:
+    """Build the audio track for a large PTS schedule in bounded batches.
+
+    A single atrim/concat graph grows superlinearly with segment count
+    (measured: 400 segments ≈ 120 s, 800 segments > 600 s), while the video
+    side stays cheap — so audio leaves the shared graph beyond
+    ``_MAX_PTS_SINGLE_GRAPH_AUDIO_RANGES`` and is built here instead.
+
+    Each batch holds at most ``_PTS_AUDIO_BATCH_SIZE`` segments, addressed by
+    tick-exact ``Fraction`` seconds (never frame/fps arithmetic), concatenated
+    inside the batch and stored as lossless PCM in a .nut container.  Per-batch
+    AAC would drift at every join (measured +1280 samples per boundary from
+    priming); PCM intermediates keep the joins sample-exact, and the single
+    final AAC encode happens at mux time.  Returns the concat list file whose
+    entries carry precise ``duration`` directives (without them the demuxer
+    derives batch lengths from file metadata and boundaries drift).
+    """
+    batch_files: list[str] = []
+    durations: list[Fraction] = []
+    total_batches = (
+        len(schedule) + _PTS_AUDIO_BATCH_SIZE - 1
+    ) // _PTS_AUDIO_BATCH_SIZE
+    for start in range(0, len(schedule), _PTS_AUDIO_BATCH_SIZE):
+        _check_export_cancel(cancel_cb)
+        sub = schedule[start:start + _PTS_AUDIO_BATCH_SIZE]
+        batch_index = start // _PTS_AUDIO_BATCH_SIZE
+        lines: list[str] = []
+        labels: list[str] = []
+        for index, (_sf, _ef, start_tick, end_tick) in enumerate(sub):
+            start_seconds = _fraction_filter_seconds(start_tick * time_base)
+            end_seconds = _fraction_filter_seconds(end_tick * time_base)
+            lines.append(
+                f"[0:a:0]atrim=start={start_seconds}:end={end_seconds},"
+                f"asetpts=PTS-STARTPTS[a{index}]"
+            )
+            labels.append(f"[a{index}]")
+        lines.append(
+            "".join(labels) + f"concat=n={len(sub)}:v=0:a=1[outa]"
+        )
+        filter_file = os.path.join(tmpdir, f"audio-batch-{batch_index}.txt")
+        Path(filter_file).write_text(";\n".join(lines), encoding="utf-8")
+        batch_path = os.path.join(tmpdir, f"audio-batch-{batch_index}.nut")
+        seek_seconds = max(0.0, float(sub[0][2] * time_base) - 1.0)
+        # Input-side -t stops the decode at the batch tail; without it every
+        # batch decodes to EOF (staircase waste, observed in the prototype).
+        read_seconds = float(sub[-1][3] * time_base) - seek_seconds + 0.5
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-ss",
+            f"{seek_seconds:.9f}",
+            "-t",
+            f"{read_seconds:.9f}",
+            "-copyts",
+            "-i",
+            video_path,
+            "-filter_complex_script",
+            filter_file,
+            "-map",
+            "[outa]",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "nut",
+            batch_path,
+        ]
+        _run_ffmpeg_interruptible(
+            cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb
+        )
+        batch_files.append(batch_path)
+        durations.append(
+            sum(
+                (end_tick - start_tick) * time_base
+                for _sf, _ef, start_tick, end_tick in sub
+            )
+        )
+        _export_progress(
+            progress_cb,
+            0.90 + 0.08 * (batch_index + 1) / total_batches,
+            0,
+            f"音频分批导出中…（{batch_index + 1}/{total_batches} 批）",
+        )
+    list_path = os.path.join(tmpdir, "audio-concat.txt")
+    lines = []
+    for index, (batch_path, duration) in enumerate(zip(batch_files, durations)):
+        lines.append(f"file '{Path(batch_path).as_posix()}'")
+        if index < len(batch_files) - 1:
+            lines.append(f"duration {_fraction_filter_seconds(duration)}")
+    Path(list_path).write_text("\n".join(lines), encoding="utf-8")
+    return list_path
+
+
 def export_pts_schedule(
     video_path: str,
     output_path: str,
@@ -1949,6 +2168,15 @@ def export_pts_schedule(
     )
     ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
     has_audio = bool(include_audio and source_has_audio)
+    # Beyond the single-graph audio ceiling the shared atrim/concat graph
+    # grows superlinearly with segment count and would stall the whole
+    # export, so large schedules keep the video pass audio-free and build
+    # the audio track in bounded batches afterwards (PCM intermediates, one
+    # final AAC encode at mux time).
+    batch_audio = (
+        has_audio and len(schedule) > _MAX_PTS_SINGLE_GRAPH_AUDIO_RANGES
+    )
+    graph_audio = has_audio and not batch_audio
     with tempfile.TemporaryDirectory() as tmpdir:
         filter_file = os.path.join(tmpdir, "pts-filter.txt")
         # VFR schedules use one flat select/setpts pass over the source; the
@@ -1959,7 +2187,7 @@ def export_pts_schedule(
         concat_inputs: list[str] = []
         if frame_pts_status == "vfr":
             lines.append(_pts_select_setpts_video_filter(schedule))
-            if has_audio:
+            if graph_audio:
                 audio_inputs: list[str] = []
                 for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
                     start_seconds = _fraction_filter_seconds(start_tick * time_base)
@@ -1980,7 +2208,7 @@ def export_pts_schedule(
                     f"setpts=PTS-STARTPTS[v{index}]"
                 )
                 concat_inputs.append(f"[v{index}]")
-                if has_audio:
+                if graph_audio:
                     start_seconds = _fraction_filter_seconds(start_tick * time_base)
                     end_seconds = _fraction_filter_seconds(end_tick * time_base)
                     lines.append(
@@ -1988,7 +2216,7 @@ def export_pts_schedule(
                         f"asetpts=PTS-STARTPTS[a{index}]"
                     )
                     concat_inputs.append(f"[a{index}]")
-            if has_audio:
+            if graph_audio:
                 lines.append(
                     "".join(concat_inputs)
                     + f"concat=n={len(schedule)}:v=1:a=1[outv][outa]"
@@ -2015,7 +2243,7 @@ def export_pts_schedule(
             "-map",
             "[outv]",
         ]
-        if has_audio:
+        if graph_audio:
             cmd += ["-map", "[outa]"]
         cmd += ["-fps_mode:v", output_fps_mode]
         cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
@@ -2031,8 +2259,16 @@ def export_pts_schedule(
                 "-frames:v",
                 str(scheduled_written + 1),
             ]
-        cmd += ["-c:a", "aac"] if has_audio else ["-an"]
-        cmd += ["-movflags", "+faststart", output_path]
+            # Pin the terminal tpad clone to its analytic position: tpad
+            # inherits the source frame's duration, which is pathological on
+            # bad-timestamp VFR sources and would otherwise create a
+            # far-future phantom packet and a garbage declared duration.
+            cmd += _pts_sentinel_fix_args(schedule)
+        cmd += ["-c:a", "aac"] if graph_audio else ["-an"]
+        video_target = output_path
+        if batch_audio:
+            video_target = os.path.join(tmpdir, "video-only.mp4")
+        cmd += ["-movflags", "+faststart", video_target]
 
         _check_export_cancel(cancel_cb)
         _export_progress(
@@ -2044,19 +2280,98 @@ def export_pts_schedule(
         try:
             _run_ffmpeg_interruptible(cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb)
         except BaseException:
-            if os.path.isfile(output_path):
-                try:
-                    os.remove(output_path)
-                except OSError:
-                    pass
+            for stale in (output_path, video_target):
+                if os.path.isfile(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
             raise
+
+        audio_mode = "disabled"
+        if batch_audio:
+            # Audio is built only after the video pass succeeded; an audio
+            # failure degrades to the (already complete) silent video instead
+            # of deleting the whole export.
+            try:
+                audio_list = _export_audio_pts_batched(
+                    video_path,
+                    schedule,
+                    time_base=time_base,
+                    ffmpeg=ffmpeg,
+                    tmpdir=tmpdir,
+                    progress_cb=progress_cb,
+                    cancel_cb=cancel_cb,
+                    ffmpeg_timeout=ffmpeg_timeout,
+                )
+                mux_cmd = [
+                    ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostats",
+                    "-i",
+                    video_target,
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    audio_list,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    output_path,
+                ]
+                _run_ffmpeg_interruptible(
+                    mux_cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb
+                )
+                audio_mode = "muxed"
+            except TaskCancelled:
+                for stale in (output_path, video_target):
+                    if os.path.isfile(stale):
+                        try:
+                            os.remove(stale)
+                        except OSError:
+                            pass
+                raise
+            except BaseException as exc:
+                print(f"[analyzer] 音频分批导出失败，降级为无声成片: {exc}")
+                audio_mode = "failed_video_only"
+            if audio_mode == "failed_video_only" and os.path.isfile(video_target):
+                os.replace(video_target, output_path)
+            elif os.path.isfile(video_target):
+                os.remove(video_target)
+        elif graph_audio:
+            audio_mode = "muxed"
+        elif include_audio:
+            audio_mode = "no_stream"
 
     if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
         raise RuntimeError("PTS 导出器未生成有效输出文件")
+    if frame_pts_status == "vfr":
+        # Decode-level checks are blind to phantom packets; verify the packet
+        # table itself (count, clone position, monotonicity, declared duration).
+        _verify_pts_export_container(
+            output_path, schedule, time_base=time_base
+        )
     written = scheduled_written
     _export_progress(progress_cb, 1.0, written, "认证 PTS 导出完成")
     return written, reported_total_frames, {
-        "audio_mode": "muxed" if has_audio else ("no_stream" if include_audio else "disabled"),
+        "audio_mode": audio_mode,
+        "pts_audio_consumer": (
+            "batched_pcm" if batch_audio
+            else "single_graph" if graph_audio
+            else "none"
+        ),
         "pts_table_consumed": True,
         "pts_consumer": (
             "ffmpeg_select_pts_setpts_flat"
