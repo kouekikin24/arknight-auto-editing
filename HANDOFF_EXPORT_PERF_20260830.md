@@ -3,8 +3,9 @@
 > 本文件是**本次会话**的交接。宏观现状仍以 `HANDOFF_STATE_20260827.md` 为准（ffprobe 退役、
 > PyAV 整合、证书 v2 等）。本文件聚焦这次新做的：**样本 4 导出性能（阶段三已完成）** +
 > v26.7.23 导出失败根因实锤（§3.1）。
-> 分支 `fix/preview-pacing-metrics`，最新提交 `acbaf0b`，工作区干净（仅 `.zcode/` 未跟踪）。
+> 分支 `fix/preview-pacing-metrics`，最新提交 `de76aa6`，工作区干净（仅 `.zcode/` 未跟踪）。
 > 配套：`RESEARCH_PHASE3_20260831.md`（阶段三前置调研，提交 `042b53c`）。
+> 阶段三提交链：`95b2c30`（实现）→ `acbaf0b`（GUI 降级提示）→ `de76aa6`（本文档）。
 
 ---
 
