@@ -1642,6 +1642,28 @@ def _pts_bframe_args(encoder_args: list[str]) -> list[str]:
     return ["-bf", "0"]
 
 
+def _audio_bitrate_args(video_path: str, *, default: int = 128000) -> list[str]:
+    """Align the final AAC bitrate with the source audio's bitrate.
+
+    Re-encoding above the source rate buys nothing — the detail lost by the
+    source's lossy encode is unrecoverable; below it adds avoidable
+    generation loss.  Falls back to 128k when the rate is unreadable.
+    """
+    bit_rate = None
+    try:
+        import av
+
+        with av.open(video_path) as container:
+            audio_streams = container.streams.audio
+            if audio_streams:
+                bit_rate = audio_streams[0].bit_rate
+    except Exception:
+        bit_rate = None
+    if not bit_rate or bit_rate <= 0:
+        bit_rate = default
+    return ["-b:a", str(int(bit_rate))]
+
+
 
 def _export_progress(progress_cb, ratio, written=0, status: str | None = None) -> None:
     """Call UI progress callback; support optional status string (3rd arg)."""
@@ -2281,7 +2303,7 @@ def _export_pts_video_single_pass(
         # bad-timestamp VFR sources and would otherwise create a
         # far-future phantom packet and a garbage declared duration.
         cmd += _pts_sentinel_fix_args(schedule)
-    cmd += ["-c:a", "aac"] if graph_audio else ["-an"]
+    cmd += ["-c:a", "aac"] + _audio_bitrate_args(video_path) if graph_audio else ["-an"]
     cmd += ["-movflags", "+faststart", output_path]
 
     _export_progress(
@@ -2584,6 +2606,7 @@ def export_pts_schedule(
                     "copy",
                     "-c:a",
                     "aac",
+                ] + _audio_bitrate_args(video_path) + [
                     "-movflags",
                     "+faststart",
                     output_path,

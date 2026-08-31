@@ -252,6 +252,23 @@ class AnalyzerPtsExportTests(unittest.TestCase):
             analyzer._pts_bframe_args(["-c:v", "h264_amf"]), ["-bf", "0"]
         )
 
+    def test_audio_bitrate_aligns_with_source(self) -> None:
+        fake_stream = mock.MagicMock()
+        fake_stream.bit_rate = 96000
+        fake_container = mock.MagicMock()
+        fake_container.streams.audio = [fake_stream]
+        fake_container.__enter__.return_value = fake_container
+        with mock.patch("av.open", return_value=fake_container):
+            self.assertEqual(
+                analyzer._audio_bitrate_args("x.mp4"), ["-b:a", "96000"]
+            )
+
+    def test_audio_bitrate_falls_back_to_128k_when_unreadable(self) -> None:
+        with mock.patch("av.open", side_effect=OSError("boom")):
+            self.assertEqual(
+                analyzer._audio_bitrate_args("x.mp4"), ["-b:a", "128000"]
+            )
+
     def test_container_postcheck_tolerates_bframe_packet_reorder(self) -> None:
         # With B-frames the packet order is the decode order, so packet-level
         # PTS is legitimately non-monotonic; order-free invariants must pass.
