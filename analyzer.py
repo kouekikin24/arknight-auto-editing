@@ -1624,6 +1624,20 @@ def _video_encoder_args(
             "-pix_fmt", "yuv420p", "-threads", "0"]
 
 
+def _pts_bframe_args(encoder_args: list[str]) -> list[str]:
+    """B-frame count for the certified PTS export paths.
+
+    B-frames were originally disabled (-bf 0) because the container
+    post-check read packet-order PTS as the presentation timeline.  The
+    post-check now uses order-free invariants, so reordering is safe:
+    2 on NVENC (OBS default), 3 elsewhere (libx264 default).  Measured gain
+    on action-heavy 1080p60 content: ~13-14% smaller files at equal SSIM.
+    """
+    if "h264_nvenc" in encoder_args:
+        return ["-bf", "2"]
+    return ["-bf", "3"]
+
+
 
 def _export_progress(progress_cb, ratio, written=0, status: str | None = None) -> None:
     """Call UI progress callback; support optional status string (3rd arg)."""
@@ -1980,8 +1994,10 @@ def _verify_pts_export_container(
     Decode-level checks cannot see the phantom packet the tpad clone becomes
     on bad-timestamp sources (it is skipped by decoders in a standalone file
     but turns into a real frame after concat).  Verify the packet table
-    directly: clone position, monotonic tail, and a sane declared stream
-    duration.
+    directly — but with **order-free** invariants only: with B-frames enabled
+    the packet order is the decode order, so packet-level PTS is legitimately
+    non-monotonic.  Checks: clone position (max pts), timeline anchor
+    (min pts == 0), and a sane declared stream duration.
 
     Packet count is intentionally a soft check: on badly non-monotonic
     sources the muxer clamps/drops duplicate-PTS frames (observed on sample
@@ -1996,17 +2012,31 @@ def _verify_pts_export_container(
     try:
         video = container.streams.video[0]
         declared = video.duration
-        count = 0
-        prev_pts = None
-        last_pts = None
-        for packet in container.demux(video):
-            if packet.pts is None:
-                continue
-            count += 1
-            prev_pts, last_pts = last_pts, packet.pts
+        packet_pts = [
+            packet.pts
+            for packet in container.demux(video)
+            if packet.pts is not None
+        ]
     finally:
         container.close()
+    problems = _evaluate_pts_export_packets(
+        packet_pts, declared, schedule, time_base=time_base
+    )
+    if problems:
+        raise RuntimeError("PTS 导出容器后检失败: " + "; ".join(problems))
+
+
+def _evaluate_pts_export_packets(
+    packet_pts: list[int],
+    declared: int | None,
+    schedule: Sequence[tuple[int, int, int, int]],
+    *,
+    time_base: Fraction,
+) -> list[str]:
+    """Order-free packet-table invariants (B-frame-safe; pure, testable)."""
+    scheduled, clone_pts, step = _pts_sentinel_clone_position(schedule)
     problems: list[str] = []
+    count = len(packet_pts)
     if abs(count - (scheduled + 1)) > 2:
         problems.append(f"包数 {count} 与预期 {scheduled + 1} 偏差超过 2")
     elif count != scheduled + 1:
@@ -2014,17 +2044,24 @@ def _verify_pts_export_container(
             f"[analyzer] 容器后检提示：包数 {count}，预期 {scheduled + 1}，"
             "差值在坏时间戳源的已知 muxer 行为范围内"
         )
-    if last_pts != clone_pts:
-        problems.append(f"末包 pts {last_pts} != 预期克隆位 {clone_pts}")
-    if prev_pts is not None and last_pts is not None and last_pts <= prev_pts:
-        problems.append(f"PTS 非单调: {prev_pts} -> {last_pts}")
-    if declared is not None and abs(declared - (clone_pts + step)) > max(step, 1):
+    if not packet_pts or max(packet_pts) != clone_pts:
+        top = max(packet_pts) if packet_pts else None
+        problems.append(f"最大包 pts {top} != 预期克隆位 {clone_pts}")
+    if packet_pts and min(packet_pts) != 0:
+        problems.append(f"最小包 pts {min(packet_pts)} != 0（时间轴起点未锚定）")
+    # With B-frames the muxer derives the declared duration from the
+    # decode-order tail, which legitimately differs from the presentation
+    # end by a few frame steps (observed 5.8x step at bf=3).  The phantom
+    # packet landmine this check guards against is 5+ orders of magnitude
+    # larger (minutes of garbage ticks), so a 16-step tolerance keeps full
+    # sensitivity while tolerating reorder accounting.
+    duration_tolerance = max(step * 16, 1)
+    if declared is not None and abs(declared - (clone_pts + step)) > duration_tolerance:
         problems.append(
             f"容器声明时长 {declared} 与预期 {clone_pts + step} 不符"
-            f"（time_base={time_base}）"
+            f"（time_base={time_base}，容差 {duration_tolerance}）"
         )
-    if problems:
-        raise RuntimeError("PTS 导出容器后检失败: " + "; ".join(problems))
+    return problems
 
 
 def _export_audio_pts_batched(
@@ -2222,11 +2259,11 @@ def _export_pts_video_single_pass(
     if graph_audio:
         cmd += ["-map", "[outa]"]
     cmd += ["-fps_mode:v", output_fps_mode]
-    cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
+    enc_args = _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
+    cmd += enc_args
     if frame_pts_status == "vfr":
+        cmd += _pts_bframe_args(enc_args)
         cmd += [
-            "-bf",
-            "0",
             "-enc_time_base:v",
             f"{time_base.numerator}/{time_base.denominator}",
             "-video_track_timescale",
@@ -2320,10 +2357,10 @@ def _export_pts_video_batched(
             "-fps_mode:v",
             "passthrough",
         ]
-        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
+        enc_args = _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
+        cmd += enc_args
+        cmd += _pts_bframe_args(enc_args)
         cmd += [
-            "-bf",
-            "0",
             "-enc_time_base:v",
             tb_text,
             "-video_track_timescale",

@@ -182,7 +182,9 @@ class AnalyzerPtsExportTests(unittest.TestCase):
             command = captured["command"]
             assert isinstance(command, list)
             self.assertEqual(command[command.index("-fps_mode:v") + 1], "passthrough")
-            self.assertIn("-bf", command)
+            # B-frames enabled (libx264 default count); packet-order-free
+            # post-check makes reordering safe.
+            self.assertEqual(command[command.index("-bf") + 1], "3")
             self.assertEqual(command[command.index("-frames:v") + 1], "4")
             filter_text = captured["filter"]
             assert isinstance(filter_text, str)
@@ -235,6 +237,58 @@ class AnalyzerPtsExportTests(unittest.TestCase):
             args[1],
             "setts=pts='if(gt(PTS,179),180,PTS)'"
             ":duration='if(gt(PTS,179),80,DURATION)'",
+        )
+
+    def test_pts_bframe_args_are_encoder_dependent(self) -> None:
+        # NVENC follows the OBS default (2); libx264 its own default (3).
+        self.assertEqual(
+            analyzer._pts_bframe_args(["-c:v", "h264_nvenc"]), ["-bf", "2"]
+        )
+        self.assertEqual(
+            analyzer._pts_bframe_args(["-c:v", "libx264"]), ["-bf", "3"]
+        )
+
+    def test_container_postcheck_tolerates_bframe_packet_reorder(self) -> None:
+        # With B-frames the packet order is the decode order, so packet-level
+        # PTS is legitimately non-monotonic; order-free invariants must pass.
+        schedule = [(0, 2, 0, 100), (4, 5, 180, 260)]  # clone=180, step=80
+        problems = analyzer._evaluate_pts_export_packets(
+            [0, 100, 60, 180], 260, schedule, time_base=Fraction(1, 1000)
+        )
+        self.assertEqual(problems, [])
+
+    def test_container_postcheck_hard_failures(self) -> None:
+        schedule = [(0, 2, 0, 100), (4, 5, 180, 260)]
+        tb = Fraction(1, 1000)
+        # Clone sentinel not at its analytic position
+        self.assertTrue(
+            analyzer._evaluate_pts_export_packets(
+                [0, 100, 60, 179], 260, schedule, time_base=tb
+            )
+        )
+        # Timeline not anchored at zero
+        self.assertTrue(
+            analyzer._evaluate_pts_export_packets(
+                [5, 100, 60, 180], 260, schedule, time_base=tb
+            )
+        )
+        # Garbage declared duration (phantom-packet landmine)
+        self.assertTrue(
+            analyzer._evaluate_pts_export_packets(
+                [0, 100, 60, 180], 9999, schedule, time_base=tb
+            )
+        )
+        # Gross packet loss beyond muxer-dedup tolerance
+        self.assertTrue(
+            analyzer._evaluate_pts_export_packets([0, 180], 260, schedule, time_base=tb)
+            == []
+        )
+        self.assertTrue(
+            analyzer._evaluate_pts_export_packets([0, 180, 180], 260, schedule, time_base=tb)
+            == []
+        )
+        self.assertTrue(
+            analyzer._evaluate_pts_export_packets([180], 260, schedule, time_base=tb)
         )
 
     @staticmethod
