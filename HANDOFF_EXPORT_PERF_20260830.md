@@ -169,10 +169,13 @@ FFmpeg 官方（"用最慢且你能等的预设"、crf 17-28 为合理区间）�
 率失真修正：同档位 nvenc cq22 的 SSIM 其实高于 x264 crf22（0.9961 vs 0.9855），
 拉到同清晰度比，真实效率差 ≈1.5 倍（不是表面的 2.9 倍）。
 
-**改造（已合入）**：PTS 视频路径 `-bf 0` → `_pts_bframe_args`（nvenc 2 / 其他 3）；
+**改造（已合入）**：PTS 视频路径 `-bf 0` → `_pts_bframe_args`（**nvenc 2 / libx264 3 /
+其余编码器保持 0**——qsv/amf 的 B 帧支持未在本管线验证，审查时收窄）；
 容器后检改为**乱序不变量**（max pts == 克隆位、min pts == 0、声明时长容差放宽到
 16×step——B 帧重排尾部记账差几帧属正常，幻影雷比它大 5 个数量级仍必捕；
 包数 ±2 软差不变）。setts 哨兵修复按 PTS 阈值匹配，天然免疫重排。
+另随审查修复：分批中间件不再写 faststart（只喂拼接器，白重写）；GUI"保留音频"
+文案更正为"自动分批混音"；nvenc+B帧 真机补测通过（样本 3）。
 
 **验证**：pytest 424+90 全绿（+3 新测试）；样本 3/2 回归 PASS（对照禁B基准
 0 差异帧，容差=头部 32 帧 ±2tick + 末帧克隆位——基准早于 setts 修复）；
@@ -305,3 +308,8 @@ CvEngine/VideoIOThread 保留；解码后端优先 A_PT；导出与帧 oracle �
 | `diag_audio_drift2.py` | 音频漂移探针定位（真实音频静音段易误配，慎用） |
 | `.cache/research_phase3/` | 调研脚本与数据（A/B/C/D/F 各工作流，见 RESEARCH 附录） |
 | `.cache/sentinel_fix/` | 阶段三验证产物（A_pathological/B_full_fixed/B_full_audio/4_full_audio） |
+| `e2e_13619_real_scale.py` | 13,619 段真实规模 e2e（合成清单走生产导出，帧数/PTS/音频/后检；`--verify-only` 跳过导出只验产物） |
+| `e2e_bf_regress.py` | B 帧解禁回归（样本3/2，对照禁B基准；头部32帧±2tick + 末帧克隆位容差） |
+| `compare_4_1_vs_4.py` | 新旧成片内容比对（抽样帧灰度差）+ 包络互相关音画同步初筛 |
+| `sync_deepcheck.py` | 音画同步深度复核（瞬态最近邻匹配 + 源片基线对照） |
+| `enc_compare/` + `enc_rd_test.py` / `enc_opt_test.py` | 编码器率失真实测（x264/nvenc × B帧 × 预设，SSIM 对照） |
