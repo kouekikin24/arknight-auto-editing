@@ -255,7 +255,9 @@ CvEngine/VideoIOThread 保留；解码后端优先 A_PT；导出与帧 oracle �
    （PCM 中间件）；②混流失败降级不删产物；③克隆帧幻影修复（setts bsf）。根因证据在 §3.1，
    实现参照 fork 的 `95b2c30`。
 3. 可选：并行批编码 / CFR 千段验证 / OpenCV 5 对齐（装 5.0.0.93 复跑一致性探针）。
-4. 收尾：`arknight-preview-pack.zip` 仍未审计，不要运行。
+4. ~~收尾：`arknight-preview-pack.zip` 仍未审计~~ **已静态审计（2026-09-01）**：纯 Python
+   快照（9 个文件，8/3 日期，结构与本仓库同名文件一致），零网络/子进程/eval/删文件调用，
+   无二进制——安全，未运行、未采用。
 
 ## 7. 关键脚本索引（`.cache/`，gitignored）
 
