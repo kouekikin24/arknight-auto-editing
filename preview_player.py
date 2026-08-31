@@ -1839,6 +1839,10 @@ class VideoPreviewPlayer(tk.Frame):
                 include_audio=include_audio,
                 video_path=video_path,
                 ffmpeg_path=ffmpeg_path,
+                # enforce_media_certification guarantees a complete MediaInfo
+                # at this point (checked above), i.e. the certified PTS route
+                # whose batched audio has no segment-count ceiling.
+                pts_certified=enforce_media_certification,
             )
         except Exception as exc:
             return messagebox.showerror("导出准备失败", str(exc))

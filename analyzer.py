@@ -31,11 +31,19 @@ _GPU_PROBE_LOCK = threading.Lock()
 # 超过阈值则跳过，改走有帧进度的稳妥逐帧路径（不改变删帧语义）
 _MAX_FILTER_EXPORT_RANGES = 120
 _MAX_FILTER_EXPORT_RANGES_AUDIO = 80
-# The certified PTS exporter uses one compact trim/atrim chain per segment in
-# a filter_complex_script file, so the per-segment filter cost is linear and
-# the ceiling only guards against absurd graphs.  Real business plans reach
-# 2623 kept ranges (sample 4).
+# The CFR/legacy branch of the certified PTS exporter keeps one trim chain
+# per segment; graph cost grows superlinearly with segment count (measured
+# ~quadratic in RESEARCH_PHASE3_20260831 §B), so this ceiling stays a hard
+# error there.  The VFR branch fails differently: one flat select/setpts
+# expression pair per pass overflows FFmpeg's expression evaluator stack
+# somewhere between 4000 and 13619 terms (observed 2026-09-01: exit code
+# 0xC00000FD on a 13619-range schedule), so larger VFR schedules switch to
+# batched-seek export (_export_pts_video_batched) instead of raising.
 _MAX_PTS_EXPORT_RANGES = 4000
+# Segments per video batch on the batched VFR route; each batch builds its
+# own bounded select/setpts expressions.  A 4000-term single pass is
+# probe-verified and 2623 is e2e-validated; 2000 keeps 2x margin under both.
+_PTS_VIDEO_BATCH_RANGES = 2000
 
 # The video side of the VFR branch (one flat select + gap-sum setpts) stays
 # cheap into the thousands of segments; the AUDIO side does not: a single
@@ -1351,8 +1359,14 @@ def _kept_frame_ranges(to_del: np.ndarray) -> list[tuple[int, int]]:
 
 def inspect_export_plan(to_del, include_audio: bool = True, *,
                         video_path: str | None = None,
-                        ffmpeg_path: str | None = None) -> dict:
-    """Return a preflight plan without conflating probe failure with no audio."""
+                        ffmpeg_path: str | None = None,
+                        pts_certified: bool = False) -> dict:
+    """Return a preflight plan without conflating probe failure with no audio.
+
+    pts_certified marks the certified PTS export route: its audio is batched
+    beyond _MAX_PTS_SINGLE_GRAPH_AUDIO_RANGES, so segment count alone cannot
+    overflow the audio graph and the legacy range ceiling does not apply.
+    """
     if isinstance(to_del, TimelinePlan):
         plan = to_del
     else:
@@ -1371,7 +1385,9 @@ def inspect_export_plan(to_del, include_audio: bool = True, *,
             resolved_ffmpeg = resolve_ffmpeg_path(ffmpeg_path)
         except FileNotFoundError:
             block_reasons.append("ffmpeg_unavailable")
-    if include_audio and n_ranges > audio_limit:
+    # The 80-range ceiling only protects the legacy in-graph audio mixer
+    # (_export_video_impl); the certified PTS route batches audio instead.
+    if include_audio and n_ranges > audio_limit and not pts_certified:
         drop_reasons.append("too_many_ranges")
     if include_audio and video_path is not None:
         if resolved_ffmpeg is None:
@@ -1870,6 +1886,8 @@ def _normalize_pts_schedule(
 
 def _pts_select_setpts_video_filter(
     schedule: Sequence[tuple[int, int, int, int]],
+    *,
+    clone_guard: bool = True,
 ) -> str:
     """Single-pass, tick-exact selection and renumbering for large schedules.
 
@@ -1894,11 +1912,14 @@ def _pts_select_setpts_video_filter(
                 f"-if(gte(PTS,{gap_end}),{gap_end - gap_start},0)"
             )
     # The terminal clone guard gives the last real frame a positive muxed
-    # duration; without it the final frame is lost at EOF.
+    # duration; without it the final frame is lost at EOF.  Batched exports
+    # only enable it on the final batch — a mid-stream clone would surface
+    # as a duplicated frame after concatenation.
+    tail = ",tpad=stop_mode=clone:stop=1" if clone_guard else ""
     return (
         f"[0:v:0]select='{conditions}',"
-        f"setpts='{''.join(expression_parts)}',"
-        "tpad=stop_mode=clone:stop=1[outv]"
+        f"setpts='{''.join(expression_parts)}'"
+        f"{tail}[outv]"
     )
 
 
@@ -2112,6 +2133,253 @@ def _export_audio_pts_batched(
     return list_path
 
 
+def _export_pts_video_single_pass(
+    video_path: str,
+    schedule: Sequence[tuple[int, int, int, int]],
+    *,
+    time_base: Fraction,
+    output_fps_mode: str,
+    graph_audio: bool,
+    quality: int,
+    use_gpu: bool,
+    gpu_encoder: str,
+    ffmpeg: str,
+    tmpdir: str,
+    output_path: str,
+    scheduled_written: int,
+    frame_pts_status: str | None,
+    progress_cb=None,
+    cancel_cb=None,
+    ffmpeg_timeout: float,
+) -> None:
+    """Encode the whole PTS schedule in one ffmpeg pass (the filter graph
+    fits within FFmpeg's expression evaluator limits)."""
+    filter_file = os.path.join(tmpdir, "pts-filter.txt")
+    # VFR schedules use one flat select/setpts pass over the source; the
+    # cfr branch keeps the proven per-segment trim/setpts/concat chains.
+    # Interval end ticks are by construction the last kept frame's natural
+    # end (pts + duration), so nothing shortens a segment tail either way.
+    lines: list[str] = []
+    concat_inputs: list[str] = []
+    if frame_pts_status == "vfr":
+        lines.append(_pts_select_setpts_video_filter(schedule))
+        if graph_audio:
+            audio_inputs: list[str] = []
+            for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
+                start_seconds = _fraction_filter_seconds(start_tick * time_base)
+                end_seconds = _fraction_filter_seconds(end_tick * time_base)
+                lines.append(
+                    f"[0:a:0]atrim=start={start_seconds}:end={end_seconds},"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                )
+                audio_inputs.append(f"[a{index}]")
+            lines.append(
+                "".join(audio_inputs)
+                + f"concat=n={len(schedule)}:v=0:a=1[outa]"
+            )
+    else:
+        for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
+            lines.append(
+                f"[0:v:0]trim=start_pts={start_tick}:end_pts={end_tick},"
+                f"setpts=PTS-STARTPTS[v{index}]"
+            )
+            concat_inputs.append(f"[v{index}]")
+            if graph_audio:
+                start_seconds = _fraction_filter_seconds(start_tick * time_base)
+                end_seconds = _fraction_filter_seconds(end_tick * time_base)
+                lines.append(
+                    f"[0:a:0]atrim=start={start_seconds}:end={end_seconds},"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                )
+                concat_inputs.append(f"[a{index}]")
+        if graph_audio:
+            lines.append(
+                "".join(concat_inputs)
+                + f"concat=n={len(schedule)}:v=1:a=1[outv][outa]"
+            )
+        else:
+            lines.append(
+                "".join(concat_inputs)
+                + f"concat=n={len(schedule)}:v=1:a=0[outv]"
+            )
+    Path(filter_file).write_text(";\n".join(lines), encoding="utf-8")
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-copyts",
+        "-i",
+        video_path,
+        "-filter_complex_script",
+        filter_file,
+        "-map",
+        "[outv]",
+    ]
+    if graph_audio:
+        cmd += ["-map", "[outa]"]
+    cmd += ["-fps_mode:v", output_fps_mode]
+    cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
+    if frame_pts_status == "vfr":
+        cmd += [
+            "-bf",
+            "0",
+            "-enc_time_base:v",
+            f"{time_base.numerator}/{time_base.denominator}",
+            "-video_track_timescale",
+            str(time_base.denominator),
+            # One extra slot for the terminal clone guard.
+            "-frames:v",
+            str(scheduled_written + 1),
+        ]
+        # Pin the terminal tpad clone to its analytic position: tpad
+        # inherits the source frame's duration, which is pathological on
+        # bad-timestamp VFR sources and would otherwise create a
+        # far-future phantom packet and a garbage declared duration.
+        cmd += _pts_sentinel_fix_args(schedule)
+    cmd += ["-c:a", "aac"] if graph_audio else ["-an"]
+    cmd += ["-movflags", "+faststart", output_path]
+
+    _export_progress(
+        progress_cb,
+        0.01,
+        0,
+        f"按认证 PTS 时间表导出（{len(schedule)} 段）…",
+    )
+    _run_ffmpeg_interruptible(cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb)
+
+
+def _export_pts_video_batched(
+    video_path: str,
+    schedule: Sequence[tuple[int, int, int, int]],
+    *,
+    time_base: Fraction,
+    quality: int,
+    use_gpu: bool,
+    gpu_encoder: str,
+    ffmpeg: str,
+    tmpdir: str,
+    output_path: str,
+    progress_cb=None,
+    cancel_cb=None,
+    ffmpeg_timeout: float,
+) -> None:
+    """VFR video pass for schedules beyond the single-pass expression ceiling.
+
+    Each batch reuses the single-pass flat select/setpts filter on its own
+    sub-schedule (bounded expression size), seeks with ``-ss`` + ``-copyts``
+    so only the batch span is decoded, and stops at a ``-frames:v`` cap.
+    Batches are stream-copied together by the concat demuxer with exact
+    duration directives (batch span = sum of kept tick lengths, so the
+    concatenated timeline equals the global compressed tick axis).  Only the
+    final batch carries the terminal clone guard and its setts fix; a
+    mid-stream clone would surface as a duplicated frame.
+    """
+    batch_size = _PTS_VIDEO_BATCH_RANGES
+    batches = [
+        schedule[index : index + batch_size]
+        for index in range(0, len(schedule), batch_size)
+    ]
+    tb_text = f"{time_base.numerator}/{time_base.denominator}"
+    tb_float = float(time_base)
+    batch_files: list[str] = []
+    batch_span_ticks: list[int] = []
+    frames_done = 0
+    for batch_index, sub in enumerate(batches):
+        last_batch = batch_index == len(batches) - 1
+        batch_frames = sum(end - start for start, end, _st, _et in sub)
+        batch_span = sum(end_tick - start_tick for _sf, _ef, start_tick, end_tick in sub)
+        filter_file = os.path.join(tmpdir, f"pts-filter-{batch_index:04d}.txt")
+        Path(filter_file).write_text(
+            _pts_select_setpts_video_filter(sub, clone_guard=last_batch),
+            encoding="utf-8",
+        )
+        batch_path = os.path.join(tmpdir, f"vbatch-{batch_index:04d}.mp4")
+        seek_seconds = max(0.0, sub[0][2] * tb_float - 1.0)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-ss",
+            f"{seek_seconds:.9f}",
+            # -copyts keeps certified source ticks so the batch filter still
+            # addresses frames in global tick coordinates.
+            "-copyts",
+            "-i",
+            video_path,
+            "-filter_complex_script",
+            filter_file,
+            "-map",
+            "[outv]",
+            "-fps_mode:v",
+            "passthrough",
+        ]
+        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
+        cmd += [
+            "-bf",
+            "0",
+            "-enc_time_base:v",
+            tb_text,
+            "-video_track_timescale",
+            str(time_base.denominator),
+            # The output cap stops the batch right after its last kept frame
+            # instead of decoding to EOF; the final batch gets one extra slot
+            # for the terminal clone guard.
+            "-frames:v",
+            str(batch_frames + (1 if last_batch else 0)),
+        ]
+        if last_batch:
+            cmd += _pts_sentinel_fix_args(sub)
+        cmd += ["-an", "-movflags", "+faststart", batch_path]
+        _export_progress(
+            progress_cb,
+            0.01 + 0.84 * (batch_index / len(batches)),
+            frames_done,
+            f"视频分批导出 {batch_index + 1}/{len(batches)}（每批 ≤{batch_size} 段）…",
+        )
+        _run_ffmpeg_interruptible(cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb)
+        batch_files.append(batch_path)
+        batch_span_ticks.append(batch_span)
+        frames_done += batch_frames
+        _check_export_cancel(cancel_cb)
+
+    concat_list = os.path.join(tmpdir, "video-concat.txt")
+    list_lines: list[str] = []
+    for batch_index, batch_path in enumerate(batch_files):
+        list_lines.append(f"file '{Path(batch_path).as_posix()}'")
+        if batch_index < len(batch_files) - 1:
+            seconds = batch_span_ticks[batch_index] * tb_float
+            list_lines.append(f"duration {seconds:.9f}")
+    Path(concat_list).write_text("\n".join(list_lines), encoding="utf-8")
+    _export_progress(progress_cb, 0.86, frames_done, "拼接视频分批…")
+    concat_cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        concat_list,
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    _run_ffmpeg_interruptible(concat_cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb)
+
+
 def export_pts_schedule(
     video_path: str,
     output_path: str,
@@ -2155,13 +2423,13 @@ def export_pts_schedule(
     schedule = _normalize_pts_schedule(intervals, time_base=time_base)
     if schedule[-1][1] > source_frame_count:
         raise ValueError("PTS interval exceeds the certified source frame count")
-    if len(schedule) > _MAX_PTS_EXPORT_RANGES:
+    if frame_pts_status not in {None, "cfr", "vfr"}:
+        raise ValueError("frame_pts_status must be cfr, vfr, or None")
+    if frame_pts_status != "vfr" and len(schedule) > _MAX_PTS_EXPORT_RANGES:
         raise RuntimeError(
             f"认证 PTS 时间表段数超过 FFmpeg 滤镜安全上限（{_MAX_PTS_EXPORT_RANGES}），"
             "拒绝回退到 FPS 导出"
         )
-    if frame_pts_status not in {None, "cfr", "vfr"}:
-        raise ValueError("frame_pts_status must be cfr, vfr, or None")
     output_fps_mode = "cfr" if frame_pts_status == "cfr" else "passthrough"
     scheduled_written = sum(
         end - start for start, end, _start_tick, _end_tick in schedule
@@ -2177,108 +2445,55 @@ def export_pts_schedule(
         has_audio and len(schedule) > _MAX_PTS_SINGLE_GRAPH_AUDIO_RANGES
     )
     graph_audio = has_audio and not batch_audio
+    # One flat select/setpts expression pair per pass overflows FFmpeg's
+    # expression evaluator stack somewhere between 4000 and 13619 terms
+    # (observed: exit code 0xC00000FD), so beyond the single-pass ceiling
+    # the VFR video pass is encoded in bounded -ss-seeked batches and
+    # stitched with the concat demuxer.  Audio batching is independent of
+    # this and stays unchanged.
+    batched_video = (
+        frame_pts_status == "vfr" and len(schedule) > _MAX_PTS_EXPORT_RANGES
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
-        filter_file = os.path.join(tmpdir, "pts-filter.txt")
-        # VFR schedules use one flat select/setpts pass over the source; the
-        # cfr branch keeps the proven per-segment trim/setpts/concat chains.
-        # Interval end ticks are by construction the last kept frame's natural
-        # end (pts + duration), so nothing shortens a segment tail either way.
-        lines: list[str] = []
-        concat_inputs: list[str] = []
-        if frame_pts_status == "vfr":
-            lines.append(_pts_select_setpts_video_filter(schedule))
-            if graph_audio:
-                audio_inputs: list[str] = []
-                for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
-                    start_seconds = _fraction_filter_seconds(start_tick * time_base)
-                    end_seconds = _fraction_filter_seconds(end_tick * time_base)
-                    lines.append(
-                        f"[0:a:0]atrim=start={start_seconds}:end={end_seconds},"
-                        f"asetpts=PTS-STARTPTS[a{index}]"
-                    )
-                    audio_inputs.append(f"[a{index}]")
-                lines.append(
-                    "".join(audio_inputs)
-                    + f"concat=n={len(schedule)}:v=0:a=1[outa]"
-                )
-        else:
-            for index, (_start_frame, _end_frame, start_tick, end_tick) in enumerate(schedule):
-                lines.append(
-                    f"[0:v:0]trim=start_pts={start_tick}:end_pts={end_tick},"
-                    f"setpts=PTS-STARTPTS[v{index}]"
-                )
-                concat_inputs.append(f"[v{index}]")
-                if graph_audio:
-                    start_seconds = _fraction_filter_seconds(start_tick * time_base)
-                    end_seconds = _fraction_filter_seconds(end_tick * time_base)
-                    lines.append(
-                        f"[0:a:0]atrim=start={start_seconds}:end={end_seconds},"
-                        f"asetpts=PTS-STARTPTS[a{index}]"
-                    )
-                    concat_inputs.append(f"[a{index}]")
-            if graph_audio:
-                lines.append(
-                    "".join(concat_inputs)
-                    + f"concat=n={len(schedule)}:v=1:a=1[outv][outa]"
-                )
-            else:
-                lines.append(
-                    "".join(concat_inputs)
-                    + f"concat=n={len(schedule)}:v=1:a=0[outv]"
-                )
-        Path(filter_file).write_text(";\n".join(lines), encoding="utf-8")
-
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostats",
-            "-copyts",
-            "-i",
-            video_path,
-            "-filter_complex_script",
-            filter_file,
-            "-map",
-            "[outv]",
-        ]
-        if graph_audio:
-            cmd += ["-map", "[outa]"]
-        cmd += ["-fps_mode:v", output_fps_mode]
-        cmd += _video_encoder_args(quality, use_gpu, gpu_encoder, ffmpeg_path=ffmpeg)
-        if frame_pts_status == "vfr":
-            cmd += [
-                "-bf",
-                "0",
-                "-enc_time_base:v",
-                f"{time_base.numerator}/{time_base.denominator}",
-                "-video_track_timescale",
-                str(time_base.denominator),
-                # One extra slot for the terminal clone guard.
-                "-frames:v",
-                str(scheduled_written + 1),
-            ]
-            # Pin the terminal tpad clone to its analytic position: tpad
-            # inherits the source frame's duration, which is pathological on
-            # bad-timestamp VFR sources and would otherwise create a
-            # far-future phantom packet and a garbage declared duration.
-            cmd += _pts_sentinel_fix_args(schedule)
-        cmd += ["-c:a", "aac"] if graph_audio else ["-an"]
         video_target = output_path
         if batch_audio:
             video_target = os.path.join(tmpdir, "video-only.mp4")
-        cmd += ["-movflags", "+faststart", video_target]
-
         _check_export_cancel(cancel_cb)
-        _export_progress(
-            progress_cb,
-            0.01,
-            0,
-            f"按认证 PTS 时间表导出（{len(schedule)} 段）…",
-        )
         try:
-            _run_ffmpeg_interruptible(cmd, timeout=ffmpeg_timeout, cancel_cb=cancel_cb)
+            if batched_video:
+                _export_pts_video_batched(
+                    video_path,
+                    schedule,
+                    time_base=time_base,
+                    quality=quality,
+                    use_gpu=use_gpu,
+                    gpu_encoder=gpu_encoder,
+                    ffmpeg=ffmpeg,
+                    tmpdir=tmpdir,
+                    output_path=video_target,
+                    progress_cb=progress_cb,
+                    cancel_cb=cancel_cb,
+                    ffmpeg_timeout=ffmpeg_timeout,
+                )
+            else:
+                _export_pts_video_single_pass(
+                    video_path,
+                    schedule,
+                    time_base=time_base,
+                    output_fps_mode=output_fps_mode,
+                    graph_audio=graph_audio,
+                    quality=quality,
+                    use_gpu=use_gpu,
+                    gpu_encoder=gpu_encoder,
+                    ffmpeg=ffmpeg,
+                    tmpdir=tmpdir,
+                    output_path=video_target,
+                    scheduled_written=scheduled_written,
+                    frame_pts_status=frame_pts_status,
+                    progress_cb=progress_cb,
+                    cancel_cb=cancel_cb,
+                    ffmpeg_timeout=ffmpeg_timeout,
+                )
         except BaseException:
             for stale in (output_path, video_target):
                 if os.path.isfile(stale):
@@ -2373,6 +2588,9 @@ def export_pts_schedule(
             else "none"
         ),
         "pts_table_consumed": True,
+        "pts_video_consumer": (
+            "batched_seek_concat" if batched_video else "single_pass"
+        ),
         "pts_consumer": (
             "ffmpeg_select_pts_setpts_flat"
             if frame_pts_status == "vfr"

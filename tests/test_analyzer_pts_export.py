@@ -383,6 +383,150 @@ class AnalyzerPtsExportTests(unittest.TestCase):
             self.assertEqual(content.count("duration 25.6"), 2)
             self.assertEqual(content.count(".nut"), 3)
 
+    def test_vfr_beyond_expression_ceiling_routes_to_batched_video(self) -> None:
+        intervals = self._big_intervals(analyzer._MAX_PTS_EXPORT_RANGES + 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"source")
+            (root / "ffmpeg.exe").write_bytes(b"ffmpeg")
+
+            def fake_batched(_path, _sched, **kwargs):
+                Path(kwargs["output_path"]).write_bytes(b"batched")
+
+            with mock.patch.object(
+                analyzer, "_export_pts_video_batched", side_effect=fake_batched
+            ) as batched_mock, mock.patch.object(
+                analyzer, "_export_pts_video_single_pass"
+            ) as single_mock, mock.patch.object(
+                analyzer, "_verify_pts_export_container"
+            ):
+                written, _total, metadata = analyzer.export_pts_schedule(
+                    str(source),
+                    str(output),
+                    intervals,
+                    time_base=Fraction(1, 1000),
+                    source_frame_count=len(intervals),
+                    reported_total_frames=len(intervals),
+                    quality=8,
+                    ffmpeg_path=str(root / "ffmpeg.exe"),
+                    frame_pts_status="vfr",
+                )
+
+            batched_mock.assert_called_once()
+            single_mock.assert_not_called()
+            self.assertEqual(metadata["pts_video_consumer"], "batched_seek_concat")
+            self.assertEqual(written, len(intervals))
+
+    def test_vfr_within_ceiling_stays_single_pass(self) -> None:
+        intervals = self._big_intervals(3)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"source")
+            (root / "ffmpeg.exe").write_bytes(b"ffmpeg")
+
+            def fake_single(_path, _sched, **kwargs):
+                Path(kwargs["output_path"]).write_bytes(b"single")
+
+            with mock.patch.object(
+                analyzer, "_export_pts_video_single_pass", side_effect=fake_single
+            ) as single_mock, mock.patch.object(
+                analyzer, "_export_pts_video_batched"
+            ) as batched_mock, mock.patch.object(
+                analyzer, "_verify_pts_export_container"
+            ):
+                _written, _total, metadata = analyzer.export_pts_schedule(
+                    str(source),
+                    str(output),
+                    intervals,
+                    time_base=Fraction(1, 1000),
+                    source_frame_count=len(intervals),
+                    reported_total_frames=len(intervals),
+                    quality=8,
+                    ffmpeg_path=str(root / "ffmpeg.exe"),
+                    frame_pts_status="vfr",
+                )
+
+            single_mock.assert_called_once()
+            batched_mock.assert_not_called()
+            self.assertEqual(metadata["pts_video_consumer"], "single_pass")
+
+    def test_batched_video_split_math(self) -> None:
+        # 4500 one-frame segments, 256-tick frames with a 356-tick gap each
+        intervals = tuple(
+            {
+                "source_frame_range": [index * 2, index * 2 + 1],
+                "pts_tick_range": [index * 612, index * 612 + 256],
+            }
+            for index in range(4500)
+        )
+        schedule = analyzer._normalize_pts_schedule(
+            intervals, time_base=Fraction(1, 1000)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            captured: list = []
+
+            def fake_run(command, *, timeout, cancel_cb):
+                captured.append(list(command))
+                Path(command[-1]).write_bytes(b"encoded")
+
+            with mock.patch.object(
+                analyzer, "_run_ffmpeg_interruptible", side_effect=fake_run
+            ):
+                analyzer._export_pts_video_batched(
+                    "source.mp4",
+                    schedule,
+                    time_base=Fraction(1, 1000),
+                    quality=8,
+                    use_gpu=False,
+                    gpu_encoder="",
+                    ffmpeg="ffmpeg",
+                    tmpdir=temporary,
+                    output_path=str(root / "video.mp4"),
+                    ffmpeg_timeout=1800.0,
+                )
+
+            # 4500 segments -> 3 batches (2000+2000+500) + 1 concat
+            self.assertEqual(len(captured), 4)
+            batch_cmds, concat_cmd = captured[:3], captured[3]
+            self.assertEqual(concat_cmd[concat_cmd.index("-f") + 1], "concat")
+            self.assertEqual(concat_cmd[concat_cmd.index("-c") + 1], "copy")
+            for command in batch_cmds:
+                self.assertEqual(
+                    command[command.index("-fps_mode:v") + 1], "passthrough"
+                )
+                self.assertIn("-an", command)
+            # Per-batch expressions stay bounded; clone guard only on the last.
+            filters = [
+                (root / f"pts-filter-{index:04d}.txt").read_text(encoding="utf-8")
+                for index in range(3)
+            ]
+            self.assertNotIn("tpad", filters[0])
+            self.assertNotIn("tpad", filters[1])
+            self.assertIn("tpad=stop_mode=clone:stop=1", filters[2])
+            self.assertEqual(filters[0].count("between(pts,"), 2000)
+            self.assertEqual(filters[2].count("between(pts,"), 500)
+            # -frames:v caps each batch; only the last gets the clone slot.
+            self.assertEqual(batch_cmds[0][batch_cmds[0].index("-frames:v") + 1], "2000")
+            self.assertEqual(batch_cmds[1][batch_cmds[1].index("-frames:v") + 1], "2000")
+            self.assertEqual(batch_cmds[2][batch_cmds[2].index("-frames:v") + 1], "501")
+            # -ss seeks to each batch's first segment start tick minus 1s.
+            self.assertEqual(batch_cmds[0][batch_cmds[0].index("-ss") + 1], "0.000000000")
+            self.assertEqual(batch_cmds[1][batch_cmds[1].index("-ss") + 1], "1223.000000000")
+            self.assertEqual(batch_cmds[2][batch_cmds[2].index("-ss") + 1], "2447.000000000")
+            # Only the last batch pins the terminal clone via setts.
+            self.assertNotIn("-bsf:v", batch_cmds[0])
+            self.assertNotIn("-bsf:v", batch_cmds[1])
+            self.assertIn("-bsf:v", batch_cmds[2])
+            # Concat list carries exact per-batch durations (span ticks / 1000).
+            concat_list = (root / "video-concat.txt").read_text(encoding="utf-8")
+            self.assertEqual(concat_list.count("duration 512.000000000"), 2)
+            self.assertEqual(concat_list.count("vbatch-"), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

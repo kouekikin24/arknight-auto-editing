@@ -53,6 +53,72 @@ class ExportPreflightTests(unittest.TestCase):
         self.assertEqual(plan["audio_limit"], 80)
         self.assertTrue(plan["audio_drop_requires_confirmation"])
 
+    def test_pts_certified_route_never_drops_audio_for_range_count(self) -> None:
+        # The certified PTS exporter batches audio beyond
+        # _MAX_PTS_SINGLE_GRAPH_AUDIO_RANGES, so segment count alone must not
+        # trigger the legacy audio-drop confirmation (real cuts reach 13619
+        # kept ranges on sample 4).
+        mask = np.ones(161, dtype=bool)
+        mask[::2] = False
+        plan = analyzer.inspect_export_plan(
+            mask, include_audio=True, pts_certified=True
+        )
+        self.assertEqual(plan["n_ranges"], 81)
+        self.assertFalse(plan["audio_drop_requires_confirmation"])
+        self.assertNotIn("too_many_ranges", plan["audio_drop_reasons"])
+
+    @staticmethod
+    def _overshoot_intervals(count: int) -> list[dict]:
+        return [
+            {
+                "source_frame_range": (index * 2, index * 2 + 1),
+                "pts_tick_range": (index * 20, index * 20 + 10),
+            }
+            for index in range(count)
+        ]
+
+    def test_vfr_schedule_beyond_ceiling_is_accepted_for_batching(self) -> None:
+        # VFR schedules beyond _MAX_PTS_EXPORT_RANGES are no longer rejected:
+        # they route to batched-seek export (the single-pass expression
+        # overflows FFmpeg's evaluator stack at five-digit term counts).
+        from fractions import Fraction
+
+        intervals = self._overshoot_intervals(analyzer._MAX_PTS_EXPORT_RANGES + 1)
+        with mock.patch.object(
+            analyzer,
+            "resolve_ffmpeg_path",
+            side_effect=RuntimeError("sentinel: reached ffmpeg resolution"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "sentinel"):
+                analyzer.export_pts_schedule(
+                    "src.mp4",
+                    "out.mp4",
+                    intervals,
+                    time_base=Fraction(1, 15360),
+                    source_frame_count=2 * len(intervals),
+                    reported_total_frames=2 * len(intervals),
+                    quality=6,
+                    frame_pts_status="vfr",
+                )
+
+    def test_cfr_schedule_cap_unchanged(self) -> None:
+        # The CFR per-segment trim/concat branch keeps its hard ceiling:
+        # graph cost grows superlinearly with segment count there.
+        from fractions import Fraction
+
+        intervals = self._overshoot_intervals(analyzer._MAX_PTS_EXPORT_RANGES + 1)
+        with self.assertRaisesRegex(RuntimeError, "滤镜安全上限"):
+            analyzer.export_pts_schedule(
+                "src.mp4",
+                "out.mp4",
+                intervals,
+                time_base=Fraction(1, 15360),
+                source_frame_count=2 * len(intervals),
+                reported_total_frames=2 * len(intervals),
+                quality=6,
+                frame_pts_status="cfr",
+            )
+
     def test_disabling_audio_never_requires_confirmation(self) -> None:
         mask = np.ones(161, dtype=bool)
         mask[::2] = False
