@@ -1661,7 +1661,11 @@ def _audio_bitrate_args(video_path: str, *, default: int = 128000) -> list[str]:
         bit_rate = None
     if not bit_rate or bit_rate <= 0:
         bit_rate = default
-    return ["-b:a", str(int(bit_rate))]
+    # Clamp into the sane stereo-AAC range: a pathological source (e.g. a PCM
+    # track reporting >1 Mbps) must not produce an out-of-range -b:a that
+    # would fail the final encode.
+    bit_rate = max(16000, min(int(bit_rate), 320000))
+    return ["-b:a", str(bit_rate)]
 
 
 

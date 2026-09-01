@@ -269,6 +269,19 @@ class AnalyzerPtsExportTests(unittest.TestCase):
                 analyzer._audio_bitrate_args("x.mp4"), ["-b:a", "128000"]
             )
 
+    def test_audio_bitrate_clamps_pathological_source_rate(self) -> None:
+        # A PCM source track reporting >1 Mbps must not yield an -b:a the
+        # AAC encoder would reject.
+        fake_stream = mock.MagicMock()
+        fake_stream.bit_rate = 1_536_000
+        fake_container = mock.MagicMock()
+        fake_container.streams.audio = [fake_stream]
+        fake_container.__enter__.return_value = fake_container
+        with mock.patch("av.open", return_value=fake_container):
+            self.assertEqual(
+                analyzer._audio_bitrate_args("x.mp4"), ["-b:a", "320000"]
+            )
+
     def test_container_postcheck_tolerates_bframe_packet_reorder(self) -> None:
         # With B-frames the packet order is the decode order, so packet-level
         # PTS is legitimately non-monotonic; order-free invariants must pass.
@@ -368,6 +381,8 @@ class AnalyzerPtsExportTests(unittest.TestCase):
             mux_cmd = captured[-1]
             self.assertEqual(mux_cmd[mux_cmd.index("-c:v") + 1], "copy")
             self.assertEqual(mux_cmd[mux_cmd.index("-c:a") + 1], "aac")
+            # Source bitrate unreadable on the fake file → 128k fallback.
+            self.assertEqual(mux_cmd[mux_cmd.index("-b:a") + 1], "128000")
 
     def test_audio_batch_failure_degrades_to_silent_video(self) -> None:
         intervals = self._big_intervals(401)
