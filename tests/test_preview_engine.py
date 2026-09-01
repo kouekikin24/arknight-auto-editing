@@ -441,6 +441,90 @@ class PreviewEngineContractTests(unittest.TestCase):
             self.assertEqual(edl.preview_tick_collision_frames, (1,))
             self.assertIn("1", edl.path.read_text(encoding="utf-8"))
 
+    def test_dipped_head_deleted_row_inside_kept_span_is_flagged(self):
+        # Regression for the ascending merge: an out-of-order high head row
+        # (f3 pts=400) opened and immediately closed the kept interval, so the
+        # deleted f4 row (pts=250, inside the kept [100,300) span) was silently
+        # published without collision metadata.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = _certified_media(
+                root,
+                [
+                    {"n": 0, "pts": 0, "duration": 40},
+                    {"n": 1, "pts": 40, "duration": 40},
+                    {"n": 2, "pts": 80, "duration": 40},
+                    {"n": 3, "pts": 400, "duration": 40},
+                    {"n": 4, "pts": 250, "duration": 40},
+                    {"n": 5, "pts": 100, "duration": 40},
+                    {"n": 6, "pts": 150, "duration": 150},
+                ],
+                head_anomaly_limit=32,
+            )
+            plan = TimelinePlan.from_deleted_ranges(7, [(0, 5)])
+            edl = build_certified_edl(CertifiedEdlRequest(media, plan, 0, 0), root / "edl")
+            self.assertEqual(edl.preview_tick_collision_frames, (4,))
+            # A deleted collision row snaps to the next kept segment's start,
+            # never to the end of the preview.
+            self.assertEqual(
+                edl.virtual_time_for_source(4, snap=True), Fraction(0, 1)
+            )
+
+    def test_dipped_head_row_below_span_is_not_falsely_flagged(self):
+        # Regression for the false-positive direction: the merge kept an
+        # interval open across a dipped head row (f1 pts=50) that lies below
+        # the kept span [100,180), flagging it and tripping the >1 collision
+        # adjudication gate.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = _certified_media(
+                root,
+                [
+                    {"n": 0, "pts": 150, "duration": 40},
+                    {"n": 1, "pts": 50, "duration": 40},
+                    {"n": 2, "pts": 100, "duration": 40},
+                    {"n": 3, "pts": 140, "duration": 40},
+                ],
+                head_anomaly_limit=32,
+            )
+            plan = TimelinePlan.from_deleted_ranges(4, [(0, 2)])
+            edl = build_certified_edl(CertifiedEdlRequest(media, plan, 0, 0), root / "edl")
+            self.assertEqual(edl.preview_tick_collision_frames, (0,))
+
+    def test_segment_monotonic_flag_cached_at_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = _certified_media(
+                root,
+                [
+                    {"n": 0, "pts": 0, "duration": 40},
+                    {"n": 1, "pts": 80, "duration": 40},
+                    {"n": 2, "pts": 40, "duration": 40},
+                    {"n": 3, "pts": 120, "duration": 40},
+                ],
+                head_anomaly_limit=32,
+            )
+            plan = TimelinePlan.from_deleted_ranges(4, [])
+            edl = build_certified_edl(CertifiedEdlRequest(media, plan, 0, 0), root / "edl")
+            self.assertEqual(edl._segment_monotonic, (False,))
+            # The non-monotonic nearest-row fallback still resolves times.
+            self.assertEqual(
+                edl.source_frame_for_virtual_time(Fraction(40, 1000)), 2
+            )
+            clean = _certified_media(
+                root,
+                [
+                    {"n": 0, "pts": 0, "duration": 40},
+                    {"n": 1, "pts": 40, "duration": 40},
+                    {"n": 2, "pts": 80, "duration": 40},
+                ],
+            )
+            clean_edl = build_certified_edl(
+                CertifiedEdlRequest(clean, TimelinePlan.from_deleted_ranges(3, []), 0, 0),
+                root / "edl",
+            )
+            self.assertEqual(clean_edl._segment_monotonic, (True,))
+
 
 def _reference_head_tick_collision_frames(timeline, intervals):
     """Brute-force oracle for the linear merge in certified_edl.

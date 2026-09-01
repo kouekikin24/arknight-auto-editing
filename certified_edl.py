@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from fractions import Fraction
 import hashlib
 import json
@@ -76,12 +76,30 @@ class CertifiedEdl:
     content_sha256: str
     _rows: tuple[FramePtsRow, ...] = field(repr=False, compare=False)
     _segment_pts: tuple[tuple[int, ...], ...] = field(repr=False, compare=False)
+    # Per-segment "PTS is non-decreasing" flag.  The EDL is immutable, so the
+    # flag is derived once in __post_init__ instead of re-scanning a whole
+    # segment on every mpv time-pos update.
+    _segment_monotonic: tuple[bool, ...] = field(repr=False, compare=False, default=())
     # B' accepts a bounded, source-head PTS anomaly for preview only.  Keep
     # the adjudication visible on the immutable object so callers cannot
     # mistake this EDL for a pixel-exact export timeline.
     preview_bias_frames: int = 0
     preview_bias_reason: str | None = None
     preview_tick_collision_frames: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self._segment_monotonic) != len(self._segment_pts):
+            object.__setattr__(
+                self,
+                "_segment_monotonic",
+                tuple(
+                    all(
+                        left <= right
+                        for left, right in zip(values, values[1:])
+                    )
+                    for values in self._segment_pts
+                ),
+            )
 
     @property
     def frame_count(self) -> int:
@@ -123,6 +141,13 @@ class CertifiedEdl:
                     # following EDL boundary, never a later decode row whose
                     # anomalous PTS happens to be earlier in virtual time.
                     return segment.virtual_time_range[1]
+            # A deleted collision row belongs to no kept segment; landing on
+            # self.duration would fling the preview to its very end.  Snap to
+            # the next kept segment's start, matching the generic
+            # deleted-frame path below.
+            for segment in self.segments:
+                if source_frame < segment.source_frame_range[0]:
+                    return segment.start_time
             return self.duration
         for segment in self.segments:
             start, end = segment.source_frame_range
@@ -184,7 +209,7 @@ class CertifiedEdl:
         rows = self._rows
         start, end = segment.source_frame_range
         values = self._segment_pts[segment_index]
-        if all(left <= right for left, right in zip(values, values[1:])):
+        if self._segment_monotonic[segment_index]:
             offset = bisect_left(values, target_tick)
             if offset < len(values) and values[offset] == target_tick:
                 return start + offset
@@ -267,35 +292,48 @@ def _head_tick_collision_frames(
     # every interval is O(intervals x frames), which is unusable on real
     # sources (thousands of kept ranges over hundreds of thousands of frames).
     # The certification guarantees strictly increasing PTS outside the
-    # adjudicated head window, so one ascending merge over the rows reaches
-    # exactly the same rows.
-    limit = timeline.head_anomaly_limit
+    # adjudicated head window, so rows there are handled by one ascending
+    # merge.  Inside the window PTS may dip or repeat by adjudication, so the
+    # bounded head rows are tested against every interval exactly — a merge
+    # that assumes ascending row PTS both misses in-span deleted rows and
+    # flags dipped rows outside the span there.
+    limit = max(0, min(int(timeline.head_anomaly_limit or 0), timeline.frame_count))
     starts = [interval.start_tick for interval in intervals]
     ends = [interval.end_tick for interval in intervals]
-    opened: list[int] = []
-    next_interval = 0
-    for frame, row in enumerate(timeline.rows):
-        pts = row.pts
-        # The certification boundary already enforces strictly increasing PTS
-        # outside the adjudicated head window, so once the ascending walk
-        # passes an interval's end_tick that interval can never match a later
-        # row again.  Each opened interval is therefore closed independently
-        # by the single ``pts < ends[index]`` test.
-        while next_interval < len(intervals) and starts[next_interval] <= pts:
-            opened.append(next_interval)
-            next_interval += 1
-        kept_row = kept[frame]
-        remaining: list[int] = []
-        for index in opened:
-            if pts < ends[index]:
-                remaining.append(index)
-                if not kept_row:
-                    collisions.append(frame)
-        opened = remaining
+    for frame in range(limit):
+        if kept[frame]:
+            continue
+        pts = timeline.rows[frame].pts
+        for index in range(len(intervals)):
+            if starts[index] <= pts < ends[index]:
+                collisions.append(frame)
+                break
+    if limit < timeline.frame_count:
+        # Seed the merge at the first post-window row: every interval whose
+        # start_tick is not after that row's PTS is already open.
+        next_interval = bisect_right(starts, timeline.rows[limit].pts)
+        opened = list(range(next_interval))
+        for frame in range(limit, timeline.frame_count):
+            pts = timeline.rows[frame].pts
+            # The certification boundary already enforces strictly increasing
+            # PTS outside the adjudicated head window, so once the ascending
+            # walk passes an interval's end_tick that interval can never match
+            # a later row again.  Each opened interval is therefore closed
+            # independently by the single ``pts < ends[index]`` test.
+            while next_interval < len(intervals) and starts[next_interval] <= pts:
+                opened.append(next_interval)
+                next_interval += 1
+            kept_row = kept[frame]
+            remaining: list[int] = []
+            for index in opened:
+                if pts < ends[index]:
+                    remaining.append(index)
+                    if not kept_row:
+                        collisions.append(frame)
+            opened = remaining
     collisions = sorted(set(collisions))
     if not collisions:
         return ()
-    limit = timeline.head_anomaly_limit
     if (
         limit <= 0
         or len(collisions) > _PREVIEW_HEAD_TICK_COLLISION_MAX

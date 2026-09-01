@@ -1085,8 +1085,10 @@ class MpvEngine:
             # Nearest-PTS lookup advances the source pointer halfway through
             # a long frame, which is wrong for cut editing and especially
             # visible on variable-duration material.
-            offset = bisect_left(times[clean_start:], target)
-            index = clean_start + offset
+            # lo= bounds the search without copying the (potentially
+            # hundreds of thousands of entries) tail of the PTS table on
+            # every time-pos update.
+            index = bisect_left(times, target, clean_start)
             if index < len(times) and times[index] == target:
                 return index
             return max(clean_start, min(len(times) - 1, index - 1))
