@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from fractions import Fraction
@@ -195,6 +196,67 @@ def _worker_classify_gray_scored(gray: np.ndarray) -> tuple[int, float]:
         else -1.0
     )
     return state, float(score)
+
+
+class _AsyncClassifier:
+    """Overlap frame decode with process-pool classification.
+
+    Batches are submitted without waiting for results; at most
+    ``max_in_flight`` batches stay uncollected, so a fast decoder cannot
+    outrun the workers and pile unbounded gray frames into memory.
+    Collection happens in submission order — _BoundaryTracker observes
+    pause runs and requires strictly increasing frame indices, and
+    diag_scores must stay frame-ordered too.  Individual ``states[i]``
+    writes are index-addressed and order-independent.
+    """
+
+    def __init__(
+        self,
+        ex: concurrent.futures.ProcessPoolExecutor,
+        *,
+        n_workers: int,
+        scored: bool,
+        states: np.ndarray,
+        tracker: "_BoundaryTracker | None",
+        diag_scores: "list[float] | None",
+    ) -> None:
+        self._ex = ex
+        self._worker = _worker_classify_gray_scored if scored else _worker_classify_gray
+        self._chunk_divisor = max(1, n_workers * 2)
+        self._states = states
+        self._tracker = tracker
+        self._diag_scores = diag_scores
+        self._scored = scored
+        self._pending: deque = deque()
+        # Decode-ahead budget: enough batches to keep every worker busy while
+        # bounding worst-case extra memory to max_in_flight x batch frames.
+        self._max_in_flight = max(2, n_workers)
+
+    def submit(self, grays: list, indices: list, prevs: list) -> None:
+        chunk = max(4, len(grays) // self._chunk_divisor)
+        iterator = self._ex.map(self._worker, grays, chunksize=chunk)
+        self._pending.append((iterator, indices, grays, prevs))
+
+    def collect_oldest(self) -> None:
+        iterator, indices, grays, prevs = self._pending.popleft()
+        results = list(iterator)
+        if self._scored:
+            self._diag_scores.extend(score for _, score in results)
+            state_results = (state for state, _ in results)
+        else:
+            state_results = iter(results)
+        for i, s, g, pg in zip(indices, state_results, grays, prevs):
+            self._states[i] = s
+            if self._tracker is not None:
+                self._tracker.observe(i, g, int(s), pg)
+
+    def backpressure(self) -> None:
+        while len(self._pending) >= self._max_in_flight:
+            self.collect_oldest()
+
+    def drain(self) -> None:
+        while self._pending:
+            self.collect_oldest()
 
 
 # ---------------------------------------------------------------
@@ -678,6 +740,14 @@ def _analyze_video_ffmpeg_sw_passthrough(
             initializer=_worker_init,
             initargs=(configs, thresholds, proc_res),
         ) as ex:
+            classifier = _AsyncClassifier(
+                ex,
+                n_workers=n_workers,
+                scored=diag_scores is not None,
+                states=states,
+                tracker=tracker,
+                diag_scores=diag_scores,
+            )
             while got < total:
                 if time.perf_counter() > deadline:
                     raise TimeoutError(
@@ -714,28 +784,14 @@ def _analyze_video_ffmpeg_sw_passthrough(
                     got += 1
 
                 if batch_grays:
-                    chunk = max(4, len(batch_grays) // (n_workers * 2))
-                    if diag_scores is not None:
-                        scored = list(
-                            ex.map(_worker_classify_gray_scored, batch_grays, chunksize=chunk)
-                        )
-                        results = [s for s, _ in scored]
-                        diag_scores.extend(sc for _, sc in scored)
-                    else:
-                        results = list(
-                            ex.map(_worker_classify_gray, batch_grays, chunksize=chunk)
-                        )
-                    for i, s, g, pg in zip(
-                        batch_indices, results, batch_grays, batch_prev
-                    ):
-                        states[i] = s
-                        if tracker is not None:
-                            tracker.observe(i, g, int(s), pg)
+                    classifier.submit(batch_grays, batch_indices, batch_prev)
+                    classifier.backpressure()
                     if progress_cb:
                         progress_cb((got / total) * 0.5)
 
                 if eof:
                     break
+            classifier.drain()
 
         # Drain/wait FFmpeg
         try:
@@ -904,36 +960,26 @@ def _analyze_video_pyav_filter(
             initializer=_worker_init,
             initargs=(configs, thresholds, proc_res),
         ) as ex:
+            classifier = _AsyncClassifier(
+                ex,
+                n_workers=n_workers,
+                scored=diag_scores is not None,
+                states=states,
+                tracker=tracker,
+                diag_scores=diag_scores,
+            )
 
-            def _flush_batch() -> None:
+            def _submit_batch() -> None:
                 if not batch_grays:
                     return
                 if time.perf_counter() > deadline:
                     raise TimeoutError(
                         f"PyAV A_PT timed out after {timeout_s:.1f}s at frame {got}/{total}"
                     )
-                chunk = max(4, len(batch_grays) // (n_workers * 2))
-                if diag_scores is not None:
-                    scored = list(
-                        ex.map(_worker_classify_gray_scored, batch_grays, chunksize=chunk)
-                    )
-                    results = [s for s, _ in scored]
-                    diag_scores.extend(sc for _, sc in scored)
-                else:
-                    results = list(
-                        ex.map(_worker_classify_gray, batch_grays, chunksize=chunk)
-                    )
-                for i, s, g, pg in zip(
-                    batch_indices, results, batch_grays, batch_prev
-                ):
-                    states[i] = s
-                    if tracker is not None:
-                        tracker.observe(i, g, int(s), pg)
+                classifier.submit(batch_grays, batch_indices, batch_prev)
+                classifier.backpressure()
                 if progress_cb:
                     progress_cb((got / total) * 0.5)
-                batch_grays.clear()
-                batch_indices.clear()
-                batch_prev.clear()
 
             def _drain(eof: bool) -> None:
                 while not stop:
@@ -952,11 +998,18 @@ def _analyze_video_pyav_filter(
                 if stop:
                     break
                 if len(batch_grays) >= int(batch_size):
-                    _flush_batch()
+                    _submit_batch()
+                    # Hand the filled batch to the in-flight queue and start a
+                    # fresh one; submitted lists stay referenced by the
+                    # classifier until collected, never cleared in place.
+                    batch_grays = []
+                    batch_indices = []
+                    batch_prev = []
             if not stop:
                 graph.push(None)
                 _drain(eof=True)
-            _flush_batch()
+            _submit_batch()
+            classifier.drain()
     finally:
         if container is not None:
             try:
