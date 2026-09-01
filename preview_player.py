@@ -369,11 +369,13 @@ class VideoPreviewPlayer(tk.Frame):
                    command=lambda: self._copy_osd_text("fps")).pack(side=tk.LEFT, padx=(4, 0))
 
         # 默认开优化；取消勾选 / 按 O = #9 式基线（只统计，不追帧软锚）
+        # 注：pace 对照只对 cv 引擎生效；mpv 引擎下隐藏（见 ARCHIVE_PREVIEW_PACE.md）
         self.preview_opt_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.chk_preview_opt = ttk.Checkbutton(
             ctrl, text="预览优化", variable=self.preview_opt_var,
             command=self._on_preview_opt_change,
-        ).pack(side=tk.LEFT, padx=5)
+        )
+        self.chk_preview_opt.pack(side=tk.LEFT, padx=5)
 
         self.lbl_time = ttk.Label(ctrl, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.RIGHT, padx=10)
@@ -427,10 +429,13 @@ class VideoPreviewPlayer(tk.Frame):
             self.video_canvas.pack_forget()
             self.mpv_host.pack(fill=tk.BOTH, expand=True)
             self._raise_native_cover()
+            # pace 对照开关只对 cv 引擎有真实效果；mpv 下隐藏以免误导
+            self.chk_preview_opt.pack_forget()
         else:
             self.mpv_host.pack_forget()
             self._drop_native_cover()
             self.video_canvas.pack(fill=tk.BOTH, expand=True)
+            self.chk_preview_opt.pack(side=tk.LEFT, padx=5)
         try:
             self.video_surface.update_idletasks()
             target = engine or self._io
