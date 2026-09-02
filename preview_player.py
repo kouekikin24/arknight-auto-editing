@@ -6,6 +6,8 @@ import cv2
 import inspect
 import numpy as np
 import PIL.Image
+import PIL.ImageDraw
+import PIL.ImageFont
 import PIL.ImageTk
 import os
 import subprocess
@@ -280,6 +282,8 @@ class VideoPreviewPlayer(tk.Frame):
         self._still_last_gray = None
         self._still_pending = None
         self._still_decoding: bool = False
+        self._still_resize_after_id: str | None = None
+        self._still_osd_font_cache: tuple[int, object] = (0, None)
         self._was_playing: bool = False
         # PyAV 静帧解码（API 层主选）：关键帧索引表后台构建（npz 缓存），
         # 未就绪/未安装时自动回退 ffmpeg CLI 两段式，再回退 OpenCV
@@ -471,6 +475,20 @@ class VideoPreviewPlayer(tk.Frame):
             )
         except Exception:
             pass
+        # 暂停中静帧覆盖层是按旧尺寸生成的：显示区变了就防抖重出一张
+        if not self.is_playing and self._still_overlay is not None:
+            if self._still_resize_after_id is not None:
+                try:
+                    self.after_cancel(self._still_resize_after_id)
+                except Exception:
+                    pass
+            self._still_resize_after_id = self.after(180, self._reshow_paused_still)
+
+    def _reshow_paused_still(self) -> None:
+        self._still_resize_after_id = None
+        if self._closing or self.is_playing or self._still_overlay is None:
+            return
+        self._show_paused_still(int(self.current_frame_idx))
 
     def _make_preview_engine(self, path: str) -> PreviewEngine:
         # CvEngine owns the only long-lived OpenCV capture.  Avoid opening a
@@ -1060,6 +1078,15 @@ class VideoPreviewPlayer(tk.Frame):
             h = max(1, self.video_surface.winfo_height())
         except Exception:
             return
+        # 保比例：目标尺寸按源宽高比收缩进显示区（letterbox），黑边由覆盖层
+        # 黑底 + Label 居中自然形成——与上游 video_io._push_frame 同一公式。
+        # media_info 未就绪时退回显示区满铺（旧行为）。
+        src_w = int(getattr(getattr(self, "media_info", None), "width", 0) or 0)
+        src_h = int(getattr(getattr(self, "media_info", None), "height", 0) or 0)
+        if src_w > 0 and src_h > 0:
+            fit = min(w / src_w, h / src_h)
+            w = max(1, int(src_w * fit))
+            h = max(1, int(src_h * fit))
         # 节流：已有解码在飞时跳过（渲染循环的追帧逻辑会在落地后补齐最新目标），
         # 避免拖时间轴时每个 tick 都 spawn 一个 ffmpeg 子进程
         if self._still_decoding:
@@ -1183,25 +1210,50 @@ class VideoPreviewPlayer(tk.Frame):
             self._still_overlay = tk.Frame(self.video_surface, bg="black")
             self._still_label = tk.Label(self._still_overlay, bg="black")
             self._still_label.pack(fill=tk.BOTH, expand=True)
-            # mpv 的帧号 OSD 画在 mpv 窗口内，会被本覆盖层盖住；
-            # 暂停态在覆盖层上自绘同样的左上角帧号
-            self._still_osd = tk.Label(
-                self._still_overlay, bg="black", fg="white", anchor="w")
-            self._still_osd.place(x=8, y=6)
             self._still_overlay.pack(fill=tk.BOTH, expand=True)
+        try:
+            show_osd = bool(self.show_frame_osd_var.get())
+        except Exception:
+            show_osd = True
+        if show_osd:
+            img = self._draw_still_osd(img, frame_idx)
         self._still_photo = PIL.ImageTk.PhotoImage(img)
         self._still_label.config(image=self._still_photo)
         self._still_overlay.lift()
-        try:
-            if bool(self.show_frame_osd_var.get()):
-                self._still_osd.config(
-                    text=f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}")
-            else:
-                self._still_osd.config(text="")
-        except Exception:
-            pass
         self._still_last_gray = gray
         self._still_frame_idx = frame_idx
+
+    def _still_osd_font(self, size: int):
+        cached_size, cached_font = self._still_osd_font_cache
+        if cached_size != size:
+            font = None
+            for name in ("consola.ttf", "cour.ttf"):
+                try:
+                    font = PIL.ImageFont.truetype(name, size)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                font = PIL.ImageFont.load_default()
+            self._still_osd_font_cache = (size, font)
+        return self._still_osd_font_cache[1]
+
+    def _draw_still_osd(self, img, frame_idx: int):
+        """帧号直接画进静帧像素：白字黑描边、左上角、字号随画面高度——
+        视觉对齐 mpv 的 ASS OSD（Tk Label 做不到描边和透明底）。"""
+        try:
+            text = f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}"
+            size = max(12, round(img.height * 0.05))
+            out = img.copy()
+            draw = PIL.ImageDraw.Draw(out)
+            draw.text(
+                (10, 8), text,
+                font=self._still_osd_font(size), fill="white",
+                stroke_width=max(1, size // 14), stroke_fill="black",
+            )
+            return out
+        except Exception:
+            return img
 
     def _drain_still_pending(self) -> None:
         item = self._still_pending

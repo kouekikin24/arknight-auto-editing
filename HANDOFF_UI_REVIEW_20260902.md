@@ -45,6 +45,8 @@
 - **UI 精简**（owner 逐项拍板，`a0607bc` + 冒烟脚本修复 `8fa2ce3`）：删 忽略业务加速/流畅度遥测行/标定行/提示行 O 字样；保留 屏显帧号/复制帧号；新增 **屏显帧率** 独立开关（`show_fps_osd_var`，原来 FPS OSD 挂在帧号开关下）。机制代码休眠未删（归档可查）。`preview_ignore_speedup_var` 删除后 4 处读取点固定为默认行为（mpv 下仍强制忽略）。后续 owner 又拍板：**删除复制帧率**（控制条按钮 + 视频区右键菜单项一并去掉，`_copy_osd_text`/`_osd_texts` 删除，`_copy_frame_no` 取代；mpv_engine.get_osd_texts 保留，probe 脚本在用）；**底栏提示恢复上游原文**（"← → 逐帧移动  |  空格 播放  |  时间轴：右键点击黄色块手动删除操作，鼠标中键平移"）。
 - 对照标注图：`.cache/gui_compare_annotated.png`；PrintWindow 后台截屏脚本 `.cache/cap_gui.py`（DPI 感知，按 pid 截指定窗口）。
 - zreview 复审精简提交抓到 1 条真问题（冒烟脚本读被删标签崩溃）→ 已修为直读引擎快照字段。
+- **暂停观感双修**（2026-09-03）：① 静帧拉伸修复——`_show_paused_still` 按 media_info 源宽高比 min-scale 收缩（同上游 `_push_frame` 公式），覆盖层黑底+Label 居中自然 letterbox；media_info 未就绪时退回旧行为。② 帧号字体统一——撤掉 Tk Label OSD，帧号改由 `_draw_still_osd` 用 PIL 画进静帧像素（Consolas、白字黑描边、字号随画面高度），视觉对齐 mpv ASS OSD；文本两侧本就同格式。③ 暂停中改窗口尺寸：`_on_video_surface_configure` 防抖 180ms 重出静帧（`_reshow_paused_still`）。
+- **B 台架**（2026-09-03）：时间戳无损修复可行性实测完毕——mkvmerge 路线证伪（双胞胎序不可控，44% 调换），自研 ctts 微手术全项满分（`.cache/bench_b/ctts_patch.py`）。四样本双胞胎普查 13~14% 全中。全文 `BENCH_B_20260903.md`，启封触发器在内。
 
 ## 4. 铁约束（沿用，不变）
 
