@@ -1,6 +1,7 @@
 # preview_player.py — 视频预览播放器
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 import cv2
 import inspect
@@ -758,6 +759,12 @@ class VideoPreviewPlayer(tk.Frame):
             self.media_info_error = None
             self.frame_pts_error = None
             self.frame_pts_status = "PENDING"
+            # 探测就绪前贴出的静帧是按"满铺"回退路径解码的（无源尺寸），
+            # 现在有了宽高比，暂停中的静帧按 letterbox 重出一张
+            if getattr(self, "_still_overlay", None) is not None and not getattr(
+                self, "is_playing", False
+            ):
+                self._reshow_paused_still()
             self._start_frame_pts_certification(result, snapshot)
 
         def on_error(exc: BaseException) -> None:
@@ -1218,20 +1225,17 @@ class VideoPreviewPlayer(tk.Frame):
             return
         if self._still_overlay is None:
             self._still_overlay = tk.Frame(self.video_surface, bg="black")
-            self._still_label = tk.Label(self._still_overlay, bg="black")
-            self._still_label.pack(fill=tk.BOTH, expand=True)
+            # Canvas 承载：图像居中 + 帧号文本浮于画布绝对坐标（与 mpv OSD
+            # 一样相对显示区左上角落位，而不是相对图像——黑边大时位置也不偏）
+            self._still_canvas = tk.Canvas(
+                self._still_overlay, bg="black", highlightthickness=0, bd=0)
+            self._still_canvas.pack(fill=tk.BOTH, expand=True)
             # 覆盖层用 place 而非 pack：place 不参与几何分配——pack 会与
             # mpv 原生窗口瓜分视频区（画面断成两节），且子图尺寸会反向
             # 撑爆窗口（几何传播）；place 两者皆免
             self._still_overlay.place(x=0, y=0, relwidth=1, relheight=1)
-        try:
-            show_osd = bool(self.show_frame_osd_var.get())
-        except Exception:
-            show_osd = True
-        if show_osd:
-            img = self._draw_still_osd(img, frame_idx)
         # 兜底：按显示区现状 letterbox 收缩过大的静帧（布局瞬态解码出的
-        # 旧尺寸图在落地时被纠正；OSD 已画入，随图等比缩）
+        # 旧尺寸图在落地时被纠正）
         try:
             vw = max(1, self.video_surface.winfo_width())
             vh = max(1, self.video_surface.winfo_height())
@@ -1244,44 +1248,52 @@ class VideoPreviewPlayer(tk.Frame):
                 PIL.Image.LANCZOS,
             )
         self._still_photo = PIL.ImageTk.PhotoImage(img)
-        self._still_label.config(image=self._still_photo)
+        c = self._still_canvas
+        c.delete("all")
+        # 图像在画布居中（黑边由画布黑底形成）
+        try:
+            cw = max(1, c.winfo_width())
+            ch = max(1, c.winfo_height())
+        except Exception:
+            cw, ch = img.width, img.height
+        c.create_image(cw // 2, ch // 2, image=self._still_photo)
+        try:
+            show_osd = bool(self.show_frame_osd_var.get())
+        except Exception:
+            show_osd = True
+        if show_osd:
+            self._draw_still_osd(c, frame_idx)
         self._still_overlay.lift()
         self._still_last_gray = gray
         self._still_frame_idx = frame_idx
 
-    def _still_osd_font(self, size: int):
+    def _still_osd_font(self, size_px: int):
         cached_size, cached_font = self._still_osd_font_cache
-        if cached_size != size:
-            font = None
-            # 首选雅黑：含 CJK 字形（"帧"）；Consolas 无中文字形会出豆腐块
-            for name in ("msyh.ttc", "msyh.ttf", "simhei.ttf", "consola.ttf", "cour.ttf"):
-                try:
-                    font = PIL.ImageFont.truetype(name, size)
-                    break
-                except Exception:
-                    continue
-            if font is None:
-                font = PIL.ImageFont.load_default()
-            self._still_osd_font_cache = (size, font)
+        if cached_size != size_px:
+            # Tk 字号取负=像素单位；雅黑含 CJK，Tk 字体引擎自带系统回退
+            self._still_osd_font_cache = (
+                size_px, tkfont.Font(family="Microsoft YaHei", size=-size_px))
         return self._still_osd_font_cache[1]
 
-    def _draw_still_osd(self, img, frame_idx: int):
-        """帧号直接画进静帧像素：白字黑描边、左上角、字号随画面高度——
-        视觉对齐 mpv 的 ASS OSD（Tk Label 做不到描边和透明底）。"""
+    def _draw_still_osd(self, canvas: tk.Canvas, frame_idx: int) -> None:
+        """帧号浮于画布绝对坐标 (25,22)（= mpv 默认 osd-margin），多重偏移
+        描边模拟 mpv ASS OSD 的黑边白字；字号随显示区高度与 mpv 同比例。"""
         try:
             text = f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}"
-            # 0.032 实测对齐 mpv OSD 字号（同窗高下暂停/播放文字同高）
-            size = max(12, round(img.height * 0.032))
-            out = img.copy()
-            draw = PIL.ImageDraw.Draw(out)
-            draw.text(
-                (10, 8), text,
-                font=self._still_osd_font(size), fill="white",
-                stroke_width=max(1, size // 14), stroke_fill="black",
-            )
-            return out
+            vh = max(1, self.video_surface.winfo_height())
+            # 实测 mpv OSD ≈ 显示区高 × 0.036（0.039/0.031 两次实测的中值）
+            size_px = max(14, min(64, round(vh * 0.036)))
+            font = self._still_osd_font(size_px)
+            x, y = 25, 22
+            r = max(1, size_px // 16)
+            for dx, dy in ((-r, -r), (-r, r), (r, -r), (r, r),
+                           (0, -r), (0, r), (-r, 0), (r, 0)):
+                canvas.create_text(x + dx, y + dy, text=text, anchor="nw",
+                                   font=font, fill="black")
+            canvas.create_text(x, y, text=text, anchor="nw",
+                               font=font, fill="white")
         except Exception:
-            return img
+            pass
 
     def _drain_still_pending(self) -> None:
         item = self._still_pending
