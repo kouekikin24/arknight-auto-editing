@@ -1085,9 +1085,14 @@ class VideoPreviewPlayer(tk.Frame):
             return
         # 保比例：目标尺寸按源宽高比收缩进显示区（letterbox），黑边由覆盖层
         # 黑底 + Label 居中自然形成——与上游 video_io._push_frame 同一公式。
-        # media_info 未就绪时退回显示区满铺（旧行为）。
-        src_w = int(getattr(getattr(self, "media_info", None), "width", 0) or 0)
-        src_h = int(getattr(getattr(self, "media_info", None), "height", 0) or 0)
+        # 尺寸在 media_info.video_streams[0]（MediaInfo 本体没有 width/height）；
+        # 探测未就绪时退回显示区满铺（旧行为）。
+        src_w = src_h = 0
+        _mi = getattr(self, "media_info", None)
+        _vs = getattr(_mi, "video_streams", None) if _mi is not None else None
+        if _vs:
+            src_w = int(getattr(_vs[0], "width", 0) or 0)
+            src_h = int(getattr(_vs[0], "height", 0) or 0)
         if src_w > 0 and src_h > 0:
             fit = min(w / src_w, h / src_h)
             w = max(1, int(src_w * fit))
@@ -1265,7 +1270,8 @@ class VideoPreviewPlayer(tk.Frame):
         视觉对齐 mpv 的 ASS OSD（Tk Label 做不到描边和透明底）。"""
         try:
             text = f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}"
-            size = max(12, round(img.height * 0.05))
+            # 0.032 实测对齐 mpv OSD 字号（同窗高下暂停/播放文字同高）
+            size = max(12, round(img.height * 0.032))
             out = img.copy()
             draw = PIL.ImageDraw.Draw(out)
             draw.text(
