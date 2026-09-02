@@ -1,14 +1,11 @@
 # preview_player.py — 视频预览播放器
 
 import tkinter as tk
-import tkinter.font as tkfont
 from tkinter import ttk
 import cv2
 import inspect
 import numpy as np
 import PIL.Image
-import PIL.ImageDraw
-import PIL.ImageFont
 import PIL.ImageTk
 import os
 import subprocess
@@ -283,8 +280,6 @@ class VideoPreviewPlayer(tk.Frame):
         self._still_last_gray = None
         self._still_pending = None
         self._still_decoding: bool = False
-        self._still_resize_after_id: str | None = None
-        self._still_osd_font_cache: tuple[int, object] = (0, None)
         self._was_playing: bool = False
         # PyAV 静帧解码（API 层主选）：关键帧索引表后台构建（npz 缓存），
         # 未就绪/未安装时自动回退 ffmpeg CLI 两段式，再回退 OpenCV
@@ -476,25 +471,6 @@ class VideoPreviewPlayer(tk.Frame):
             )
         except Exception:
             pass
-        # 暂停中静帧覆盖层是按旧尺寸生成的：显示区变了就防抖重出一张
-        if not self.is_playing and self._still_overlay is not None:
-            if self._still_resize_after_id is not None:
-                try:
-                    self.after_cancel(self._still_resize_after_id)
-                except Exception:
-                    pass
-            self._still_resize_after_id = self.after(180, self._reshow_paused_still)
-
-    def _reshow_paused_still(self) -> None:
-        self._still_resize_after_id = None
-        if self._closing or self.is_playing or self._still_overlay is None:
-            return
-        if self._still_decoding:
-            # 在飞解码落地时会被 _blit_still 的兜底缩放纠正尺寸；
-            # 这里稍后重试，让下一张按新显示区原生分辨率出图
-            self._still_resize_after_id = self.after(180, self._reshow_paused_still)
-            return
-        self._show_paused_still(int(self.current_frame_idx))
 
     def _make_preview_engine(self, path: str) -> PreviewEngine:
         # CvEngine owns the only long-lived OpenCV capture.  Avoid opening a
@@ -759,12 +735,6 @@ class VideoPreviewPlayer(tk.Frame):
             self.media_info_error = None
             self.frame_pts_error = None
             self.frame_pts_status = "PENDING"
-            # 探测就绪前贴出的静帧是按"满铺"回退路径解码的（无源尺寸），
-            # 现在有了宽高比，暂停中的静帧按 letterbox 重出一张
-            if getattr(self, "_still_overlay", None) is not None and not getattr(
-                self, "is_playing", False
-            ):
-                self._reshow_paused_still()
             self._start_frame_pts_certification(result, snapshot)
 
         def on_error(exc: BaseException) -> None:
@@ -1090,20 +1060,6 @@ class VideoPreviewPlayer(tk.Frame):
             h = max(1, self.video_surface.winfo_height())
         except Exception:
             return
-        # 保比例：目标尺寸按源宽高比收缩进显示区（letterbox），黑边由覆盖层
-        # 黑底 + Label 居中自然形成——与上游 video_io._push_frame 同一公式。
-        # 尺寸在 media_info.video_streams[0]（MediaInfo 本体没有 width/height）；
-        # 探测未就绪时退回显示区满铺（旧行为）。
-        src_w = src_h = 0
-        _mi = getattr(self, "media_info", None)
-        _vs = getattr(_mi, "video_streams", None) if _mi is not None else None
-        if _vs:
-            src_w = int(getattr(_vs[0], "width", 0) or 0)
-            src_h = int(getattr(_vs[0], "height", 0) or 0)
-        if src_w > 0 and src_h > 0:
-            fit = min(w / src_w, h / src_h)
-            w = max(1, int(src_w * fit))
-            h = max(1, int(src_h * fit))
         # 节流：已有解码在飞时跳过（渲染循环的追帧逻辑会在落地后补齐最新目标），
         # 避免拖时间轴时每个 tick 都 spawn 一个 ffmpeg 子进程
         if self._still_decoding:
@@ -1225,75 +1181,27 @@ class VideoPreviewPlayer(tk.Frame):
             return
         if self._still_overlay is None:
             self._still_overlay = tk.Frame(self.video_surface, bg="black")
-            # Canvas 承载：图像居中 + 帧号文本浮于画布绝对坐标（与 mpv OSD
-            # 一样相对显示区左上角落位，而不是相对图像——黑边大时位置也不偏）
-            self._still_canvas = tk.Canvas(
-                self._still_overlay, bg="black", highlightthickness=0, bd=0)
-            self._still_canvas.pack(fill=tk.BOTH, expand=True)
-            # 覆盖层用 place 而非 pack：place 不参与几何分配——pack 会与
-            # mpv 原生窗口瓜分视频区（画面断成两节），且子图尺寸会反向
-            # 撑爆窗口（几何传播）；place 两者皆免
-            self._still_overlay.place(x=0, y=0, relwidth=1, relheight=1)
-        # 兜底：按显示区现状 letterbox 收缩过大的静帧（布局瞬态解码出的
-        # 旧尺寸图在落地时被纠正）
-        try:
-            vw = max(1, self.video_surface.winfo_width())
-            vh = max(1, self.video_surface.winfo_height())
-        except Exception:
-            vw = vh = 0
-        if vw > 1 and vh > 1 and (img.width > vw or img.height > vh):
-            fit = min(vw / img.width, vh / img.height)
-            img = img.resize(
-                (max(1, int(img.width * fit)), max(1, int(img.height * fit))),
-                PIL.Image.LANCZOS,
-            )
+            self._still_label = tk.Label(self._still_overlay, bg="black")
+            self._still_label.pack(fill=tk.BOTH, expand=True)
+            # mpv 的帧号 OSD 画在 mpv 窗口内，会被本覆盖层盖住；
+            # 暂停态在覆盖层上自绘同样的左上角帧号
+            self._still_osd = tk.Label(
+                self._still_overlay, bg="black", fg="white", anchor="w")
+            self._still_osd.place(x=8, y=6)
+            self._still_overlay.pack(fill=tk.BOTH, expand=True)
         self._still_photo = PIL.ImageTk.PhotoImage(img)
-        c = self._still_canvas
-        c.delete("all")
-        # 图像在画布居中（黑边由画布黑底形成）
-        try:
-            cw = max(1, c.winfo_width())
-            ch = max(1, c.winfo_height())
-        except Exception:
-            cw, ch = img.width, img.height
-        c.create_image(cw // 2, ch // 2, image=self._still_photo)
-        try:
-            show_osd = bool(self.show_frame_osd_var.get())
-        except Exception:
-            show_osd = True
-        if show_osd:
-            self._draw_still_osd(c, frame_idx)
+        self._still_label.config(image=self._still_photo)
         self._still_overlay.lift()
-        self._still_last_gray = gray
-        self._still_frame_idx = frame_idx
-
-    def _still_osd_font(self, size_px: int):
-        cached_size, cached_font = self._still_osd_font_cache
-        if cached_size != size_px:
-            # Tk 字号取负=像素单位；雅黑含 CJK，Tk 字体引擎自带系统回退
-            self._still_osd_font_cache = (
-                size_px, tkfont.Font(family="Microsoft YaHei", size=-size_px))
-        return self._still_osd_font_cache[1]
-
-    def _draw_still_osd(self, canvas: tk.Canvas, frame_idx: int) -> None:
-        """帧号浮于画布绝对坐标 (25,22)（= mpv 默认 osd-margin），多重偏移
-        描边模拟 mpv ASS OSD 的黑边白字；字号随显示区高度与 mpv 同比例。"""
         try:
-            text = f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}"
-            vh = max(1, self.video_surface.winfo_height())
-            # 实测 mpv OSD ≈ 显示区高 × 0.036（0.039/0.031 两次实测的中值）
-            size_px = max(14, min(64, round(vh * 0.036)))
-            font = self._still_osd_font(size_px)
-            x, y = 25, 22
-            r = max(1, size_px // 16)
-            for dx, dy in ((-r, -r), (-r, r), (r, -r), (r, r),
-                           (0, -r), (0, r), (-r, 0), (r, 0)):
-                canvas.create_text(x + dx, y + dy, text=text, anchor="nw",
-                                   font=font, fill="black")
-            canvas.create_text(x, y, text=text, anchor="nw",
-                               font=font, fill="white")
+            if bool(self.show_frame_osd_var.get()):
+                self._still_osd.config(
+                    text=f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}")
+            else:
+                self._still_osd.config(text="")
         except Exception:
             pass
+        self._still_last_gray = gray
+        self._still_frame_idx = frame_idx
 
     def _drain_still_pending(self) -> None:
         item = self._still_pending
