@@ -42,7 +42,7 @@
 
 - **八问诊断**（代码实据）：暂停拉伸=静帧按控件尺寸缩放不保比例；帧号字体=mpv OSD vs Tk Label 两套体系；预览优化=mpv 下假开关（pace 只进 stats）；无声=mpv `audio:"no"` 故意设计；4x 卡顿=全分辨率软解吞吐天花板（4×60=240fps 需求）；proc_res 可增大（管道瓶颈已消失）但需重标定模板阈值。
 - **pace 体系归档**（owner 方案一）：tag `archive/pace-ab-20260901` + `ARCHIVE_PREVIEW_PACE.md` + mpv 引擎下隐藏勾选框（`1dbf023`，启动即隐藏已修）。
-- **UI 精简**（owner 逐项拍板，`a0607bc` + 冒烟脚本修复 `8fa2ce3`）：删 忽略业务加速/流畅度遥测行/标定行/提示行 O 字样；保留 屏显帧号/复制帧号/复制帧率；新增 **屏显帧率** 独立开关（`show_fps_osd_var`，原来 FPS OSD 挂在帧号开关下）。机制代码休眠未删（归档可查）。`preview_ignore_speedup_var` 删除后 4 处读取点固定为默认行为（mpv 下仍强制忽略）。
+- **UI 精简**（owner 逐项拍板，`a0607bc` + 冒烟脚本修复 `8fa2ce3`）：删 忽略业务加速/流畅度遥测行/标定行/提示行 O 字样；保留 屏显帧号/复制帧号；新增 **屏显帧率** 独立开关（`show_fps_osd_var`，原来 FPS OSD 挂在帧号开关下）。机制代码休眠未删（归档可查）。`preview_ignore_speedup_var` 删除后 4 处读取点固定为默认行为（mpv 下仍强制忽略）。后续 owner 又拍板：**删除复制帧率**（控制条按钮 + 视频区右键菜单项一并去掉，`_copy_osd_text`/`_osd_texts` 删除，`_copy_frame_no` 取代；mpv_engine.get_osd_texts 保留，probe 脚本在用）；**底栏提示恢复上游原文**（"← → 逐帧移动  |  空格 播放  |  时间轴：右键点击黄色块手动删除操作，鼠标中键平移"）。
 - 对照标注图：`.cache/gui_compare_annotated.png`；PrintWindow 后台截屏脚本 `.cache/cap_gui.py`（DPI 感知，按 pid 截指定窗口）。
 - zreview 复审精简提交抓到 1 条真问题（冒烟脚本读被删标签崩溃）→ 已修为直读引擎快照字段。
 
@@ -57,5 +57,6 @@
 - 基准脚本（.cache/）：`ref_analysis_sample3.py`（save/verify 含 context）、`bench_apt_backends.py`、`bench_apt_decompose.py`、`bench_pool_ipc.py`、`locate2.py`、`probe_align.py`、`compose_gui_compare.py`、`cap_gui.py`
 - 基准数据：`.cache/ref_analysis_sample3.npz` + `.ctx.json`
 - 样本：`D:\qq下载\920\{1,2,3,4}.mp4`（4=424k 帧 VFR）
+- **手动启动 GUI 必须带 mpv 环境变量**：`ARKNIGHT_PREVIEW_ENGINE=mpv python main.py`（或双击 `启动剪辑工具.bat`，bat 里就设了这个）。裸跑 `python main.py` 默认 cv 引擎——预览行为完全不同，且「预览优化」勾选框按设计显示（pace 对照只在 cv 有效），不是回归。已踩过一次。
 - GUI 运行中：pid 30672（a0607bc 代码）
 - PowerShell 坑：ZCode 的 `powershell` = 5.1（中文脚本乱码风险），改用 `pwsh`（7.6.4）或加 BOM。

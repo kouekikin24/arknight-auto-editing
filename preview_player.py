@@ -315,7 +315,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.video_surface.bind("<Button-1>", lambda _event: self._focus_preview(), add="+")
         self.mpv_host.bind("<Button-1>", lambda _event: self._focus_preview(), add="+")
         self.video_canvas.bind("<Button-1>", lambda _event: self._focus_preview())
-        # 右键：复制帧号/帧率到剪贴板（OSD 画在视频上没法选中复制）
+        # 右键：复制帧号到剪贴板（OSD 画在视频上没法选中复制）
         for _w in (self.video_surface, self.mpv_host, self.video_canvas):
             _w.bind("<Button-3>", self._on_video_right_click, add="+")
 
@@ -362,11 +362,9 @@ class VideoPreviewPlayer(tk.Frame):
             command=self._on_fps_osd_change,
         ).pack(side=tk.LEFT, padx=5)
 
-        # mpv 原生窗口会吞掉视频区右键，复制帧号/帧率的入口放在控制条上
+        # mpv 原生窗口会吞掉视频区右键，复制帧号的入口放在控制条上
         ttk.Button(ctrl, text="复制帧号", width=8,
-                   command=lambda: self._copy_osd_text("frame")).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(ctrl, text="复制帧率", width=8,
-                   command=lambda: self._copy_osd_text("fps")).pack(side=tk.LEFT, padx=(4, 0))
+                   command=self._copy_frame_no).pack(side=tk.LEFT, padx=(8, 0))
 
         # 默认开优化；取消勾选 / 按 O = #9 式基线（只统计，不追帧软锚）
         # 注：pace 对照只对 cv 引擎生效；mpv 引擎下隐藏（见 ARCHIVE_PREVIEW_PACE.md）
@@ -386,7 +384,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.lbl_info = ttk.Label(self, text="就绪", foreground="#00CED1", font=("Consolas", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 
-        hint = "← → 逐帧  |  空格 播放  |  时间轴：右键黄块 / 中键平移"
+        hint = "← → 逐帧移动  |  空格 播放  |  时间轴：右键点击黄色块手动删除操作，鼠标中键平移"
         ttk.Label(self, text=hint, foreground="#555555", font=("Consolas", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
 
         self._render_loop()
@@ -414,47 +412,22 @@ class VideoPreviewPlayer(tk.Frame):
         except Exception:
             pass
 
-    def _osd_texts(self) -> tuple[str, str]:
-        getter = getattr(self._io, "get_osd_texts", None)
-        if not callable(getter):
-            return "", ""
-        try:
-            return getter()
-        except Exception:
-            return "", ""
-
-    def _copy_osd_text(self, kind: str) -> None:
-        """复制帧号（纯数字，方便直接贴进排查工具）或帧率读数到剪贴板。"""
-        if kind == "frame":
-            self._copy_to_clipboard(str(int(self.current_frame_idx)))
-            return
-        _frame_text, fps_text = self._osd_texts()
-        if fps_text:
-            self._copy_to_clipboard(fps_text)
-        else:
-            try:
-                self.lbl_info.config(text="暂无可复制的帧率读数")
-            except Exception:
-                pass
+    def _copy_frame_no(self) -> None:
+        """复制当前帧号（纯数字，方便直接贴进排查工具）到剪贴板。"""
+        self._copy_to_clipboard(str(int(self.current_frame_idx)))
 
     def _on_video_right_click(self, event) -> None:
-        """视频区右键：复制帧号/帧率菜单。
+        """视频区右键：复制帧号菜单。
 
         原生 mpv 子窗口会吞掉右键事件，此菜单实际只对 CV 引擎触发；
-        mpv 下用控制条上的「复制帧号/复制帧率」按钮。
+        mpv 下用控制条上的「复制帧号」按钮。
         """
         if self._closing:
             return
-        _frame_text, fps_text = self._osd_texts()
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(
             label=f"复制帧号  ({int(self.current_frame_idx)})",
-            command=lambda: self._copy_osd_text("frame"),
-        )
-        menu.add_command(
-            label=f"复制帧率  ({fps_text or '无'})",
-            command=lambda: self._copy_osd_text("fps"),
-            state=(tk.NORMAL if fps_text else tk.DISABLED),
+            command=self._copy_frame_no,
         )
         try:
             menu.tk_popup(event.x_root, event.y_root)
