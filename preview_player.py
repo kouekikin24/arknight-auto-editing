@@ -488,6 +488,11 @@ class VideoPreviewPlayer(tk.Frame):
         self._still_resize_after_id = None
         if self._closing or self.is_playing or self._still_overlay is None:
             return
+        if self._still_decoding:
+            # 在飞解码落地时会被 _blit_still 的兜底缩放纠正尺寸；
+            # 这里稍后重试，让下一张按新显示区原生分辨率出图
+            self._still_resize_after_id = self.after(180, self._reshow_paused_still)
+            return
         self._show_paused_still(int(self.current_frame_idx))
 
     def _make_preview_engine(self, path: str) -> PreviewEngine:
@@ -1208,6 +1213,9 @@ class VideoPreviewPlayer(tk.Frame):
             return
         if self._still_overlay is None:
             self._still_overlay = tk.Frame(self.video_surface, bg="black")
+            # 硬保证：静帧尺寸绝不反向撑大窗口（解码目标尺寸可能基于布局
+            # 未稳定时的瞬时 winfo 读数；Tk 几何传播会把大图顶破窗口）
+            self._still_overlay.pack_propagate(False)
             self._still_label = tk.Label(self._still_overlay, bg="black")
             self._still_label.pack(fill=tk.BOTH, expand=True)
             self._still_overlay.pack(fill=tk.BOTH, expand=True)
@@ -1217,6 +1225,19 @@ class VideoPreviewPlayer(tk.Frame):
             show_osd = True
         if show_osd:
             img = self._draw_still_osd(img, frame_idx)
+        # 兜底：按显示区现状 letterbox 收缩过大的静帧（布局瞬态解码出的
+        # 旧尺寸图在落地时被纠正；OSD 已画入，随图等比缩）
+        try:
+            vw = max(1, self.video_surface.winfo_width())
+            vh = max(1, self.video_surface.winfo_height())
+        except Exception:
+            vw = vh = 0
+        if vw > 1 and vh > 1 and (img.width > vw or img.height > vh):
+            fit = min(vw / img.width, vh / img.height)
+            img = img.resize(
+                (max(1, int(img.width * fit)), max(1, int(img.height * fit))),
+                PIL.Image.LANCZOS,
+            )
         self._still_photo = PIL.ImageTk.PhotoImage(img)
         self._still_label.config(image=self._still_photo)
         self._still_overlay.lift()
