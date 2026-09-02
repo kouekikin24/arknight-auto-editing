@@ -167,7 +167,6 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
         window_image = grab_window()
         window_image.save(out_dir / "window_play.png")
         stats = _window_stats(window_image)
-        perf_text = str(player.lbl_perf.cget("text"))
         result["checks"]["play_with_speed_segments"] = {
             "accepted": bool(accepted),
             "ui_play_call_seconds": play_call_s,
@@ -180,7 +179,6 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
             "distinct_colors": stats["distinct_colors"],
             "mean_luma": round(stats["mean_luma"], 1),
             "info_text": info_text,
-            "perf_text": perf_text,
         }
         if not accepted or engine.mode != "edl":
             failures.append("PLAY_REJECTED_OR_WRONG_MODE")
@@ -188,7 +186,9 @@ def run(source: Path, dll_dir: Path, out_dir: Path) -> dict:
             failures.append("PLAY_CALL_BLOCKED_UI")
         if stats["distinct_colors"] <= 8:
             failures.append("WINDOW_BLANK_DURING_PLAY")
-        if "mpv丢帧" not in perf_text or "实测比" not in perf_text:
+        # The perf label row was removed from the main UI; the same mpv
+        # fields now verified straight from the engine snapshot.
+        if "mpv_frame_drops" not in snap or "rt_ratio" not in snap:
             failures.append("FLUENCY_LABEL_MISSING_MPV_FIELDS")
         if "变速段按原速" not in info_text:
             failures.append("SPEED_POLICY_HINT_MISSING")
