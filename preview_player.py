@@ -1248,7 +1248,8 @@ class VideoPreviewPlayer(tk.Frame):
         cached_size, cached_font = self._still_osd_font_cache
         if cached_size != size:
             font = None
-            for name in ("consola.ttf", "cour.ttf"):
+            # 首选雅黑：含 CJK 字形（"帧"）；Consolas 无中文字形会出豆腐块
+            for name in ("msyh.ttc", "msyh.ttf", "simhei.ttf", "consola.ttf", "cour.ttf"):
                 try:
                     font = PIL.ImageFont.truetype(name, size)
                     break
