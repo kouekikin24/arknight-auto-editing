@@ -1213,12 +1213,12 @@ class VideoPreviewPlayer(tk.Frame):
             return
         if self._still_overlay is None:
             self._still_overlay = tk.Frame(self.video_surface, bg="black")
-            # 硬保证：静帧尺寸绝不反向撑大窗口（解码目标尺寸可能基于布局
-            # 未稳定时的瞬时 winfo 读数；Tk 几何传播会把大图顶破窗口）
-            self._still_overlay.pack_propagate(False)
             self._still_label = tk.Label(self._still_overlay, bg="black")
             self._still_label.pack(fill=tk.BOTH, expand=True)
-            self._still_overlay.pack(fill=tk.BOTH, expand=True)
+            # 覆盖层用 place 而非 pack：place 不参与几何分配——pack 会与
+            # mpv 原生窗口瓜分视频区（画面断成两节），且子图尺寸会反向
+            # 撑爆窗口（几何传播）；place 两者皆免
+            self._still_overlay.place(x=0, y=0, relwidth=1, relheight=1)
         try:
             show_osd = bool(self.show_frame_osd_var.get())
         except Exception:
