@@ -2365,8 +2365,8 @@ class VideoPreviewPlayer(tk.Frame):
             except Exception:
                 pass
 
-        # apply ignore flag for this run
-        self.preview_ignore_speedup_var.set(bool(ignore_biz))
+        # apply ignore flag for this run（勾选框已随 UI 精简删除，
+        # 引擎读取点固定为 False；此处只保留 calib 流程自身的状态记录）
         self._calib_ignore = bool(ignore_biz)
         self._calib_mode = mode
         self._calib_active = True
