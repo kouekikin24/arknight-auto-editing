@@ -33,6 +33,7 @@ def _bare_player() -> VideoPreviewPlayer:
     player._io.native_rendering = True
     player._io.fps = 60.0  # time-pos 口径需要真实源帧率
     player.show_frame_osd_var = _BoolVar(True)
+    player.show_fps_osd_var = _BoolVar(True)
     player.preview_speed_var = SimpleNamespace(get=lambda: "1x")
     return player
 

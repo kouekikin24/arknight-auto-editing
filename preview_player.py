@@ -349,17 +349,17 @@ class VideoPreviewPlayer(tk.Frame):
             command=self._on_preview_option_change,
         ).pack(side=tk.LEFT, padx=5)
 
-        # 关闭后预览仍按设置对 1x/0.2x 区抽帧加速；勾选后预览只跟上方「倍速」，便于排查卡顿
-        self.preview_ignore_speedup_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            ctrl, text="预览忽略业务加速", variable=self.preview_ignore_speedup_var,
-            command=self._on_preview_option_change,
-        ).pack(side=tk.LEFT, padx=5)
-
         # mpv 原生渲染时用 mpv OSD 在画面上叠加当前源帧号（编辑时直接读屏）
         self.show_frame_osd_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             ctrl, text="屏显帧号", variable=self.show_frame_osd_var,
+        ).pack(side=tk.LEFT, padx=5)
+
+        # 右上角播放帧率 OSD 的独立开关（与帧号分开控制）
+        self.show_fps_osd_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ctrl, text="屏显帧率", variable=self.show_fps_osd_var,
+            command=self._on_fps_osd_change,
         ).pack(side=tk.LEFT, padx=5)
 
         # mpv 原生窗口会吞掉视频区右键，复制帧号/帧率的入口放在控制条上
@@ -376,6 +376,9 @@ class VideoPreviewPlayer(tk.Frame):
             command=self._on_preview_opt_change,
         )
         self.chk_preview_opt.pack(side=tk.LEFT, padx=5)
+        if self._preview_engine_kind == "mpv":
+            # 视频未加载时尚无引擎切换事件，启动即按目标引擎隐藏
+            self.chk_preview_opt.pack_forget()
 
         self.lbl_time = ttk.Label(ctrl, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.RIGHT, padx=10)
@@ -383,42 +386,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.lbl_info = ttk.Label(self, text="就绪", foreground="#00CED1", font=("Consolas", 10))
         self.lbl_info.pack(fill=tk.X, padx=10, pady=2)
 
-        perf_row = ttk.Frame(self)
-        perf_row.pack(fill=tk.X, padx=10, pady=(0, 2))
-        self.lbl_perf = ttk.Label(
-            perf_row,
-            text="流畅度: 播放后显示（迟到率 / 追帧 / 单帧耗时）",
-            foreground="#888888",
-            font=("Consolas", 9),
-        )
-        self.lbl_perf.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(perf_row, text="复制流畅度", width=10, command=self._copy_perf_stats).pack(
-            side=tk.RIGHT, padx=(6, 0)
-        )
-        ttk.Button(perf_row, text="清零统计", width=8, command=self._reset_perf_stats_ui).pack(
-            side=tk.RIGHT
-        )
-        ttk.Button(perf_row, text="标定10s", width=8, command=self._calib_start_single).pack(
-            side=tk.RIGHT, padx=(6, 0)
-        )
-        ttk.Button(perf_row, text="对比标定", width=8, command=self._calib_start_pair).pack(
-            side=tk.RIGHT, padx=(6, 0)
-        )
-        ttk.Button(perf_row, text="复制标定", width=8, command=self._calib_copy).pack(
-            side=tk.RIGHT, padx=(6, 0)
-        )
-
-        calib_row = ttk.Frame(self)
-        calib_row.pack(fill=tk.X, padx=10, pady=(0, 2))
-        self.lbl_calib = ttk.Label(
-            calib_row,
-            text="倍率: 播≥3秒停即显示(跳裁剪不虚高)；也可标定10s/对比",
-            foreground="#888888",
-            font=("Consolas", 9),
-        )
-        self.lbl_calib.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        hint = "← → 逐帧  |  空格 播放  |  O 切换预览优化  |  时间轴：右键黄块 / 中键平移"
+        hint = "← → 逐帧  |  空格 播放  |  时间轴：右键黄块 / 中键平移"
         ttk.Label(self, text=hint, foreground="#555555", font=("Consolas", 8)).pack(fill=tk.X, padx=10, pady=(0, 2))
 
         self._render_loop()
@@ -1532,8 +1500,9 @@ class VideoPreviewPlayer(tk.Frame):
             bool(p.get('speedup_1x')) or bool(p.get('speedup_02'))
             or bool(self._speed_segs_snap())
         )
-        ignore_biz = bool(self.preview_ignore_speedup_var.get()) or native_engine
-        if native_engine and biz_active and not bool(self.preview_ignore_speedup_var.get()):
+        # 忽略业务加速控件已移除：cv 引擎按原行为（不忽略），mpv 引擎始终忽略
+        ignore_biz = native_engine
+        if native_engine and biz_active:
             try:
                 self.lbl_info.config(text="mpv 预览：业务变速段按原速播放（如需业务加速请切回 OpenCV 引擎）")
             except Exception:
@@ -1587,6 +1556,15 @@ class VideoPreviewPlayer(tk.Frame):
             self._auto_rate_mark_start()
             self._send_play(self.current_frame_idx)
         self._update_labels()
+
+    def _on_fps_osd_change(self):
+        """屏显帧率开关：关闭时立即清掉右上角持久 OSD（开着则由播放心跳刷新）。"""
+        shower = getattr(self._io, "show_osd_corner_text", None)
+        if not self.show_fps_osd_var.get() and callable(shower):
+            try:
+                shower("")
+            except Exception:
+                pass
 
     def _pace_mode_str(self) -> str:
         return "opt" if bool(self.preview_opt_var.get()) else "base"
@@ -2448,7 +2426,7 @@ class VideoPreviewPlayer(tk.Frame):
             return
         self._auto_rate_t0 = time.monotonic()
         self._auto_rate_f0 = int(self.current_frame_idx)
-        self._auto_rate_ignore = bool(self.preview_ignore_speedup_var.get())
+        self._auto_rate_ignore = False
 
     def _auto_rate_clear(self) -> None:
         self._auto_rate_t0 = None
@@ -2509,7 +2487,7 @@ class VideoPreviewPlayer(tk.Frame):
             self._calib_set_label("标定进行中…", "#daa520")
             return
         self._calib_pair_lines = []
-        ignore = bool(self.preview_ignore_speedup_var.get())
+        ignore = False
         self._calib_begin_run("single", ignore_biz=ignore, anchor_frame=None)
 
     def _calib_start_pair(self) -> None:
@@ -2589,7 +2567,7 @@ class VideoPreviewPlayer(tk.Frame):
             if self._fps_samples:
                 self._fps_samples.clear()
         shower = getattr(self._io, "show_osd_corner_text", None)
-        if not callable(shower) or not bool(self.show_frame_osd_var.get()):
+        if not callable(shower) or not bool(self.show_fps_osd_var.get()):
             return
         if not self.is_playing:
             return
@@ -2869,7 +2847,7 @@ class VideoPreviewPlayer(tk.Frame):
                 break
         else:
             p = self.settings.get_params()
-            ignore_biz = bool(self.preview_ignore_speedup_var.get())
+            ignore_biz = False
             for seg in self.speed_segments:
                 if seg['start'] <= cur <= seg['end']:
                     t = seg['type']
