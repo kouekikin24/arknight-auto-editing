@@ -1,0 +1,312 @@
+{
+ "assets": [
+  {
+   "path": ".cache\\v3ass\\analyze_user_pair.py",
+   "class": "analyze_user_pair"
+  },
+  {
+   "path": ".cache\\v3ass\\ass_roundtrip.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\burn_isolate.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\c4_region_diag.py",
+   "class": "c4_"
+  },
+  {
+   "path": ".cache\\v3ass\\calibrate.py",
+   "class": "calibrat"
+  },
+  {
+   "path": ".cache\\v3ass\\chain_isolate.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\check_dump.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\color_probe.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\crop_corners.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\crop_corners2.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\default_size_probe.py",
+   "class": "default_size_probe"
+  },
+  {
+   "path": ".cache\\v3ass\\diag_pts_range.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\duo_instance.py",
+   "class": "duo_instance"
+  },
+  {
+   "path": ".cache\\v3ass\\esc_test.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\find_bounds.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\g_precise.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\matrix_decide.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\measure_pair.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\mpv_color_params.py",
+   "class": "mpv_"
+  },
+  {
+   "path": ".cache\\v3ass\\mpv_color_params2.py",
+   "class": "mpv_"
+  },
+  {
+   "path": ".cache\\v3ass\\mpv_identity.py",
+   "class": "mpv_"
+  },
+  {
+   "path": ".cache\\v3ass\\offset_check.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\outline_test.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_b_geometry.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_burn_dump.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\shift_test.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c.py",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c4.py",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c5.py",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c6.py",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c_landing.py",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c_landing4.py",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\static_shift_probe.py",
+   "class": "static_shift_probe"
+  },
+  {
+   "path": ".cache\\v3ass\\step_latency_probe.py",
+   "class": "step_latency_probe"
+  },
+  {
+   "path": ".cache\\v3ass\\transfer_curve.py",
+   "class": "transfer_curve"
+  },
+  {
+   "path": ".cache\\v3ass\\user_shots.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_c4_prod.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_fixes.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_gui.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_gui2.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\window_curve.py",
+   "class": "window_curve"
+  },
+  {
+   "path": ".cache\\v3ass\\window_curve2.py",
+   "class": "window_curve"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c4_results.json",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\spike_c_results.json",
+   "class": "spike_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_c4_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": "PRODUCTION_PTS_GOLDEN_20260816_v1",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_PTS_GOLDEN_20260816_v2",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_PTS_GOLDEN_20260816_v3",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_PTS_GOLDEN_VFR_20260816_v1",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_PTS_GOLDEN_VFR_20260816_v2",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_REAL_SAMPLE_20260816",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_VFR_AV_DEBUG_20260816_v1",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_VFR_AV_DEBUG_20260816_v2",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_VFR_DEBUG_20260816_v1",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "PRODUCTION_VFR_DEBUG_20260816_v2",
+   "class": "PRODUCTION_"
+  },
+  {
+   "path": "MPV_GATE_DECISION_20260816_v1.json",
+   "class": "MPV_GATE_DECISION_"
+  },
+  {
+   "path": "MPV_GATE_DECISION_20260816_v2.json",
+   "class": "MPV_GATE_DECISION_"
+  },
+  {
+   "path": "MPV_GATE_DECISION_20260819_v3.json",
+   "class": "MPV_GATE_DECISION_"
+  },
+  {
+   "path": "MPV_GATE_DECISION_20260822_v4.json",
+   "class": "MPV_GATE_DECISION_"
+  },
+  {
+   "path": ".cache\\pyav_kf\\2_750205379_1784276987.npz",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\pyav_kf\\4_2265644549_1784276989.npz",
+   "class": "individual"
+  },
+  {
+   "path": "HANDOFF_C4STILL_20260904.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_CURRENT.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_EXPORT_PERF_20260830.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_PAUSE_STILL_20260903.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_PR_STRATEGY_20260901.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_PREVIEW.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_PREVIEW_ACCURACY.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_PYAV_CONSOLIDATION.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_STATE_20260827.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_TIMING.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_UI_REVIEW_20260902.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_V3ASS_20260904.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "AGENTS.md",
+   "class": "individual"
+  },
+  {
+   "path": "checklist.md",
+   "class": "individual"
+  },
+  {
+   "path": "ASSET_INVENTORY.md",
+   "class": "individual"
+  },
+  {
+   "path": "asset_index.json",
+   "class": "individual"
+  }
+ ]
+}
