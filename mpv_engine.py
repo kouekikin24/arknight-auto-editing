@@ -226,6 +226,9 @@ class MpvEngine:
             "osc": "no",
             "framedrop": "vo",
             "hr_seek": "yes",
+            # 钉死 OSD 字体：暂停静帧的帧号由 ffmpeg/libass 按同字体同参数
+            # 烧录，两侧必须解析到同一字体文件才能逐像素一致
+            "osd-font": "Microsoft YaHei",
         }
         if self.wid is None:
             options["vo"] = "null"

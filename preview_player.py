@@ -280,12 +280,21 @@ class VideoPreviewPlayer(tk.Frame):
         self._still_last_gray = None
         self._still_pending = None
         self._still_decoding: bool = False
+        self._still_resize_after = None
+        self._video_dims: tuple[int, int] | None = None
+        self._still_matrix = None
         self._was_playing: bool = False
         # PyAV 静帧解码（API 层主选）：关键帧索引表后台构建（npz 缓存），
         # 未就绪/未安装时自动回退 ffmpeg CLI 两段式，再回退 OpenCV
         self._pyav_kf = None
         self._pyav_state = "idle"
         self._pyav_container = None
+        # 方案 C：暂停静帧由隐藏 mpv 实例自渲染（单帧 Y4M 喂入），与播放
+        # 同一渲染管线 → 逐像素一致。主线程建实例，工作线程只发命令。
+        self._still_mpv = None
+        self._still_mpv_top = None
+        self._still_mpv_size = (0, 0)
+        self._still_mpv_settle_until = 0.0
         # (monotonic, source_frame, mpv_drop_count) 采样，用于右上角
         # 瞬时播放帧率（≈1s 窗口，丢帧不计入“看到的”帧率）
         self._fps_samples: deque = deque(maxlen=64)
@@ -353,6 +362,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.show_frame_osd_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             ctrl, text="屏显帧号", variable=self.show_frame_osd_var,
+            command=self._on_frame_osd_toggle,
         ).pack(side=tk.LEFT, padx=5)
 
         # 右上角播放帧率 OSD 的独立开关（与帧号分开控制）
@@ -471,6 +481,48 @@ class VideoPreviewPlayer(tk.Frame):
             )
         except Exception:
             pass
+        # 静帧的黑边和帧号已按窗口尺寸烧进位图：尺寸变了按新尺寸重出
+        if not self.is_playing and self._still_overlay is not None:
+            if self._still_resize_after is not None:
+                try:
+                    self.after_cancel(self._still_resize_after)
+                except Exception:
+                    pass
+            self._still_resize_after = self.after(180, self._reblit_resized_still)
+
+    def _reblit_resized_still(self) -> None:
+        self._still_resize_after = None
+        if self._closing or self.is_playing or self._still_overlay is None:
+            return
+        if self._still_decoding:
+            # 在飞的解码出的是旧尺寸：落地后再按新尺寸重出一帧
+            self._still_resize_after = self.after(180, self._reblit_resized_still)
+            return
+        self._show_paused_still(int(self.current_frame_idx))
+
+    def _on_frame_osd_toggle(self) -> None:
+        """帧号开关：播放中立即显隐 mpv overlay；暂停中重出静帧（烧字与否）。
+
+        播放中取消勾选必须主动清——持久 overlay 不会自己消失，
+        不清会把旧帧号定格在画面上。
+        """
+        try:
+            on = bool(self.show_frame_osd_var.get())
+        except Exception:
+            return
+        if self.is_playing:
+            if on:
+                self._osd_pending = True
+                self._maybe_show_frame_osd(self.current_frame_idx)
+            else:
+                shower = getattr(self._io, "show_osd_topleft_text", None)
+                if callable(shower):
+                    try:
+                        shower("")
+                    except Exception:
+                        pass
+        elif self._still_overlay is not None:
+            self._show_paused_still(int(self.current_frame_idx))
 
     def _make_preview_engine(self, path: str) -> PreviewEngine:
         # CvEngine owns the only long-lived OpenCV capture.  Avoid opening a
@@ -486,8 +538,12 @@ class VideoPreviewPlayer(tk.Frame):
         try:
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         finally:
             cap.release()
+        # 静帧化妆链按 mpv 的 floor 取整规则预计算内容尺寸，需要源尺寸
+        self._video_dims = (vw, vh) if vw > 0 and vh > 0 else None
         if self._engine_factory is not None:
             factory_kwargs = {
                 "frame_queue": self._frame_q,
@@ -556,6 +612,7 @@ class VideoPreviewPlayer(tk.Frame):
             return io_closed and not survivors
         self._closing = True
         self._pyav_reset()
+        self._teardown_still_mpv()
         self.task_manager.invalidate(_ANALYSIS_TASK)
         self.task_manager.invalidate(_MEDIA_INFO_TASK)
         self.task_manager.invalidate(_FRAME_PTS_TASK)
@@ -1079,13 +1136,21 @@ class VideoPreviewPlayer(tk.Frame):
             ffmpeg_path = None
         # 碰撞刻度消歧依据：N 在暂停段内=暗帧，否则亮帧（主线程读段落）
         expected_bright = self._expected_bright(int(frame_idx))
+        # 帧号文本在主线程拼好（与播放态 mpv OSD 同格式）；开关关=空串=不烧字
+        try:
+            show_osd = bool(self.show_frame_osd_var.get())
+        except Exception:
+            show_osd = True
+        osd_text = (self._still_frame_text(int(frame_idx)) if show_osd else "")
+        # 方案 C：主线程建/复用隐藏渲染实例（工作线程不可碰 Tk）
+        self._ensure_still_mpv(w, h)
         self._overlay_gen += 1
         gen = self._overlay_gen
         self._still_decoding = True
         threading.Thread(
             target=self._decode_still_work,
             args=(int(frame_idx), gen, w, h, float(t), ffmpeg_path,
-                  expected_bright),
+                  expected_bright, osd_text),
             daemon=True,
         ).start()
 
@@ -1104,20 +1169,324 @@ class VideoPreviewPlayer(tk.Frame):
                 continue
         return True
 
+    def _still_frame_text(self, frame_idx: int) -> str:
+        """与播放态 mpv OSD 完全一致的帧号文本。"""
+        return f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}"
+
+    def _build_still_ass(self, w: int, h: int, text: str):
+        """生成与 mpv OSD 逐像素对齐的临时 ASS，返回路径（失败 None）。
+
+        常数来自 .cache/v3ass 标定（三尺寸 bbox 零差）：两侧同为 libass +
+        Microsoft YaHei 是一致的前提；PlayResX=W*720/H 使横纵缩放同为
+        H/720，与 mpv 的窗高缩放定律一致。
+        """
+        try:
+            import tempfile
+            px = max(1, round(w * 720 / h))
+            ass = (Path(tempfile.gettempdir())
+                   / f"arknight_still_osd_{os.getpid()}.ass")
+            ass.write_text(
+                "[Script Info]\nScriptType: v4.00+\n"
+                f"PlayResX: {px}\nPlayResY: 720\n"
+                "ScaledBorderAndShadow: yes\n\n"
+                "[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, "
+                "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, "
+                "Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+                "MarginL, MarginR, MarginV, Encoding\n"
+                "Style: OSD,Microsoft YaHei,30,&H00FFFFFF,&H00000000,&H80000000,"
+                "0,0,0,0,100,100,0,0,1,1.65,0,7,15,15,15,1\n\n"
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+                "MarginV, Effect, Text\n"
+                f"Dialogue: 0,0:00:00.00,0:00:01.00,OSD,,0,0,0,,{text}\n",
+                encoding="utf-8")
+            return ass
+        except Exception:
+            return None
+
+    def _still_color_matrix(self) -> str:
+        """静帧链的 yuv→rgb 矩阵，与 mpv 对未标记流的启发式对齐。
+
+        源带颜色标记则尊重标记（bt709/601 系）；未标记则按 mpv 规则：
+        高 ≥720 用 bt709，否则 bt601。实测本仓 OBS 源全部未标记，mpv 按
+        709 渲染——静帧若用 swscale 默认的 601，饱和区会产生 R/G 通道
+        1.5+ 灰阶的系统性偏差（用户可察觉的"颜色有点不一样"）。
+        """
+        m = self._still_matrix
+        if m is not None:
+            return m
+        tag = None
+        try:
+            import av
+            c = av.open(str(self.video_path))
+            raw = getattr(c.streams.video[0].codec_context, "colorspace", None)
+            c.close()
+            tag = int(getattr(raw, "value", raw)) if raw is not None else None
+        except Exception:
+            tag = None
+        if tag == 1:             # AVCOL_SPC_BT709
+            m = "bt709"
+        elif tag in (5, 6):      # BT470BG / SMPTE170M（601 系）
+            m = "smpte170m"
+        else:                    # 未标记：跟随 mpv 的高清启发式
+            dims = self._video_dims
+            m = "bt709" if (dims and dims[1] >= 720) else "smpte170m"
+        self._still_matrix = m
+        return m
+
+    def _still_filter_chain(self, w: int, h: int, ass_path,
+                            select_expr: str = "", native_dims=None,
+                            matrix=None) -> str:
+        """静帧化妆链：[select] → 保比例缩放 → 补黑边 → [矩阵打标] → 烧帧号。
+
+        内容尺寸按 mpv 的 floor 取整规则在 Python 侧算死：实测同一
+        1920x1080 源在 1000x483 目标下，mpv 取 858 宽放 x=71，scale 滤镜
+        的自动比例取 859 放 x=70——暂停/播放切换会有 1px 横移。native_dims
+        未知时退回自动比例（接受 ≤1px 差）。ass= 的 Windows 路径必须
+        正斜杠 + 冒号转义 + 单引号包裹。ass 滤镜按帧 PTS 匹配 Dialogue
+        时间窗：两段式寻址带 -copyts 时帧带着源片原始大 PTS，必须 setpts
+        归零，否则文本静默不渲染。matrix 只能由 scale 滤镜的
+        in_color_matrix 亲自执行（实测 setparams 打标不驱动自动转换器）；
+        设了矩阵后 scale 直接输出 rgb，pad/ass 在 RGB 域工作。
+        """
+        chain = select_expr
+        cw = ch = 0
+        if native_dims:
+            nw, nh = native_dims
+            if nw > 0 and nh > 0:
+                if w * nh >= nw * h:    # 高度绑定（目标比源更宽）
+                    ch = h
+                    cw = max(1, (h * nw) // nh)
+                else:                   # 宽度绑定
+                    cw = w
+                    ch = max(1, (w * nh) // nw)
+        cm = f":in_color_matrix={matrix}" if matrix else ""
+        if cw:
+            chain += (f"scale={cw}:{ch}:flags=area{cm},"
+                      f"pad={w}:{h}:{(w - cw) // 2}:{(h - ch) // 2}:color=black")
+        else:
+            chain += (f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+                      f":flags=area{cm},"
+                      f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black")
+        if ass_path is not None:
+            esc = str(ass_path).replace("\\", "/").replace(":", "\\:")
+            chain += f",setpts=PTS-STARTPTS,ass='{esc}'"
+        return chain
+
+    def _still_burn_ffmpeg(self, data: bytes, nw: int, nh: int, pix_fmt: str,
+                           w: int, h: int, ass_path, ffmpeg_path):
+        """原生帧字节 → ffmpeg CLI 化妆链 → 窗口尺寸成品图。
+
+        pix_fmt 为 yuv420p 时颜色矩阵在链里按 mpv 启发式打标（消除
+        601/709 分歧）；rgb24 输入的矩阵转换已在上游发生，不再干预。
+        """
+        try:
+            ff = resolve_ffmpeg_path(ffmpeg_path)
+            matrix = self._still_color_matrix() if pix_fmt == "yuv420p" else None
+            cmd = [str(ff), "-y", "-loglevel", "error",
+                   "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{nw}x{nh}",
+                   "-i", "-",
+                   "-vf", self._still_filter_chain(w, h, ass_path,
+                                                   native_dims=(nw, nh),
+                                                   matrix=matrix),
+                   "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            out = subprocess.run(cmd, input=data,
+                                 capture_output=True, timeout=15).stdout
+            if len(out) < w * h * 3:
+                return None
+            return PIL.Image.frombytes("RGB", (w, h), bytes(out[: w * h * 3]))
+        except Exception:
+            return None
+
+    def _burn_av_frame(self, frame, w: int, h: int, ass_path, ffmpeg_path):
+        """PyAV 帧的化妆入口：优先零转换地喂 yuv420p 平面（矩阵在链里
+        对齐 mpv），非 yuv420p 源退回 rgb24。"""
+        nw, nh = frame.width, frame.height
+        yuv = self._pyav_frame_yuv420p_bytes(frame)
+        if yuv is not None:
+            img = self._still_burn_ffmpeg(yuv, nw, nh, "yuv420p",
+                                          w, h, ass_path, ffmpeg_path)
+            if img is not None:
+                return img
+        rgb = frame.to_ndarray(format="rgb24")
+        pil = PIL.Image.fromarray(rgb)
+        return (self._still_burn_ffmpeg(rgb.tobytes(), nw, nh, "rgb24",
+                                        w, h, ass_path, ffmpeg_path)
+                or pil.resize((w, h)))
+
+    # ---- 方案 C：隐藏 mpv 实例自渲染静帧（与播放同管线，逐像素一致） ----
+
+    def _ensure_still_mpv(self, w: int, h: int):
+        """主线程建/复用离屏隐藏 mpv 实例（wid 嵌入无任务栏按钮的
+        Toplevel，运行时可改尺寸免重建）。任何失败返回 None → 走兜底链。
+        """
+        if self._still_mpv is not None:
+            if (w, h) != self._still_mpv_size and self._still_mpv_top is not None:
+                try:
+                    self._still_mpv_top.geometry(f"{w}x{h}+20000+20000")
+                    self._still_mpv_top.update_idletasks()
+                    self._still_mpv_size = (w, h)
+                    # 窗口 resize 触发 mpv vo 重配（其内部线程异步进行）；
+                    # 工作线程的命令必须等重配完成，否则 d3d11 交换链竞态
+                    self._still_mpv_settle_until = time.monotonic() + 0.4
+                except Exception:
+                    pass
+            return self._still_mpv
+        try:
+            import mpv
+            top = tk.Toplevel(self)
+            top.overrideredirect(True)
+            top.geometry(f"{w}x{h}+20000+20000")
+            top.configure(bg="black")
+            top.update_idletasks()
+            p = mpv.MPV(
+                vo="gpu", wid=str(top.winfo_id()), idle="yes",
+                keep_open="yes", pause="yes", hr_seek="yes", osc="no",
+                audio="no", terminal="no", input_default_bindings="no",
+                input_vo_keyboard="no", osd_font="Microsoft YaHei",
+                keepaspect_window="no", image_display_duration="inf",
+                osd_duration=1)
+            self._still_mpv = p
+            self._still_mpv_top = top
+            self._still_mpv_size = (w, h)
+            return p
+        except Exception:
+            self._still_mpv = None
+            self._still_mpv_top = None
+            return None
+
+    def _teardown_still_mpv(self) -> None:
+        # 等工作线程离开 libmpv 命令窗口（identity 检查之外的最后保险）
+        end = time.time() + 1.0
+        while time.time() < end and self._still_decoding:
+            time.sleep(0.05)
+        p = self._still_mpv
+        top = self._still_mpv_top
+        self._still_mpv = None
+        self._still_mpv_top = None
+        self._still_mpv_size = (0, 0)
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        if top is not None:
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _write_still_y4m(path, yuv: bytes, w: int, h: int) -> None:
+        header = (f"YUV4MPEG2 W{w} H{h} F60:1 Ip A1:1 C420mpeg2 "
+                  f"XYSCSS=420MPEG2\nFRAME\n")
+        with open(path, "wb") as f:
+            f.write(header.encode("ascii"))
+            f.write(yuv)
+
+    def _still_render_mpv(self, frame, w: int, h: int, osd_text: str):
+        """工作线程：单帧 Y4M → 隐藏实例 loadfile → window 截图 → PIL。
+
+        帧精确由构造保证（无时间寻址）；Y4M=未标记 YUV → mpv 走与真实
+        视频相同的色彩启发式；window 截图含上屏转换 → 与播放逐像素一致。
+        任何环节失败返回 None，调用方回退 ffmpeg 化妆链。
+        """
+        p = self._still_mpv
+        if p is None:
+            return None
+        yuv = self._pyav_frame_yuv420p_bytes(frame)
+        if yuv is None:
+            return None
+        try:
+            # resize 后等 mpv vo 重配完成（主线程记的稳定截止点）
+            wait = self._still_mpv_settle_until - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            if self._still_mpv is not p:  # 期间被 teardown/重建
+                return None
+            import tempfile
+            y4m = Path(tempfile.gettempdir()) / \
+                f"arknight_still_{os.getpid()}.y4m"
+            self._write_still_y4m(y4m, yuv, frame.width, frame.height)
+            if osd_text:
+                safe = (osd_text.replace("\\", "\\\\").replace("{", "\\{")
+                        .replace("}", "\\}"))
+                p.command("osd-overlay", 2, "ass-events",
+                          "{\\an7}" + safe, 0, 0, 0)
+            else:
+                p.command("osd-overlay", 2, "none", "", 0, 0, 0)
+            p.command("loadfile", str(y4m))
+            end = time.time() + 5
+            loaded = False
+            while time.time() < end:
+                if (getattr(p, "path", None) or "").endswith(".y4m"):
+                    loaded = True
+                    break
+                time.sleep(0.03)
+            if not loaded:
+                return None
+            time.sleep(0.25)
+            shot = Path(tempfile.gettempdir()) / \
+                f"arknight_still_shot_{os.getpid()}.png"
+            if shot.exists():
+                shot.unlink()
+            if self._still_mpv is not p:  # teardown 竞态保护
+                return None
+            p.command("screenshot-to-file", str(shot), "window")
+            end = time.time() + 5
+            last = -1
+            while time.time() < end:
+                if shot.is_file():
+                    sz = shot.stat().st_size
+                    if sz > 0 and sz == last:
+                        break
+                    last = sz
+                time.sleep(0.03)
+            else:
+                return None
+            img = PIL.Image.open(shot).convert("RGB")
+            if img.size != (w, h):
+                return None
+            return img
+        except Exception:
+            return None
+
     def _decode_still_work(self, frame_idx: int, gen: int,
                            w: int, h: int, t: float, ffmpeg_path,
-                           expected_bright: bool) -> None:
+                           expected_bright: bool, osd_text: str) -> None:
         try:
-            # 解码后端优先级：PyAV（API 层计数定帧，表就绪时）→
-            # ffmpeg CLI 两段式（A_PT 工具链）→ OpenCV
+            # 解码后端只负责出"对的那帧"（PyAV 计数定帧 → ffmpeg 两段式 →
+            # OpenCV）；保比例+黑边+帧号的化妆统一走 ffmpeg CLI 一条链，
+            # 与播放态 mpv OSD 同为 libass 渲染。子进程不可用时退回
+            # 硬拉伸——宁可变形，不让暂停画面空白。
+            ass_path = None
+            if osd_text:
+                ass_path = self._build_still_ass(w, h, osd_text)
             img = None
             if self._pyav_kf is not None:
-                img = self._still_decode_pyav(frame_idx, w, h, expected_bright)
+                frame = self._still_decode_pyav(frame_idx, expected_bright)
+                if frame is not None:
+                    # 方案 C 主路：隐藏 mpv 自渲染（与播放同管线）；
+                    # 失败回退 ffmpeg 化妆链（烧帧号走 ASS）
+                    img = self._still_render_mpv(frame, w, h, osd_text)
+                    if img is None:
+                        img = self._burn_av_frame(frame, w, h, ass_path,
+                                                  ffmpeg_path)
             if img is None:
                 img = self._still_decode_ffmpeg(frame_idx, w, h, t, ffmpeg_path,
-                                                expected_bright)
+                                                expected_bright, ass_path)
             if img is None:
-                img = self._still_decode_opencv(frame_idx, w, h)
+                native = self._still_decode_opencv(frame_idx)
+                if native is not None:
+                    # OpenCV 的 BGR→RGB 转换已按 601 发生，矩阵无法再修；
+                    # 兜底路径接受这一已知偏差
+                    img = (self._still_burn_ffmpeg(native.tobytes(),
+                                                   native.size[0],
+                                                   native.size[1],
+                                                   "rgb24", w, h, ass_path,
+                                                   ffmpeg_path)
+                           or native.resize((w, h)))
             if img is None:
                 return
             arr = np.asarray(img)
@@ -1132,7 +1501,8 @@ class VideoPreviewPlayer(tk.Frame):
             self._still_decoding = False
 
     def _still_decode_ffmpeg(self, frame_idx: int, w: int, h: int,
-                             t: float, ffmpeg_path, expected_bright: bool):
+                             t: float, ffmpeg_path, expected_bright: bool,
+                             ass_path):
         try:
             ff = resolve_ffmpeg_path(ffmpeg_path)
             # 两段式精确取帧：输入 -ss 在本仓源上实测会落在目标前几帧
@@ -1141,9 +1511,14 @@ class VideoPreviewPlayer(tk.Frame):
             # 抓 2 帧：碰撞 tick 上两帧共用同一 pts，第一帧可能是前一段；
             # 用分析器语境（该帧应为暗/亮）挑对的那帧。
             back = max(0.0, float(t) - 0.5)
+            chain = self._still_filter_chain(
+                w, h, ass_path,
+                select_expr=f"select=gte(t\\,{float(t):.6f}),",
+                native_dims=self._video_dims,
+                matrix=self._still_color_matrix())
             cmd = [str(ff), "-y", "-loglevel", "error", "-copyts",
                    "-ss", f"{back:.6f}", "-i", str(self.video_path),
-                   "-vf", f"select=gte(t\\,{float(t):.6f}),scale={w}:{h}",
+                   "-vf", chain,
                    "-vsync", "0", "-frames:v", "2",
                    "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
             out = subprocess.run(cmd, capture_output=True, timeout=10).stdout
@@ -1156,14 +1531,17 @@ class VideoPreviewPlayer(tk.Frame):
                 return imgs[0]
 
             def luma(im):
-                return float(np.asarray(im.convert("L")).mean())
+                # 黑边和烧字都在边缘：只量中央 50% 内容区，避免阈值被污染
+                cw, ch = im.size
+                crop = im.crop((cw // 4, ch // 4, cw * 3 // 4, ch * 3 // 4))
+                return float(np.asarray(crop.convert("L")).mean())
 
             want = 62.0 if expected_bright else 40.0
             return min(imgs, key=lambda im: abs(luma(im) - want))
         except Exception:
             return None
 
-    def _still_decode_opencv(self, frame_idx: int, w: int, h: int):
+    def _still_decode_opencv(self, frame_idx: int):
         try:
             cap = cv2.VideoCapture(str(self.video_path))
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -1171,7 +1549,8 @@ class VideoPreviewPlayer(tk.Frame):
             cap.release()
             if not ok or frame is None:
                 return None
-            rgb = cv2.cvtColor(cv2.resize(frame, (w, h)), cv2.COLOR_BGR2RGB)
+            # 原生分辨率返回；缩放/黑边/帧号统一走 ffmpeg 化妆链
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             return PIL.Image.fromarray(rgb)
         except Exception:
             return None
@@ -1181,27 +1560,51 @@ class VideoPreviewPlayer(tk.Frame):
             return
         if self._still_overlay is None:
             self._still_overlay = tk.Frame(self.video_surface, bg="black")
-            self._still_label = tk.Label(self._still_overlay, bg="black")
-            self._still_label.pack(fill=tk.BOTH, expand=True)
-            # mpv 的帧号 OSD 画在 mpv 窗口内，会被本覆盖层盖住；
-            # 暂停态在覆盖层上自绘同样的左上角帧号
-            self._still_osd = tk.Label(
-                self._still_overlay, bg="black", fg="white", anchor="w")
-            self._still_osd.place(x=8, y=6)
-            self._still_overlay.pack(fill=tk.BOTH, expand=True)
+            # bd/highlightthickness 必须钉 0：Label 默认 bd=2，会把位图内嵌 2px
+            self._still_label = tk.Label(
+                self._still_overlay, bg="black", bd=0, highlightthickness=0)
+            # 居中不用 relx/rely+anchor=center：place 对奇数尺寸取整不对称
+            # （round(m*0.5) - c//2 = +1），位图会下移 1px——默认窗口高度
+            # 为奇数时"暂停画面下移 1px"的根因（4K 偶数高度不发作）。
+            # 显式整数 floor 居中，与 mpv/化妆链的取整规则一致；
+            # 窗口缩放期间由 Configure 重新居中（位图重出前的过渡态）。
+            self._still_overlay.bind(
+                "<Configure>", lambda _e: self._recenter_still_label(), add="+")
+        # 帧号已按 mpv OSD 同款参数烧进位图，无需再叠 Tk 文本
         self._still_photo = PIL.ImageTk.PhotoImage(img)
         self._still_label.config(image=self._still_photo)
+        self._recenter_still_label()
+        # 覆盖层恒等于 video_surface 全幅，与位图尺寸无关
+        self._still_overlay.place(x=0, y=0, relwidth=1, relheight=1)
         self._still_overlay.lift()
+        # 自愈：位图与面板尺寸不符（启动竞态/漏收的 Configure）→ 重出一帧
         try:
-            if bool(self.show_frame_osd_var.get()):
-                self._still_osd.config(
-                    text=f"帧 {frame_idx:,} / {max(0, self.total_frames - 1):,}")
-            else:
-                self._still_osd.config(text="")
+            sw = self.video_surface.winfo_width()
+            sh = self.video_surface.winfo_height()
+            if (sw > 1 and sh > 1 and (sw, sh) != img.size
+                    and self._still_resize_after is None):
+                self._still_resize_after = self.after(
+                    200, self._reblit_resized_still)
         except Exception:
             pass
         self._still_last_gray = gray
         self._still_frame_idx = frame_idx
+
+    def _recenter_still_label(self) -> None:
+        """显式整数居中静帧位图（floor，与 mpv/化妆链取整规则一致）。"""
+        ov = self._still_overlay
+        lbl = getattr(self, "_still_label", None)
+        photo = self._still_photo
+        if ov is None or lbl is None or photo is None:
+            return
+        try:
+            ow, oh = ov.winfo_width(), ov.winfo_height()
+            if ow <= 1 or oh <= 1:
+                return
+            lbl.place(x=(ow - photo.width()) // 2,
+                      y=(oh - photo.height()) // 2)
+        except Exception:
+            pass
 
     def _drain_still_pending(self) -> None:
         item = self._still_pending
@@ -1214,6 +1617,12 @@ class VideoPreviewPlayer(tk.Frame):
         self._overlay_gen += 1
         self._still_pending = None
         self._still_last_gray = None
+        if self._still_resize_after is not None:
+            try:
+                self.after_cancel(self._still_resize_after)
+            except Exception:
+                pass
+            self._still_resize_after = None
         ov = self._still_overlay
         self._still_overlay = None
         if ov is not None:
@@ -1243,6 +1652,29 @@ class VideoPreviewPlayer(tk.Frame):
         except Exception:
             return None
 
+    @staticmethod
+    def _pyav_frame_yuv420p_bytes(frame):
+        """零转换取出 yuv420p 紧密打包字节（YUV 三平面按行宽裁剪拼接）。
+
+        颜色矩阵转换刻意留给化妆链（对齐 mpv 的启发式）；非 yuv420p
+        源返回 None，调用方退回 rgb24 路径。与 _pyav_frame_hash64 同款
+        零拷贝直读平面手法。
+        """
+        try:
+            if getattr(frame.format, "name", None) != "yuv420p":
+                return None
+            w, h = frame.width, frame.height
+            cw, ch = (w + 1) // 2, (h + 1) // 2
+            parts = []
+            for i, (pw, ph) in enumerate(((w, h), (cw, ch), (cw, ch))):
+                p = frame.planes[i]
+                buf = (ctypes.c_ubyte * p.buffer_size).from_address(p.buffer_ptr)
+                a = np.frombuffer(buf, dtype=np.uint8).reshape(ph, p.line_size)
+                parts.append(np.ascontiguousarray(a[:, :pw]).tobytes())
+            return b"".join(parts)
+        except Exception:
+            return None
+
     def _pyav_table_path(self):
         if not self.video_path:
             return None
@@ -1258,6 +1690,7 @@ class VideoPreviewPlayer(tk.Frame):
     def _pyav_reset(self) -> None:
         self._pyav_kf = None
         self._pyav_state = "idle"
+        self._still_matrix = None  # 新视频要重新判定颜色矩阵
         c = self._pyav_container
         self._pyav_container = None
         if c is not None:
@@ -1328,8 +1761,7 @@ class VideoPreviewPlayer(tk.Frame):
         except Exception:
             self._pyav_state = "idle"
 
-    def _still_decode_pyav(self, frame_idx: int, w: int, h: int,
-                           expected_bright: bool):
+    def _still_decode_pyav(self, frame_idx: int, expected_bright: bool):
         """MLT 计数式定帧 + 指纹验戳：计数给唯一答案，指纹只做裁判。
 
         PyAV(FFmpeg 8) 的 pts 标签与认证账本在碰撞处不一致（实测 0~2 帧
@@ -1408,8 +1840,9 @@ class VideoPreviewPlayer(tk.Frame):
                 return float(g.mean())
 
             best = min(group, key=lambda f: abs(fluma(f) - want))
-        rgb = best.to_ndarray(format="rgb24")
-        return PIL.Image.fromarray(rgb).resize((w, h))
+        # 返回原生帧（不做任何颜色/尺寸转换）：yuv→rgb 矩阵由化妆链
+        # 按 mpv 启发式打标执行，若此处先转 rgb 矩阵就定型成 601 了
+        return best
 
     def _seek(self, frame_idx: int, skip_trim: bool = False):
         self._auto_rate_clear()
