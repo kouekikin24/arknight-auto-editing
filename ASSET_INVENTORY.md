@@ -16,7 +16,7 @@
 
 | 资产 | 路径 | 跟踪 |
 |---|---|---|
-| libmpv-2.dll | `tools/libmpv/dll/` | 故意不跟踪 |
+| libmpv-2.dll | `tools/libmpv/dll/`（=mpv v0.41.0-926-ge034d612c，T0实测） | 故意不跟踪 |
 | ffmpeg 7.1.0 | `tools/ffmpeg-7.1.0/` | 故意不跟踪 |
 | PyAV 关键帧表 | `.cache/pyav_kf/*.npz` | gitignore,按size+mtime失效 |
 
@@ -30,13 +30,15 @@
 
 标定calibrate / 端到端verify_gui2 / 色彩transfer_curve+mpv_color_params2 /
 几何probe_b_geometry+default_size_probe / C排雷spike_c*+c4/c5/c6+duo_instance /
-验收verify_c4_prod+step_latency_probe+c4_region_diag。结论见§六。
+验收verify_c4_prod+step_latency_probe+c4_region_diag /
+原生步进probe_frame_step(+diag_step) / 集成smoke_engine_step /
+seek落点probe_seek_timepos(+probe_static_identity)。结论见§六。
 
 ## 五、决策与交接
 
 - 交接链(已跟踪): HANDOFF_{STATE_0827,EXPORT_PERF_0830,PR_STRATEGY_0901,
-  UI_REVIEW_0902,PAUSE_STILL_0903,V3ASS_0904}.md 等~11份；
-  未跟踪: HANDOFF_C4STILL_0904.md、本文件。
+  UI_REVIEW_0902,PAUSE_STILL_0903,V3ASS_0904,C4STILL_0904,
+  NATIVESTEP_20260905}.md 等；**当前头=NATIVESTEP_20260905**。
 - 决策(故意不跟踪): MPV_GATE_DECISION_*_v{1,2}.json、MPV_PHASE0_{SPEC,RESULTS}.md、
   PRODUCTION_{PTS_GOLDEN,VFR}*、arknight-preview-pack.zip、_wf_plan.json。
 - 已跟踪: UPSTREAM_FIX_PR_DRAFT.md、AV_REVIEW_AUTOVERIFICATION.md。
@@ -60,7 +62,12 @@
 | 内嵌暂停保留 fps 角标(延迟清) | c4 | OSD 复刻 |
 | PyAV容器非线程安全 / resize与vo重配竞态 | 段错误 | 单worker+settle |
 | 跨双屏被DPI重采样污染 | c4右条 | 测量须单屏 |
-| (提案未证) G双窗原生呈现≈80-100ms且不碰内嵌状态 | 本轮分析 | 待开工 |
+| **原生 frame-step/frame-back-step 帧精确**：6步前进+后退全部 bit-exact(mad≤0.024)，延迟0.3-17.2ms(均值8.6)，VFR源同样成立；校准偏移0.0即精确落帧 | probe_frame_step(2026-09-04,T0) | 取代C4步进/双窗G |
+| **裸命令可用、input-command 元命令 -4**（此 v0.41.0-926 构建上不可用）；步进一律 `("frame-step",)`/`("frame-back-step",)` 直发 | probe_frame_step | 命令选型 |
+| **site-packages python-mpv 无 `MPV.get_property()` 方法**：调用会走 __getattr__ 误读 "get-property" 属性→AttributeError(-8)；读状态用属性访问(p.time_pos/p.pause)或 observe_property（均实测可用） | probe_frame_step | 引擎读路径 |
+| time-pos observe 在 frame-step 后立即更新(1/60步进可辨)；直读 C-API mpv_get_property 亦可用（raw ctypes），唯 wrapper 的 get_property 缺失 | probe_frame_step | 延迟测量法 |
+| **暂停 exact seek 后 time-pos 报实际呈现帧 PTS（非目标值）**：52 seek×26点+16静止点扫描，可分辨点12/13支持、唯1在16.7ms模糊带；偏离落点∈[-2,+2]帧，「看」有信号 → 选项2（seek+看+补）老否决可复核，需黄金集全边界验证 | probe_seek_timepos+probe_static_identity(2026-09-05,T0) | ②G选项2 前置条件已验 |
+| (提案未证) G双窗原生呈现≈80-100ms且不碰内嵌状态 | 本轮分析 | 探针D已证可被原生步进替代 |
 
 ## 七、铁律（唯一权威源；交接只引用不复制）
 
@@ -85,8 +92,8 @@
 
 | 日期 | 决策 | 上下文 | 选择 | 后果 | 状态 |
 |---|---|---|---|---|---|
-| 09-04 | mpv剥离业务变速 | 引擎拒播速度策略,日用保护 | 忽略业务参数按原速+提示 | 业务加速静默失效(重大失误) | 待owner确认(拟补第1步) |
-| 09-04 | 静帧=C4隐藏截图回贴 | 需帧精确+同管线 | 隐藏mpv+Y4M+截图+Tk贴 | 步进~660ms偏慢 | 拟被G取代(待开工) |
+| 09-04 | mpv剥离业务变速 | 引擎拒播速度策略,日用保护 | 忽略业务参数按原速+提示 | 业务加速静默失效(重大失误) | ①已修复实现(未提交,待验收) |
+| 09-04 | 静帧=C4隐藏截图回贴 | 需帧精确+同管线 | 隐藏mpv+Y4M+截图+Tk贴 | 步进~660ms偏慢 | 步进已被选项1原生化(09-05)；②A跳过；选项2(全原生化)需黄金集验证后另立项 |
 | 09-04 | 制度封版 | 规范化完成,防膨胀 | 只维护不新增(R7)+T0-T3门禁(R6) | 制度件冻结 | 已定 |
 
 ## 九、ACH 矩阵（R5 的工具；症状诊断必用）
