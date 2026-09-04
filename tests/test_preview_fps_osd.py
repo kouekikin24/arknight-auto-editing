@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -183,6 +184,8 @@ class PausedStepSemanticsTests(unittest.TestCase):
         player._all_skip_segs_snap = mock.Mock(return_value=[(10, 20)])
         player._seek = mock.Mock()
         player._update_labels = mock.Mock()
+        # 本组测旧（非原生）路径：cv 引擎无 step_frame，走 seek+贴帧
+        player._io.native_rendering = False
         return player
 
     def test_right_step_moves_by_one_and_seeks(self):
@@ -218,6 +221,121 @@ class PausedStepSemanticsTests(unittest.TestCase):
             {"source_frame": 42, "time_pos": None, "mpv_frame_drops": None}
         )
         self.assertEqual(player.current_frame_idx, 42)
+
+
+class NativeFrameStepTests(unittest.TestCase):
+    """暂停 ←/→ 走 mpv 原生帧步进（探针D T0：毫秒级帧精确）：
+    直发 step_frame，撤贴图层，且静帧收敛标记阻止追帧重贴慢速 C4。"""
+
+    def _player(self, current: int, total: int = 100) -> VideoPreviewPlayer:
+        player = _bare_player()  # native_rendering=True
+        player.total_frames = total
+        player.current_frame_idx = current
+        player.timeline = mock.Mock()
+        player.skip_trimmed = _BoolVar(False)
+        player._seek = mock.Mock()
+        player._update_labels = mock.Mock()
+        player._auto_rate_clear = mock.Mock()
+        player._drop_still_overlay = mock.Mock()
+        player._still_frame_idx = None
+        player._io.step_frame = mock.Mock(return_value=True)
+        return player
+
+    def test_right_step_uses_native_command_and_drops_overlay(self):
+        player = self._player(current=5)
+        player._step_frame(+1, seek=True)
+        self.assertEqual(player.current_frame_idx, 6)
+        player._io.step_frame.assert_called_once_with(+1)
+        player._seek.assert_not_called()
+        player._drop_still_overlay.assert_called_once()
+        # 收敛标记对齐当前帧号：渲染循环追帧不会重新贴 C4 盖住原生帧
+        self.assertEqual(player._still_frame_idx, 6)
+        self.assertTrue(player._osd_pending)
+
+    def test_left_step_uses_native_command(self):
+        player = self._player(current=5)
+        player._step_frame(-1, seek=True)
+        self.assertEqual(player.current_frame_idx, 4)
+        player._io.step_frame.assert_called_once_with(-1)
+        player._seek.assert_not_called()
+
+    def test_native_step_failure_falls_back_to_seek(self):
+        player = self._player(current=5)
+        player._io.step_frame.return_value = False
+        player._step_frame(+1, seek=True)
+        self.assertEqual(player.current_frame_idx, 6)
+        player._seek.assert_called_once_with(6, skip_trim=False)
+        player._drop_still_overlay.assert_not_called()
+
+    def test_native_step_exception_falls_back_to_seek(self):
+        player = self._player(current=5)
+        player._io.step_frame.side_effect = RuntimeError("boom")
+        player._step_frame(+1, seek=True)
+        player._seek.assert_called_once_with(6, skip_trim=False)
+
+    def test_playing_uses_legacy_seek_not_native_step(self):
+        player = self._player(current=5)
+        player.is_playing = True
+        player._step_frame(+1, seek=True)
+        player._io.step_frame.assert_not_called()
+        player._seek.assert_called_once_with(6, skip_trim=False)
+
+    def test_non_native_engine_uses_legacy_seek(self):
+        player = self._player(current=5)
+        player._io.native_rendering = False
+        player._step_frame(+1, seek=True)
+        player._io.step_frame.assert_not_called()
+        player._seek.assert_called_once_with(6, skip_trim=False)
+
+    def test_boundary_step_does_not_touch_engine(self):
+        player = self._player(current=0)
+        player._step_frame(-1, seek=True)
+        self.assertEqual(player.current_frame_idx, 0)
+        player._io.step_frame.assert_not_called()
+        player._seek.assert_not_called()
+
+    def test_native_hold_repeat_skips_preview_seek(self):
+        # 原生步进每拍直达引擎：长按不再周期预览寻址（寻址会触发慢速贴帧）
+        player = self._player(current=5)
+        player._schedule_preview = mock.Mock()
+        player._repeat_frame = mock.Mock()
+        player._start_repeat("Right")
+        self.assertTrue(player._key_hold_fired)
+        player._schedule_preview.assert_not_called()
+        player._repeat_frame.assert_called_once_with("Right")
+
+    def test_legacy_hold_repeat_schedules_preview_seek(self):
+        player = self._player(current=5)
+        player._io.native_rendering = False
+        player._schedule_preview = mock.Mock()
+        player._repeat_frame = mock.Mock()
+        player._start_repeat("Right")
+        player._schedule_preview.assert_called_once()
+
+    def test_native_release_skips_final_preview_seek(self):
+        # 松手时引擎已停在最后一拍目标帧，末拍寻址只会触发慢速贴帧
+        player = self._player(current=5)
+        player._key_held = "Right"
+        player._key_after_id = None
+        player._key_preview_id = None
+        player._key_hold_fired = True
+        player._frame_q = queue.Queue()
+        player._do_preview_seek = mock.Mock()
+        player._on_key_release(SimpleNamespace(keysym="Right"))
+        player._do_preview_seek.assert_not_called()
+        self.assertFalse(player._key_hold_fired)
+
+    def test_legacy_release_runs_final_preview_seek(self):
+        player = self._player(current=5)
+        player._io.native_rendering = False
+        player._key_held = "Right"
+        player._key_after_id = None
+        player._key_preview_id = None
+        player._key_hold_fired = True
+        player._frame_q = queue.Queue()
+        player._do_preview_seek = mock.Mock()
+        player._on_key_release(SimpleNamespace(keysym="Right"))
+        player._do_preview_seek.assert_called_once()
 
 
 class EdlAwareSeekTests(unittest.TestCase):

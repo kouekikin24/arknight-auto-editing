@@ -1899,20 +1899,11 @@ class VideoPreviewPlayer(tk.Frame):
             preview_step = 1
             speed_multiplier = 1.0 / max(speed, 0.01)
 
-        # mpv 原生引擎不支持业务变速段（MPV_SPEED_POLICY_UNSUPPORTED 会直接拒播），
-        # 日用路径自动按「忽略业务加速」处理并提示，而不是让播放失败。
+        # mpv 原生引擎已在 time-pos 里实现业务变速段（与上游同语义），
+        # 不再按「忽略业务加速」截流；cv 引擎本就不剥，mpv 现在也不剥。
+        # 播放中跨段时 mpv 的 speed 属性在段边界切换，与 OpenCV 逐帧 step 对齐。
         native_engine = bool(getattr(self._io, "native_rendering", False))
-        biz_active = (
-            bool(p.get('speedup_1x')) or bool(p.get('speedup_02'))
-            or bool(self._speed_segs_snap())
-        )
-        # 忽略业务加速控件已移除：cv 引擎按原行为（不忽略），mpv 引擎始终忽略
-        ignore_biz = native_engine
-        if native_engine and biz_active:
-            try:
-                self.lbl_info.config(text="mpv 预览：业务变速段按原速播放（如需业务加速请切回 OpenCV 引擎）")
-            except Exception:
-                pass
+        ignore_biz = False
         if self.total_frames <= 0:
             self._reject_play_request("当前源没有可播放帧")
             return False
@@ -2530,7 +2521,10 @@ class VideoPreviewPlayer(tk.Frame):
                     self._frame_q.get_nowait()
                 except Empty:
                     break
-            self._do_preview_seek()
+            # 原生步进松手时引擎已停在最后一拍的目标帧，再寻址只会
+            # 触发慢速贴帧；旧路径仍需末拍寻址保证落点
+            if not self._native_step_enabled():
+                self._do_preview_seek()
         self._key_hold_fired = False
 
     def _on_key_space(self, event):
@@ -2545,7 +2539,10 @@ class VideoPreviewPlayer(tk.Frame):
         if self._closing:
             return
         self._key_hold_fired = True
-        self._schedule_preview()
+        # 原生步进每拍都直达引擎，无需周期预览寻址（寻址反而触发慢速
+        # C4 贴帧覆盖层，盖住原生帧）
+        if not self._native_step_enabled():
+            self._schedule_preview()
         self._repeat_frame(direction)
 
     def _repeat_frame(self, direction: str):
@@ -2581,7 +2578,46 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline._ensure_pointer_visible()
         self.timeline.update_pointer()
         self._update_labels()
+        # 原生引擎暂停中：mpv 直发毫秒级位级精确帧步进（探针D T0），
+        # 替代慢速 seek+C4 贴帧；seek 标志只在旧路径上有意义。
+        if self._native_step_enabled() and self._native_step(delta):
+            return
         if seek: self._seek(new_idx, skip_trim=False)
+
+    def _native_step_enabled(self) -> bool:
+        """原生步进可用：原生引擎 + 暂停中 + 引擎暴露 step_frame。"""
+        io = getattr(self, "_io", None)
+        return (
+            io is not None
+            and not self.is_playing
+            and not self._closing
+            and bool(getattr(io, "native_rendering", False))
+            and callable(getattr(io, "step_frame", None))
+        )
+
+    def _native_step(self, delta: int) -> bool:
+        """mpv 原生帧步进（frame-step/frame-back-step，VERY_EXACT 路径）。
+
+        主窗直接出帧：已有静帧覆盖层立即变陈旧必须撤下，并把静帧收敛
+        标记对齐到当前帧号，否则渲染循环的追帧逻辑会重新贴 C4 覆盖层
+        盖住原生帧。失败返回 False，由调用方回退旧 seek+贴帧路径。
+        """
+        try:
+            stepped = bool(self._io.step_frame(+1 if delta > 0 else -1))
+        except Exception:
+            return False
+        if not stepped:
+            return False
+        try:
+            self._auto_rate_clear()
+        except Exception:
+            pass
+        if self._fps_samples:
+            self._fps_samples.clear()
+        self._drop_still_overlay()
+        self._still_frame_idx = self.current_frame_idx
+        self._osd_pending = True
+        return True
 
     # ==========================================================
     #  播放控制

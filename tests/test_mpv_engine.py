@@ -514,29 +514,153 @@ class MpvEngineContractTests(unittest.TestCase):
         self.assertFalse(any(command[0] == "seek" for command in player.commands))
         engine.close()
 
-    def test_business_frame_speed_policy_fails_closed(self):
+    def test_business_frame_speed_policy_switches_on_segment_boundary(self):
+        # 业务变速段（上游 VideoIOThread.speed_step 语义）：1x 段且
+        # speedup_1x → 2；出段回 1。time-pos 驱动，source 模式直接映射。
+        from preview_engine import PreviewPlayRequest
+        from pts_timeline import CertifiedPtsTimeline
+        from tests.test_preview_engine import _certified_media
+
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _AsyncLoadPlayer(**options)
+            return holder["player"]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = _certified_media(
+                root,
+                [{"n": i, "pts": i * 40, "duration": 40} for i in range(100)],
+            )
+            engine = MpvEngine(
+                str(media.source_path), mpv_factory=factory, fps=25.0, total=100
+            )
+            engine.bind_media_info(media)
+            engine.start()
+            request = PreviewPlayRequest(
+                start_frame=0,
+                playback_rate=1.0,
+                preview_step=1,
+                speed_multiplier=1.0,
+                skip_trimmed=False,
+                speedup_1x=True,
+                speedup_02=True,
+                speedup_02_factor=5,
+                timeline_plan=TimelinePlan.from_deleted_ranges(100, []),
+                # 30..59 = 1x 段（→2）；70..89 = 0.2x 段（→max(2,5)=5）；其余普通（→1）
+                speed_segments=((30, 59, 2), (70, 89, 4)),
+                canvas_size=(1, 1),
+                project_generation=0,
+                timeline_revision=0,
+            )
+            self.assertTrue(engine.play(request))
+            player = holder["player"]
+            player.event_callback({"event": "file-loaded", "generation": engine.snapshot_perf()["generation"]})
+            engine.poll_events()
+            self.assertTrue(engine.is_playback_active())
+            # time-pos 回调：跨进 1x 段 → speed=2（25fps → 1 帧=40ms）
+            player.property_callbacks["time-pos"]("time-pos", 30 * 0.040)
+            self.assertEqual(player.speed, 2.0)
+            # 仍在段内不重复写（speed 只变化一次）
+            calls_before = len(player.commands)
+            player.property_callbacks["time-pos"]("time-pos", 45 * 0.040)
+            self.assertEqual(len(player.commands), calls_before)
+            # 跨进 0.2x 段 → speed=max(2, factor)=5
+            player.property_callbacks["time-pos"]("time-pos", 70 * 0.040)
+            self.assertEqual(player.speed, 5.0)
+            # 出段回普通 → speed=1
+            player.property_callbacks["time-pos"]("time-pos", 95 * 0.040)
+            self.assertEqual(player.speed, 1.0)
+            engine.close()
+
+    def test_business_speed_disabled_when_no_biz_flags(self):
+        # 无业务段/开关：基准速率 1 次钉死，time-pos 不再反复写 speed。
         from preview_engine import PreviewPlayRequest
 
-        engine = MpvEngine("source.mp4", mpv_factory=lambda **options: _FakePlayer(**options), total=2)
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _AsyncLoadPlayer(**options)
+            return holder["player"]
+
+        engine = MpvEngine("source.mp4", mpv_factory=factory, fps=30.0, total=100)
+        engine.start()
         request = PreviewPlayRequest(
             start_frame=0,
-            playback_rate=1.0,
+            playback_rate=2.0,
             preview_step=1,
             speed_multiplier=1.0,
             skip_trimmed=False,
-            speedup_1x=True,
+            speedup_1x=False,
             speedup_02=False,
             speedup_02_factor=1,
-            timeline_plan=TimelinePlan.from_deleted_ranges(2, []),
-            speed_segments=((0, 1, 1),),
+            timeline_plan=TimelinePlan.from_deleted_ranges(100, []),
+            speed_segments=(),
             canvas_size=(1, 1),
             project_generation=0,
             timeline_revision=0,
         )
-        with self.assertRaises(PreviewEngineError) as raised:
-            engine.play(request)
-        self.assertEqual(raised.exception.code, "MPV_SPEED_POLICY_UNSUPPORTED")
+        self.assertTrue(engine.play(request))
+        player = holder["player"]
+        player.event_callback({"event": "file-loaded", "generation": engine.snapshot_perf()["generation"]})
+        engine.poll_events()
+        self.assertEqual(player.speed, 2.0)
+        calls_before = len(player.commands)
+        player.property_callbacks["time-pos"]("time-pos", 50 / 30.0)
+        self.assertEqual(len(player.commands), calls_before)
         engine.close()
+
+    def test_step_frame_issues_native_commands(self):
+        # 暂停步进直发 mpv 原生命令（探针D T0：frame-step/frame-back-step
+        # 位级精确 0.3-17.2ms；input-command 元命令在此构建不可用）。
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _FakePlayer(**options)
+            return holder["player"]
+
+        engine = MpvEngine("source.mp4", mpv_factory=factory, fps=30.0, total=100)
+        engine.start()
+        player = holder["player"]
+        self.assertTrue(engine.step_frame(+1))
+        self.assertTrue(engine.step_frame(-1))
+        self.assertTrue(engine.step_frame(0))  # 非负均按前进
+        self.assertIn(("frame-step",), player.commands)
+        self.assertIn(("frame-back-step",), player.commands)
+        self.assertEqual(engine.snapshot_perf()["step_count"], 3)
+        engine.close()
+
+    def test_step_frame_pauses_playing_player_first(self):
+        # 上游语义「暂停才步进」：播放中调用先落暂停再步进。
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _FakePlayer(**options)
+            return holder["player"]
+
+        engine = MpvEngine("source.mp4", mpv_factory=factory, fps=30.0, total=100)
+        engine.start()
+        player = holder["player"]
+        player._pause = False
+        engine.step_frame(+1)
+        self.assertTrue(player._pause)
+        self.assertIn(("frame-step",), player.commands)
+        engine.close()
+
+    def test_step_frame_rejects_after_close(self):
+        holder = {}
+
+        def factory(**options):
+            holder["player"] = _FakePlayer(**options)
+            return holder["player"]
+
+        engine = MpvEngine("source.mp4", mpv_factory=factory, fps=30.0, total=100)
+        engine.start()
+        engine.close()
+        with self.assertRaises(PreviewEngineError) as ctx:
+            engine.step_frame(+1)
+        self.assertEqual(ctx.exception.code, "ENGINE_CLOSED")
 
     def test_close_timeout_is_retryable_without_duplicate_terminate(self):
         holder = {}

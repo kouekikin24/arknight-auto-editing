@@ -18,6 +18,7 @@ import time
 from typing import Any, Callable
 
 from certified_edl import CertifiedEdl, build_certified_edl
+from frame_types import FRAME_TYPE_0_2X, FRAME_TYPE_1X
 from media_info import MediaInfo, MediaInfoError
 from preview_engine import (
     CertifiedEdlRequest,
@@ -127,6 +128,12 @@ class MpvEngine:
         self._pending_seek: tuple[Fraction, bool] | None = None
         self._pending_resume = False
         self._pending_speed: float | None = None
+        # 业务变速段（上游 VideoIOThread.speed_step 语义）：收到 play 请求
+        # 时把段表与开关钉进 _biz_speed，每次 time-pos 更新判定当前段并
+        # 用 mpv speed 属性做边界切换，与 OpenCV 引擎的逐帧 step 加速对齐。
+        self._biz_speed: tuple[tuple[tuple[int, int, int], ...], bool, bool, int] | None = None
+        self._biz_base_rate = 1.0
+        self._biz_applied_step = 0  # 首拍必钉一次基准速率，避免换载间旧速残留
         self._osd_topleft = ""
         self._osd_corner = ""
         self._play_end_reason: str | None = None
@@ -146,6 +153,7 @@ class MpvEngine:
             "pace_resets": 0,
             "hard_resets": 0,
             "seek_count": 0,
+            "step_count": 0,
             "q_drop": 0,
             "present_ms_sum": 0.0,
             "present_ms_max": 0.0,
@@ -439,6 +447,39 @@ class MpvEngine:
                     return str(value)
         return None
 
+    @staticmethod
+    def _biz_speed_step(source_frame: int, speed_segs: tuple,
+                        speedup_1x: bool, speedup_02: bool, factor_02: int) -> int:
+        """上游 VideoIOThread.speed_step 的同语义实现（区间闭包，首个命中段优先）。"""
+        for seg in speed_segs:
+            try:
+                s, e, t = int(seg[0]), int(seg[1]), int(seg[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if s <= source_frame <= e:
+                if t == FRAME_TYPE_1X and speedup_1x:
+                    return 2
+                if t == FRAME_TYPE_0_2X and speedup_02:
+                    return max(2, factor_02)
+        return 1
+
+    def _apply_biz_speed_locked(self, source_frame: int) -> None:
+        """time-pos 更新后按当前源帧切换 mpv speed；无业务段时保持基准速率。"""
+        biz = self._biz_speed
+        if biz is None or self._player is None:
+            return
+        segs, speedup_1x, speedup_02, factor_02 = biz
+        step = self._biz_speed_step(source_frame, segs, speedup_1x, speedup_02, factor_02)
+        if step == self._biz_applied_step:
+            return
+        self._biz_applied_step = step
+        try:
+            self._set_speed_locked(self._biz_base_rate * step)
+        except Exception:
+            # 过渡窗口（EDL 换载等）里 speed 写入偶发失败：下一轮 time-pos
+            # 会重试，不能为预览的段边界把整条播放链炸掉。
+            self._biz_applied_step = 0
+
     def _make_property_callback(self, property_name: str) -> Callable[..., None]:
         def callback(_name: str, value: Any) -> None:
             self._on_property(property_name, value)
@@ -468,6 +509,9 @@ class MpvEngine:
                                 self._stats["media_advanced_s"] += advance
                     self._last_time_pos = position
                     self._source_frame = self._frame_for_position_locked(position)
+                    # 业务变速段的边界切换只依赖 time-pos（引擎位置唯一权威）；
+                    # source/EDL 两种模式经同一映射得到源帧，与上游语义一致。
+                    self._apply_biz_speed_locked(self._source_frame)
             elif property_name == "pause":
                 if value is not None:
                     self._playing = not bool(value)
@@ -661,6 +705,7 @@ class MpvEngine:
         self._last_time_pos = None
         self._source_frame = 0
         self._play_end_reason = None
+        self._biz_applied_step = 0  # 换载后首个 time-pos 重新钉一次速率
         # Hold the player paused across the load: pause is a global property
         # that persists into the next file, and the pending seek must land
         # before anything is presented.
@@ -814,20 +859,52 @@ class MpvEngine:
             self._source_frame = edl.source_frame_for_virtual_time(virtual)
             return True
 
+    def step_frame(self, direction: int) -> bool:
+        """暂停步进：mpv 原生 frame-step/frame-back-step（VERY_EXACT 路径）。
+
+        探针D（probe_frame_step，T0）实证裸命令位级精确且 0.3-17.2ms；
+        ``input-command`` 元命令在此 libmpv(v0.41.0-926) 上不可用，故直发。
+        步进作用于当前显示的时序（source 或 EDL 虚拟时间轴，EDL 天然
+        跳过删除段），落帧经 time-pos 观察事件回读；调用方无需传目标
+        帧号。播放中调用先落暂停，与上游「暂停才步进」语义一致。
+        """
+        with self._lock:
+            if self._closed:
+                raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
+            player = self._require_player_locked()
+            if not self._is_paused_locked(player):
+                try:
+                    player.pause = True
+                except Exception:
+                    pass
+            cmd = "frame-step" if direction >= 0 else "frame-back-step"
+            try:
+                player.command(cmd)
+            except Exception:
+                return False
+            self._stats["step_count"] += 1
+            return True
+
     def play(self, request: PreviewPlayRequest) -> bool:
         with self._lock:
             if self._closed:
                 raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
-            if request.speedup_1x or request.speedup_02 or request.speed_segments:
-                # These are source-frame business policies owned by
-                # VideoIOThread.  Applying only part of them in native mpv
-                # would silently change the edit preview, so the native
-                # skeleton fails closed and leaves the caller free to select
-                # CvEngine explicitly.
-                raise PreviewEngineError(
-                    "MPV_SPEED_POLICY_UNSUPPORTED",
-                    "native mpv preview does not yet implement frame-speed policies",
-                )
+            # 业务变速段不再拒播：段表与开关钉进 _biz_speed，time-pos 更新时
+            # 用 mpv speed 属性切换（与上游 VideoIOThread.speed_step 同语义）。
+            # EDL 模式下 time-pos 是虚拟时间，但经 _frame_for_position_locked
+            # 折回源帧，同一份段表照常生效。
+            biz = (
+                tuple(
+                    (int(seg[0]), int(seg[1]), int(seg[2]))
+                    for seg in (request.speed_segments or ())
+                ),
+                bool(request.speedup_1x),
+                bool(request.speedup_02),
+                max(1, int(request.speedup_02_factor or 1)),
+            )
+            self._biz_speed = biz if (biz[0] or biz[1] or biz[2]) else None
+            self._biz_base_rate = float(request.playback_rate)
+            self._biz_applied_step = 0
         if request.skip_trimmed and request.timeline_plan.deleted_ranges:
             # complete_for_export re-hashes the multi-gigabyte source; the
             # engine's bound certification is the authoritative readiness
