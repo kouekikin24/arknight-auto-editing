@@ -3,6 +3,15 @@
 > 上一棒：HANDOFF_V3ASS_20260904.md（v3-ASS 收官 + 方案 C/B 设计）。
 > 本棒：owner 口令「开工」→ B + C 一起实施、验证完毕。**未提交，等验收。**
 > **新会话先读 ASSET_INVENTORY.md（资产/能力/铁律唯一权威源），再读本文件 §0+§1+§3。**
+>
+> **压缩接力更新（2026-09-04 晚，本文其余章节写于提交前，以本块为准）**：
+> ①B+C4 已验收提交 `addc950`；②制度规范化已提交 `7e4154b` 并按 R7 **封版**
+> （AGENTS/checklist/ASSET_INVENTORY+asset_index.json/硬机制 probe_guard·
+> preflight·inventory_audit/R1-R7/§八决策/§九ACH/T0-T3门禁）；③压缩交接调研
+> 定稿：热集(AGENTS/checklist/inventory **原地更新**)+冷档(HANDOFF 日期棒**追加**)，
+> 当前头=日期最新（AGENTS 读序已写规则）；④业务变速结论：上游有、mpv 剥离
+> （方案已定=speed 边界切换，待开工）；步进延迟账单（~660ms vs 上游~110ms，
+> 优化方案 ②A砍睡眠/②G双窗 已定，待开工）。**待办总源=checklist.md。**
 
 ## §0 待决事项（等 owner 拍板）
 
@@ -100,3 +109,25 @@
 - 隐藏实例禁止 osd_level=0；OSD 只复刻帧号 an7。
 - 其余（不 push upstream、禁 reset --hard/clean、停口令即停、不重跑四 oracle、
   覆盖层只 place、zreview 明说才启用等）全部沿用。
+
+## §9 压缩后待办设计（①/②A/②G，2026-09-04 定稿，待开工）
+
+### ① mpv 业务加速（speed 边界切换）
+- `MpvEngine.play` 移除 `MPV_SPEED_POLICY_UNSUPPORTED` 拒播；request 收下
+  speedup_1x/speedup_02/speedup_02_factor/speed_segments。
+- 存 `self._biz=(segs, s1x, s02, factor)`、`base=playback_rate`。
+- `_on_property("time-pos")` 内（已有）：`source_frame=_frame_for_position_locked(position)`
+  → s_step 按上游 `speed_step` 语义（1x段&speedup_1x→2；0.2x段&speedup_02→
+  max(2,factor)；否则1）→ s_step 变化时 `_set_speed_locked(base*s_step)`。
+- EDL 模式：time-pos 为虚拟时间，同一映射函数已含 edl 分支，无需另写。
+- 边界精度受 time-pos 事件频率限制（~几十ms），预览可接受。
+- 验收：带 1x/0.2x 标签源，对比 mpv vs OpenCV 同段实际推进时长；pytest 全绿。
+
+### ②A 步进砍睡眠
+- `_still_render_mpv` 的固定 `sleep(0.25)` 改条件等待（loadfile 后轮询呈现，
+  短 sleep+重试），目标单步 ~660→~440ms。零风险。
+
+### ②G 双窗原生呈现（单独立项）
+- 可见第二 mpv 子窗（wid 嵌 video_surface、暂停时抬顶）直接 loadfile Y4M
+  呈现；播放时降窗，内嵌实例全程不动。目标 ~80-100ms/步（对齐上游~110）。
+  风险点=双原生子窗叠层顺序（复用 `_raise_native_cover` 模式+像素验收）。
