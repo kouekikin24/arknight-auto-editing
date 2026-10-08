@@ -155,8 +155,11 @@ def _classify_gray(gray: np.ndarray, configs: dict,
     x2s = _get_best_score(gray, configs['speed_2x'], proc_res) if configs['speed_2x'] else -1.0
     if x1s >= thresholds['speed_1x'] and x1s > x2s: return FRAME_TYPE_1X
     if x2s >= thresholds['speed_2x'] and x2s > x1s: return FRAME_TYPE_2X
-    if configs['speed_0_2x'] and _get_best_score(gray, configs['speed_0_2x'], proc_res) >= thresholds['speed_0_2x']:
-        return FRAME_TYPE_0_2X
+    if configs['speed_0_2x']:
+        s02 = _get_best_score(gray, configs['speed_0_2x'], proc_res)
+        # 0.2x 模板是「正在播放」图标，1x/2x 帧上也会高分，所以必须是三者最高
+        if s02 >= thresholds['speed_0_2x'] and s02 > max(x1s, x2s):
+            return FRAME_TYPE_0_2X
     return FRAME_TYPE_NORMAL
 
 
