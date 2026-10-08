@@ -330,7 +330,7 @@ fd9ada3 dsvc 源码入库 → 86ac797 直通核心（ledger/service/skim+tests�
 | `research_phase3/A2a_singlepass_v2623.mp4`（**文档标「别删」**，样本4单趟基准） | ✅ **完全恢复**：用会话库恢复的脚本重跑，**1,362,195,228 字节（逐位同）/107434 帧/PTS 严格递增** |
 | `sentinel_fix/4_full_audio.mp4` | ✅ **已重建 + E2E PASS**（PTS 0/107434 不一致） |
 | `bench_b/ctts_patch.py` + 产物 | ✅ 脚本从会话库恢复（tools/recovered/），产物按需重生成 |
-| `mpv_spike` 38 证据文件（503MB） | ⚠ **部分不可无损恢复**：4 个 frame_oracle（124MB，AGENTS 禁重跑）→ **待 owner 决策**；pts_normalize/g1_wid/stepspeed 等历史快照 → 脚本在库但重跑结果≠历史（实测 g1_wid 重跑 fail `RESIZE_NOT_FOLLOWED`）|
+| `mpv_spike` 38 证据文件（503MB） | ⚠ **不可无损恢复，owner 已裁决（10-09）接受损失+文档标注**：4 个 frame_oracle（124MB，AGENTS 禁重跑）不重建（实测重跑结果≠原件）；**已执行标注**：4 个 `MPV_GATE_DECISION_*` 文件共 38 条证据标 `exists:false`/`missing_since`/`missing_note` + 顶层 `evidence_audit`；20 条仍在证据零误标（反向验证）。`MPV_GATE_DECISION_*.json` 按设计不入库（.gitignore），标注只在本机留存。|
 
 **恢复工具**：`tools/recovered/{A2_production_singlepass,A2a_vs_batched_check,ctts_patch}.py`（从 ZCode 会话库提取，语法检查通过）。
 **教训 → R11 候选**：清理前必须**读引用上下文**，凡含「勿删/别删/基准/对照」先停并问 owner。
