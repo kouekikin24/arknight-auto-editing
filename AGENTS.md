@@ -17,6 +17,10 @@
 - 测量卫生(R3)：单屏窗口(主屏x<3840)、无损PNG、DPI感知；进程内驱动优先，
   禁主动桌面采集。新探针首行 import probe_guard 并断言。
 - 开工前跑 `tools/preflight.py`；定期跑 `tools/inventory_audit.py` 防漂移。
+- **验收前跑 `tools/acceptance_gate.py`**（发布前必跑清单，四层门禁：
+  L0 环境 / L1 单测 / L2 引擎（真 dsvc+mpv，headless）/ L3 GUI（真窗口，
+  需可见桌面）。默认跑到 L2 ≈2 分钟；`--level L3` ≈3.5 分钟含 GUI 四项；
+  `--list` 只列清单。**L3 会开真窗口，跑前先停正在运行的 GUI。**）
 - 调研：owner 说禁子代理则主会话亲查。
 
 ## 授权门（不可越）
