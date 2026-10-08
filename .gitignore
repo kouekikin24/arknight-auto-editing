@@ -45,6 +45,12 @@ explanation-simple.md
 # Bundled FFmpeg runtimes (see tools/opencv-runtime-manifest.json for provenance)
 tools/ffmpeg-*/
 
+# dsvc Rust build output (source is tracked; target/ is rebuildable)
+tools/dsvc/target/
+
+# Research scratch (raw web captures/downloads; reports *.md are tracked)
+agents/*/tmp/
+
 # Environment / secrets / certificates
 .env
 .env.*
