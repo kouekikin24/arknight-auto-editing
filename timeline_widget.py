@@ -15,6 +15,8 @@ _CLIP_HANDLE_Y2 = lambda h: h - 20
 _PAUSE_BAND_Y1 = 15
 _PAUSE_BAND_Y2 = lambda h: h - 25
 _CLIP_BAND_Y1 = 37
+# 拖拽启动阈值（px）：单击（含手抖）不触发手柄拖拽，回落 seek
+_DRAG_START_PX = 3
 _CLIP_BAND_Y2 = lambda h: h - 25
 
 
@@ -343,9 +345,31 @@ class TimelineWidget(tk.Frame):
     # 命中检测辅助
     # ------------------------------------------------------------------
 
-    def _collect_candidates(self, event_x: int, canvas_w: int) -> list:
+    def _collect_candidates(self, event_x: int, canvas_w: int,
+                            event_y: int | None = None) -> list:
+        """clip 端点手柄候选（拖拽用）。
+
+        09-16 真机 T0 修复：原 ±12px 命中区在真实密度下（4.mp4 约 418~2211
+        个 clip 段、980px 画布）相邻手柄命中区完全重叠、覆盖全轴 → 用户点
+        任何位置都被判定为「抓住手柄」，seek 永远到不了（报「点不到」）。
+        实测：418 clip 下 12/12 点击全部被吞。
+
+        现行规则：
+          - **垂直位置须落在手柄带内**（_CLIP_HANDLE_Y1.._CLIP_HANDLE_Y2），
+            与手柄绘制范围一致（原来只看 x，任意高度都能抓，语义不符）；
+          - 半径保持 12px（可抓性优先；密集项目下平均间距仅 ~1.5px，
+            收窄半径或"不可分辨即跳过"会让端点几乎无法抓取——09-16 复查
+            实测该做法使可抓 clip 降为 0，属回归，已撤回）；
+          - **点击/拖动分离**：候选只在位移 > _DRAG_START_PX 时才转为拖拽
+            （见 _on_mousemove）；无位移的点击在 _on_mouseup 回落为 seek。
+            这是"点不到"的正解：既不牺牲抓取，也不再吞掉跳转。
+        """
         cands = []
         RADIUS = 12
+        if event_y is not None:
+            hy1, hy2 = _CLIP_HANDLE_Y1, _CLIP_HANDLE_Y2(self.TL_HEIGHT)
+            if not (hy1 - 3 <= event_y <= hy2 + 3):
+                return cands
         for seg in self.clip_segments:
             keep_in, keep_end = self._display_clip_bounds(seg)
             ix = self._f2x(keep_in, canvas_w)
@@ -370,13 +394,17 @@ class TimelineWidget(tk.Frame):
         w = self.canvas.winfo_width()
         ey = event.y
 
-        cands = self._collect_candidates(event.x, w)
+        cands = self._collect_candidates(event.x, w, event.y)
         px = self._f2x(self.current_frame_idx, w)
         red_hit = abs(event.x - px) < 8
 
-        # 选中片段检测
+        # 选中片段检测（09-16 P1-C 真机 T0）：旧判定在暂停段带内无条件先于
+        # seek 执行，而该带（15 ~ h-25）几乎覆盖整条时间轴 → 用户点任何
+        # 位置都被理解成「选段」，「点选跳转」失效（报「点不到」）。
+        # 现行语义：**Ctrl+单击=选段**（显式意图），**裸单击=跳转**（默认）。
+        ctrl_held = bool(event.state & 0x0004)
         py1, py2 = _PAUSE_BAND_Y1, _PAUSE_BAND_Y2(self.TL_HEIGHT)
-        if py1 <= ey <= py2 + 3:
+        if ctrl_held and py1 <= ey <= py2 + 3:
             tf = self._x2f(event.x, w)
             clicked_seg_id = None
             for seg in self.pause_segments:
@@ -389,11 +417,28 @@ class TimelineWidget(tk.Frame):
                 self._draw_dynamic()
                 if self.on_pause_select_cb:
                     self.on_pause_select_cb(clicked_seg_id)
+                return
+        elif not ctrl_held and py1 <= ey <= py2 + 3:
+            # 裸单击落在段带上：仍走「清选/跳转」路径——若点在已选段上则仅清选
+            tf = self._x2f(event.x, w)
+            for seg in self.pause_segments:
+                if seg['start'] <= tf <= seg['end']:
+                    if self.selected_pause_id == seg['id']:
+                        # 点已选中的段：清选并跳转（不再吞掉点击）
+                        self.selected_pause_id = None
+                        self.mark_dirty()
+                        self._draw_dynamic()
+                        if self.on_pause_select_cb:
+                            self.on_pause_select_cb(None)
+                    break
 
         if ey < 14 and red_hit:
             self.active_handle = ('red',)
             return
         if cands:
+            # 手柄候选仅在**按下后拖动超过阈值**才算拖拽；单纯点击（无位移）
+            # 在 mouse-up 时回落为 seek（见 _on_mouseup），语义：单击=跳转、
+            # 拖动=调整端点。active_handle 不置位以免吞掉 red 指针判定。
             self._pending_candidates = cands
             self._mousedown_x = event.x
             self.active_handle = None
@@ -461,6 +506,10 @@ class TimelineWidget(tk.Frame):
 
         if self._pending_candidates and self.active_handle is None:
             dx = event.x - self._mousedown_x
+            # 09-16 T0：位移阈值——单纯点击（含手抖 ≤3px）不算拖拽手柄，
+            # 留给 _on_mouseup 回落为 seek；只有明确拖动才接管端点。
+            if abs(dx) <= _DRAG_START_PX:
+                return
             self.active_handle = self._resolve_handle(dx)
             self._pending_candidates = []
             self._begin_clip_preview(self.active_handle[1])
@@ -538,6 +587,27 @@ class TimelineWidget(tk.Frame):
     def _on_mouseup(self, event):
         changed = self._edit_changed
         handle = self.active_handle
+        # 09-16 T0：悬停候选但未拖动 = 用户意图是「点击跳转」，不是抓端点。
+        # （密集项目下手柄候选几乎总存在，不回落则 seek 永远不可达。）
+        #
+        # 09-24 修复：本分支必须**同样收尾**（清 active_handle/候选 + 调
+        # on_handle_end_cb）。原实现只调 on_seek_cb 就 return —— 而
+        # `on_seek_cb`（GUI `_on_tl_seek`）会置 `_is_dragging=True`，只有
+        # `on_handle_end_cb`（`_on_tl_drag_end`）才复位 False。漏调 →
+        # `_is_dragging` **永久 True** → 渲染循环里 `_apply_native_perf`
+        # 被永久跳过 → 红条冻死不再随播放移动（owner 真机 T0 复现：
+        # 点击跳转后红条停在 0 不动）。
+        if handle is None and self._pending_candidates and not changed:
+            self.active_handle = None
+            self._pending_candidates = []
+            self._mousedown_x = 0
+            w = self.canvas.winfo_width()
+            tf = self._x2f(event.x, w)
+            if self.on_seek_cb:
+                self.on_seek_cb(tf)
+            if self.on_handle_end_cb:
+                self.on_handle_end_cb()
+            return
         bounds = None
         if changed and handle and handle[0] in ('clip_in', 'clip_out'):
             bounds = self._clip_preview_bounds.get(int(handle[1]))

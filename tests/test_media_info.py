@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from fractions import Fraction
@@ -446,6 +447,85 @@ class MediaInfoParsingTests(unittest.TestCase):
                 "registered probe identity",
             ):
                 certified.assert_source_current()
+
+    def test_source_is_current_stat_fast_path(self) -> None:
+        """stat 快速路径：元数据一致时不重算全源 sha256（09-24 review T0）。
+
+        原实现对 2.1GB 源每次调用都全量哈希（实测 1.6~2.5s，且在三个主线程
+        回调里各来一次）。现改为：元数据一致 → 直接 True（不读内容）；
+        元数据不一致 → **仍回退全量哈希**给出准确答案。
+        """
+        payload = _probe_payload(audio=False)
+        payload["streams"][0].update({"start_pts": "0", "duration_ts": "480000"})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "sample.mp4"
+            source.write_bytes(b"fixture-before")
+            result = media_info.parse_ffprobe_json(payload, source)
+            # 一致：不哈希也应判「当前」（用探针统计哈希调用次数）
+            calls = []
+            original = media_info._sha256_file
+
+            def counting(path):
+                calls.append(str(path))
+                return original(path)
+
+            media_info._sha256_file = counting
+            try:
+                self.assertTrue(result.source_is_current())
+                self.assertEqual(calls, [], "元数据一致时不得重算哈希")
+                # 元数据变化（内容也变）→ 回退哈希，判 False
+                source.write_bytes(b"fixture-after-longer")
+                calls.clear()
+                self.assertFalse(result.source_is_current())
+                self.assertEqual(len(calls), 1, "元数据变化时应回退全量哈希")
+                # 元数据变化但内容相同（touch）→ 回退哈希判 True（不误报）
+                source.write_bytes(b"fixture-before")
+                os.utime(source, (1_700_000_000, 1_700_000_000))
+                calls.clear()
+                self.assertTrue(result.source_is_current())
+                self.assertEqual(len(calls), 1)
+            finally:
+                media_info._sha256_file = original
+
+    def test_tool_is_current_uses_stat_fast_path_only_when_proven(self) -> None:
+        """ffmpeg.exe 的 `is_current` 免重算哈希——但**仅当哈希↔签名已证**。
+
+        背景（09-24 review T0）：`complete_for_export` → `ffmpeg_verified`
+        → `ToolInfo.is_current` 每次对 87MB 的 ffmpeg.exe 重算 sha256
+        （实测 764ms，且在 Tk 主线程的认证完成回调里）。
+        安全性：只有 `_tool_info()`（亲手算哈希 + 前后 stat 比对）记录签名；
+        外部构造的 ToolInfo 仍走全量哈希，不会把不匹配的 sha 误判为当前。
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tool = root / "ffmpeg.exe"
+            tool.write_bytes(b"tool-bytes")
+            # 1) 工厂路径：算过哈希 → 记录签名 → 后续 is_current 不重算
+            info = media_info._tool_info(tool, version_line="v", verified=True)
+            calls = []
+            original = media_info._sha256_file
+
+            def counting(path):
+                calls.append(str(path))
+                return original(path)
+
+            media_info._sha256_file = counting
+            try:
+                self.assertTrue(info.is_current())
+                self.assertEqual(calls, [], "已证签名后不得重算哈希")
+                # 内容变化（签名变）→ 回退哈希 → 判 False
+                tool.write_bytes(b"tampered-tool-bytes")
+                self.assertFalse(info.is_current())
+                self.assertEqual(len(calls), 1, "签名变化时必须回退全量哈希")
+            finally:
+                media_info._sha256_file = original
+            # 2) 外部构造（未证签名）：即使文件没变也必须走哈希
+            stale = media_info.ToolInfo(tool, "0" * 64, "v", True)
+            self.assertFalse(stale.is_current(), "不匹配的 sha 不得因 stat 误报")
+            fresh = media_info.ToolInfo(
+                tool, original(tool), "v", True)
+            self.assertTrue(fresh.is_current())
 
     def test_auto_resolver_prefers_repository_bundle(self) -> None:
         expected = (

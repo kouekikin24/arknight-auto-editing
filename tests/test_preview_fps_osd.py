@@ -30,9 +30,16 @@ def _bare_player() -> VideoPreviewPlayer:
     player._osd_tick = 0
     player._osd_pending = False
     player._paused_seek_guard_until = 0.0
+    player._is_dragging = False
+    player._verify_pending_frame = None
+    player._verify_pending_until = 0.0
     player._io = mock.Mock()
     player._io.native_rendering = True
     player._io.fps = 60.0  # time-pos 口径需要真实源帧率
+    player._io.dthrough_active = False  # 防 Mock 自动属性真值劫持（1c 直通拦截）
+    # 默认引擎拒收验证定位：既有测试组保持旧 seek+贴帧路径语义，
+    # VerifiedSeekTests 显式覆写为 True（防 Mock 自动属性真值劫持）
+    player._io.seek_source_verified = mock.Mock(return_value=False)
     player.show_frame_osd_var = _BoolVar(True)
     player.show_fps_osd_var = _BoolVar(True)
     player.preview_speed_var = SimpleNamespace(get=lambda: "1x")
@@ -40,6 +47,47 @@ def _bare_player() -> VideoPreviewPlayer:
 
 
 class InstantFpsOsdTests(unittest.TestCase):
+    def test_tier_tag_shows_skim_speed(self):
+        # G4：角标带档位+实时速率——「掠过10.0x」= 0.2x 区域业务加速
+        # 此刻真实生效的直接可视证据；FPS 仍按显示节奏钳到 60。
+        player = _bare_player()
+        player.is_playing = True
+        corner_texts: list[str] = []
+        player._io.show_osd_corner_text.side_effect = corner_texts.append
+        base = 1000.0
+        ticks = 15
+        step = 0.9 / (ticks - 1)
+        perf = {"mode": "skim", "speed": 10.0}
+        with mock.patch("preview_player.time.monotonic") as clock:
+            for i in range(ticks):
+                clock.return_value = base + i * step
+                player._osd_tick = i + 1
+                # 媒体时间以 10x 推进（虚拟秒/墙钟秒=10）
+                player._note_fps_sample(10.0 * i * step, 0, perf=perf)
+        self.assertEqual(len(corner_texts), 1)
+        self.assertTrue(corner_texts[0].startswith("掠过10.0x | "))
+        self.assertIn("60.0 FPS", corner_texts[0])
+
+    def test_tier_tag_edl_source_and_no_perf(self):
+        player = _bare_player()
+        player.is_playing = True
+        texts: list[str] = []
+        player._io.show_osd_corner_text.side_effect = texts.append
+        player._osd_tick = 15
+        player._note_fps_sample(1.0, 0, perf={"mode": "edl", "speed": 3.0})
+        self.assertTrue(texts[-1].startswith("保底3.0x | "))
+        player._osd_tick = 30
+        player._note_fps_sample(2.0, 0, perf={"mode": "source", "speed": 1.0})
+        self.assertTrue(texts[-1].startswith("源1.0x | "))
+        # 无 perf（cv 引擎/旧路径）→ 无标签，行为与改动前一致
+        player._osd_tick = 45
+        player._note_fps_sample(3.0, 0)
+        self.assertNotIn("|", texts[-1])
+        # speed 缺失 → 只有档位名
+        player._osd_tick = 60
+        player._note_fps_sample(4.0, 0, perf={"mode": "skim"})
+        self.assertTrue(texts[-1].startswith("掠过 | "))
+
     def test_presented_fps_uses_time_pos_and_clamps(self):
         player = _bare_player()
         player.is_playing = True
@@ -336,6 +384,114 @@ class NativeFrameStepTests(unittest.TestCase):
         player._do_preview_seek = mock.Mock()
         player._on_key_release(SimpleNamespace(keysym="Right"))
         player._do_preview_seek.assert_called_once()
+
+
+class VerifiedSeekTests(unittest.TestCase):
+    """选项2：暂停点轴 → 闭环验证定位。成功=主窗原生精确帧（撤贴层），
+    失败/拒收=回退 C4 静帧管线；飞行中追帧逻辑不得抢跑贴帧。"""
+
+    def _player(self) -> VideoPreviewPlayer:
+        player = _bare_player()
+        player.total_frames = 100
+        player.current_frame_idx = 10
+        player.timeline = mock.Mock()
+        player.skip_trimmed = _BoolVar(False)
+        player._all_skip_segs_snap = mock.Mock(return_value=[])
+        player._task_scope = mock.Mock(return_value=(0, 0))
+        player._canvas_wh = mock.Mock(return_value=(320, 180))
+        player._preview_pts_ready = mock.Mock(return_value=True)
+        player._show_paused_still = mock.Mock()
+        player._auto_rate_clear = mock.Mock()
+        player._is_dragging = False
+        player.lbl_info = mock.Mock()
+        player._io.seek_source_verified = mock.Mock(return_value=True)
+        return player
+
+    def test_paused_click_uses_verified_seek(self):
+        player = self._player()
+        player._seek_frame(50)
+        player._io.seek_source_verified.assert_called_once()
+        req = player._io.seek_source_verified.call_args[0][0]
+        self.assertEqual(req.source_frame, 50)
+        self.assertTrue(req.exact)
+        player._io.seek_source.assert_not_called()
+        player._show_paused_still.assert_not_called()
+        self.assertEqual(player._verify_pending_frame, 50)
+        self.assertGreater(player._verify_pending_until, time.monotonic())
+
+    def test_verified_refusal_falls_back_to_legacy(self):
+        # 引擎拒收（重复PTS段/EDL）→ 旧路径 seek+C4，一个不少
+        player = self._player()
+        player._io.seek_source_verified.return_value = False
+        player._seek_frame(50)
+        player._io.seek_source.assert_called_once()
+        player._show_paused_still.assert_called_once_with(50)
+        self.assertIsNone(player._verify_pending_frame)
+
+    def test_verified_certification_error_falls_back(self):
+        player = self._player()
+        player._io.seek_source_verified.side_effect = PreviewEngineError(
+            "CERTIFICATION_REQUIRED", "not bound")
+        player._seek_frame(50)
+        player._io.seek_source.assert_called_once()
+        player._show_paused_still.assert_called_once_with(50)
+
+    def test_dragging_uses_legacy_path(self):
+        player = self._player()
+        player._is_dragging = True
+        player._seek_frame(50)
+        player._io.seek_source_verified.assert_not_called()
+        player._io.seek_source.assert_called_once()
+
+    def test_playing_uses_legacy_path(self):
+        player = self._player()
+        player.is_playing = True
+        player._seek_frame(50)
+        player._io.seek_source_verified.assert_not_called()
+        player._io.seek_source.assert_called_once()
+
+    def test_ok_event_shows_native_frame(self):
+        player = self._player()
+        player._verify_pending_frame = 50
+        player._drop_still_overlay = mock.Mock()
+        player._on_seek_verified(
+            {"event": "seek-verified", "ok": True, "frame": 50,
+             "reason": "exact"})
+        player._drop_still_overlay.assert_called_once()
+        self.assertEqual(player._still_frame_idx, 50)
+        self.assertTrue(player._osd_pending)
+        self.assertIsNone(player._verify_pending_frame)
+        player._show_paused_still.assert_not_called()
+
+    def test_fail_event_falls_back_to_still(self):
+        player = self._player()
+        player._verify_pending_frame = 50
+        player._drop_still_overlay = mock.Mock()
+        player._on_seek_verified(
+            {"event": "seek-verified", "ok": False, "frame": 50,
+             "reason": "timeout"})
+        player._show_paused_still.assert_called_once_with(50)
+        player._drop_still_overlay.assert_not_called()
+        self.assertIsNone(player._verify_pending_frame)
+
+    def test_stale_event_ignored(self):
+        player = self._player()
+        player._verify_pending_frame = 60
+        player._on_seek_verified(
+            {"event": "seek-verified", "ok": True, "frame": 50})
+        player._show_paused_still.assert_not_called()
+        self.assertEqual(player._verify_pending_frame, 60)
+
+    def test_native_step_supersedes_pending_verify(self):
+        player = self._player()
+        player._verify_pending_frame = 50
+        player._drop_still_overlay = mock.Mock()
+        player._update_labels = mock.Mock()
+        player._io.step_frame = mock.Mock(return_value=True)
+        player._still_frame_idx = None
+        player._step_frame(+1, seek=True)
+        self.assertIsNone(player._verify_pending_frame)
+        player._io.step_frame.assert_called_once_with(+1)
 
 
 class EdlAwareSeekTests(unittest.TestCase):

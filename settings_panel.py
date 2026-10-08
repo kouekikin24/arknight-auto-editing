@@ -118,6 +118,18 @@ class SettingsPanel(ttk.LabelFrame):
             foreground="#666666",
         ).grid(row=sep_r + 7, column=0, columnspan=2, sticky=tk.W)
 
+        # P1-RAM 快速掠过代理（Tier2）：把保留段预拼成内存小电影，
+        # 高速播放走 ram:// 真倍速；关闭或未就绪时活 EDL 封顶 3x。
+        self.skim_preview_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tab_basic, text="快速掠过代理（内存版真倍速）",
+                        variable=self.skim_preview_var).grid(
+            row=sep_r + 8, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(
+            tab_basic,
+            text="分析/编辑后台预拼保留段；内存超预算自动降清晰度",
+            foreground="#666666",
+        ).grid(row=sep_r + 9, column=0, columnspan=2, sticky=tk.W)
+
         ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
             row=sep_r + 10, column=0, columnspan=2, sticky=tk.EW, pady=4)
 
@@ -424,6 +436,7 @@ class SettingsPanel(ttk.LabelFrame):
             'speedup_1x': self.speedup_1x_var.get(),
             'speedup_02': self.speedup_02x_var.get(),
             'speedup_02_factor': self.speedup_02x_factor_var.get(),
+            'skim_preview': self.skim_preview_var.get(),
             'key_repeat_speed': self.key_repeat_speed_var.get(),
             'decode_backend': self._decode_backend_key(),
             'ffmpeg_path': ffmpeg_path,

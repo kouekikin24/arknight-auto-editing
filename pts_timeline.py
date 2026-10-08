@@ -213,14 +213,23 @@ class CertifiedPtsTimeline:
             certification,
             expected_ffmpeg=expected_ffmpeg,
         )
-        rows = tuple(
-            FramePtsRow(
-                n=int(row["n"]),
-                pts=int(row["pts"]),
-                duration=int(row["duration"]),
+        # 424k 行 FramePtsRow 构造是纯 Python 长循环；本函数在**后台线程**
+        # 被调用（认证绑定），长时间持 GIL 会拖慢 Tk 主线程渲染循环
+        # （09-24 review T0：主线程单拍卡顿）。每 4096 行让出一次 GIL。
+        import time as _time
+
+        rows_list: list[FramePtsRow] = []
+        for index, row in enumerate(raw_rows):
+            if index & 0xFFF == 0xFFF:
+                _time.sleep(0)
+            rows_list.append(
+                FramePtsRow(
+                    n=int(row["n"]),
+                    pts=int(row["pts"]),
+                    duration=int(row["duration"]),
+                )
             )
-            for row in raw_rows
-        )
+        rows = tuple(rows_list)
         if len(rows) != certification.frame_count:
             raise MediaInfoError(
                 "FRAME_PTS_FRAME_COUNT_MISMATCH",

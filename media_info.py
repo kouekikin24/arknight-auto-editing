@@ -61,7 +61,30 @@ def _tool_info(path: Path, *, version_line: str | None = None, verified: bool = 
     path = path.expanduser().resolve()
     if not path.is_file():
         raise MediaInfoError("TOOL_NOT_FOUND", f"tool not found: {path}", details={"path": str(path)})
-    return ToolInfo(path=path, sha256=_sha256_file(path), version_line=version_line, verified=verified)
+    # 先 stat 再哈希，再把「哈希所对应的签名」钉进实例：这样 `is_current`
+    # 可走 stat 快速路径（免每次重算 87MB 的 sha256），且**只对本函数
+    # 亲手算过哈希的实例生效**——外部直接构造的 ToolInfo（如测试里的
+    # stale_tool，带不匹配的 sha）不记录签名，`is_current` 仍全量哈希，
+    # 不会误报。stat 在哈希前后各取一次：不一致（哈希期间被换）则不记录。
+    try:
+        before = Path(path).stat()
+    except OSError:
+        before = None
+    digest = _sha256_file(path)
+    tool = ToolInfo(path=path, sha256=digest, version_line=version_line, verified=verified)
+    if before is not None:
+        try:
+            after = Path(path).stat()
+        except OSError:
+            after = None
+        if after is not None and (
+            (int(after.st_size), int(after.st_mtime_ns))
+            == (int(before.st_size), int(before.st_mtime_ns))
+        ):
+            object.__setattr__(
+                tool, "_stat_sig", (int(after.st_size), int(after.st_mtime_ns))
+            )
+    return tool
 
 
 @dataclass(frozen=True)
@@ -71,8 +94,26 @@ class ToolInfo:
     version_line: str | None = None
     verified: bool = False
 
+    def __post_init__(self) -> None:
+        # 不在此处记录签名：外部构造的 ToolInfo（如带不匹配 sha 的 stale_tool）
+        # 若记录签名，`is_current` 会误报 True。只有 `_tool_info()`（亲手算过
+        # 哈希、并做过前后 stat 比对）才钉 `_stat_sig`。
+        pass
+
     def is_current(self) -> bool:
-        """Return whether the executable still matches its registered hash."""
+        """Return whether the executable still matches its registered hash.
+
+        **stat 快速路径**：签名一致（构造时记录）→ 认定未变，不重读内容；
+        签名不一致或未知 → **回退全量哈希**给出准确答案（宁慢不错）。
+        """
+        sig = getattr(self, "_stat_sig", None)
+        if sig is not None:
+            try:
+                stat = self.path.stat()
+            except OSError:
+                return False
+            if (int(stat.st_size), int(stat.st_mtime_ns)) == sig:
+                return True
         try:
             return self.path.is_file() and _sha256_file(self.path).lower() == self.sha256.lower()
         except OSError:
@@ -190,9 +231,19 @@ def _check_pts_monotonic_head_tolerant(
     head_anomaly_limit: int,
     path: Path | None = None,
 ) -> None:
-    """Require strictly increasing PTS outside the adjudicated head window."""
+    """Require strictly increasing PTS outside the adjudicated head window.
+
+    424k 行纯 Python 循环会长时间持有 GIL；当本函数跑在**后台线程**
+    （认证绑定/时间轴构建）时，Tk 主线程的渲染循环被饿死——实测主线程
+    单拍 `update()` 卡 **~224ms**（09-24 review T0）。故每 4096 行主动
+    `time.sleep(0)` 让出 GIL（开销可忽略，换来主线程可调度）。
+    """
+    import time as _time
+
     previous_pts: int | None = None
     for expected, (number, pts) in enumerate(pairs):
+        if expected & 0xFFF == 0xFFF:
+            _time.sleep(0)   # 让出 GIL：后台线程不得饿死 Tk 主线程
         if previous_pts is not None and pts <= previous_pts:
             if head_anomaly_limit <= 0 or expected >= head_anomaly_limit:
                 raise MediaInfoError(
@@ -643,9 +694,27 @@ class MediaInfo:
         return _ffmpeg_tool_verified(self.ffmpeg)
 
     def source_is_current(self) -> bool:
-        """Return whether the probed source still has the registered identity."""
+        """Return whether the probed source still has the registered identity.
+
+        **stat 快速路径（2026-09-24 review T0）**：原实现无条件对整源重算
+        sha256——2.1GB 源实测单次 **1.6~2.5s**，且在主线程被调用三次
+        （媒体探测完成回调 / 认证前置 / `complete_for_export`），累计停顿
+        可见。现先比 `(size, mtime_ns)`：一致即认定未变（与引擎
+        `_assert_bound_source_current_locked` 的既有判据同源——那条路早就
+        是「不做每次哈希」的 stat 检查）。元数据不一致时**仍回退全量哈希**
+        判定，故「被 touch 但内容相同」不会误判为变更，语义不放松。
+        """
         try:
-            return self.source_path.is_file() and _sha256_file(self.source_path) == self.source_sha256
+            stat = self.source_path.stat()
+        except OSError:
+            return False
+        if (int(stat.st_size), int(stat.st_mtime_ns)) == (
+            int(self.source_size), int(self.source_mtime_ns)
+        ):
+            return True
+        # 元数据变了（可能只是 touch，也可能换了文件）→ 用哈希给出准确答案
+        try:
+            return _sha256_file(self.source_path) == self.source_sha256
         except OSError:
             return False
 
@@ -692,12 +761,33 @@ class MediaInfo:
             primary = self.video_streams[0] if self.video_streams else None
             if primary is None or primary.time_base != certification.time_base:
                 return False
+            # **stat 快速路径（2026-09-24 review T0）**：完整复验要重读证据
+            # 文件（~50MB）+ 解析 JSON + 重算 424k 行规范化摘要，实测
+            # **~700ms**，且发生在 Tk 主线程的认证完成回调
+            # （`complete_for_export` → 本方法）。已在本进程内成功复验过、
+            # 且证据文件 stat 未变 → 直接采信（与引擎
+            # `_assert_bound_source_current_locked` 的「不每次哈希」同策略）；
+            # stat 变化则**重新完整复验**，失败即判 False（fail-closed 不变）。
+            try:
+                st = certification.evidence_path.stat()
+                sig = (int(st.st_size), int(st.st_mtime_ns))
+            except OSError:
+                sig = None
+            if sig is not None and getattr(self, "_evidence_ok_sig", None) == (
+                sig, certification.evidence_sha256.lower()
+            ):
+                return True
             _load_certification_evidence(
                 certification,
                 expected_source_path=self.source_path,
                 expected_source_size=self.source_size,
                 expected_ffmpeg=self.ffmpeg,
             )
+            if sig is not None:
+                object.__setattr__(
+                    self, "_evidence_ok_sig",
+                    (sig, certification.evidence_sha256.lower()),
+                )
         except (MediaInfoError, OSError, TypeError, ValueError):
             return False
         return True
@@ -725,12 +815,25 @@ class MediaInfo:
             expected_source_size=self.source_size,
             expected_ffmpeg=self.ffmpeg,
         )
-        return replace(
+        certified = replace(
             self,
             vfr_status=certification.status,
             frame_pts_authoritative=True,
             frame_pts_certification=certification,
         )
+        # 刚刚完整复验成功（本函数在**后台**线程被调用）→ 把「证据 stat +
+        # 摘要」记到新实例上，主线程的 `complete_for_export` 即可走 stat
+        # 快速路径，免去再花 ~700ms 重读 424k 行证据（09-24 review T0）。
+        try:
+            st = certification.evidence_path.stat()
+            object.__setattr__(
+                certified, "_evidence_ok_sig",
+                ((int(st.st_size), int(st.st_mtime_ns)),
+                 certification.evidence_sha256.lower()),
+            )
+        except OSError:
+            pass
+        return certified
 
     def as_dict(self) -> dict[str, Any]:
         return {
