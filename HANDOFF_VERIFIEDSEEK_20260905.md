@@ -303,3 +303,39 @@ owner 令「Review 一下有没有引入新的问题」。**结论：本轮两�
 **遗留观察（非缺陷，记录备查）**：`.cache/preview_fluency/*_states.npy`（8 月产物）是旧判据输出，但**仅诊断脚本消费、生产与测试均不读取**；如需刷新可重跑 `scripts/cache_apt_analysis.py`。
 
 GUI 已重启 **pid 37720** 载最终代码。
+
+
+## 17. 收工入库 + 清理 + 误删事故（2026-10-08·owner 令「暂时不手检，入库然后清理」）
+
+### 入库（7 笔，未推送）
+fd9ada3 dsvc 源码入库 → 86ac797 直通核心（ledger/service/skim+tests）→ 1c8ba11 引擎接线+修复轮 →
+7ddecfc 分析缓存 → 384dad6 P0 0.2x 判据 → c2438d4 门禁+压测工具+调研报告 → a08c3e4 制度文档。
+43 文件 +11619 行；工作区干净；**未 push**（授权门）。
+
+### 清理（净回收 ~16.4 GB）
+| 位置 | 回收 | 内容 |
+|---|---|---|
+| .cache 11 实验目录 | 14.8 GB | 8-9 月一次性实验视频（exp_batched_seek/sentinel_fix/mpv_spike/research_phase3/smoke_export/bench_b/frame_shots/enc_compare/exp_trim_concat_vfr/e2e_bf/e2e_13619）|
+| bakeoff targets + 上游验证物 | 0.62 GB | 编译输出可重建；tag_src/release_zip 调研已完成 |
+| 父目录调研资产 | 0.9 GB | 上游克隆 319M + win 包 479M + zip 105M（均可从 GitHub 重建）|
+| C 盘临时 | 22 MB | 探针 y4m/png + pytest 临时 |
+
+项目 18.8G→3.3G；父目录 29G→13G。**保留**：ffmpeg-dev（dsvc 运行时依赖）、analysis v3 缓存（避免 310s 冷跑）、tools/ffmpeg+libmpv（生产运行时）、PRODUCTION_* 证据。
+
+### ⚠ 误删事故（我负全责，已尽量恢复）
+**根因**：清理前只查了"路径是否被引用"，看到文档引用误判为"仅文档记录"——**没读引用上下文里的保护指令**。
+
+| 误删项 | 状态 |
+|---|---|
+| `research_phase3/A2a_singlepass_v2623.mp4`（**文档标「别删」**，样本4单趟基准） | ✅ **完全恢复**：用会话库恢复的脚本重跑，**1,362,195,228 字节（逐位同）/107434 帧/PTS 严格递增** |
+| `sentinel_fix/4_full_audio.mp4` | ✅ **已重建 + E2E PASS**（PTS 0/107434 不一致） |
+| `bench_b/ctts_patch.py` + 产物 | ✅ 脚本从会话库恢复（tools/recovered/），产物按需重生成 |
+| `mpv_spike` 38 证据文件（503MB） | ⚠ **部分不可无损恢复**：4 个 frame_oracle（124MB，AGENTS 禁重跑）→ **待 owner 决策**；pts_normalize/g1_wid/stepspeed 等历史快照 → 脚本在库但重跑结果≠历史（实测 g1_wid 重跑 fail `RESIZE_NOT_FOLLOWED`）|
+
+**恢复工具**：`tools/recovered/{A2_production_singlepass,A2a_vs_batched_check,ctts_patch}.py`（从 ZCode 会话库提取，语法检查通过）。
+**教训 → R11 候选**：清理前必须**读引用上下文**，凡含「勿删/别删/基准/对照」先停并问 owner。
+
+### 搁置状态
+- 全部成果已入库（7 笔，本地）；**未 push**。
+- owner 手检未做（owner 令「暂时先不手检」）→ 下次恢复时：`python tools/acceptance_gate.py --level L3`（需停 GUI）或按 checklist 六项手检。
+- 待办：①frame_oracle 决策 ②手检→验收→push ③dsvc 源码已入库（原「推送前拍板」项已闭环）。
