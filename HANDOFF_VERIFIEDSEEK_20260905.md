@@ -339,3 +339,38 @@ fd9ada3 dsvc 源码入库 → 86ac797 直通核心（ledger/service/skim+tests�
 - 全部成果已入库（7 笔，本地）；**未 push**。
 - owner 手检未做（owner 令「暂时先不手检」）→ 下次恢复时：`python tools/acceptance_gate.py --level L3`（需停 GUI）或按 checklist 六项手检。
 - 待办：①frame_oracle 决策 ②手检→验收→push ③dsvc 源码已入库（原「推送前拍板」项已闭环）。
+
+## 18. 外部参照调研：FilmCraft + 成熟组件复核（2026-10-09/10，owner 令）
+
+### 18.1 FilmCraft（`storytold/filmcraft`）——纯 Rust 的 Premiere 替代
+- **身份**：6466★/2231 fork，MIT OR Apache-2.0，创建 2026-09-30（9 天 840+ 提交=AI 辅助高速开发：仓库含 AGENTS.md/CLAUDE.md，首席提交者 echelon 629 次）。
+- **预览防卡顿七层机制**（源码级：`crates/ui-egui/src/frames.rs`、`play_ahead.rs`、`crates/codecs/src/gop.rs`、`crates/engine/src/previews.rs`、`proxies.rs`）：
+  1. **多线程预渲染 2-6 worker** + `playback_plan()` 自适应降采样——`load = render_cost×fps×1.15/workers`；跟不上时返回 `(lead, stride)`，**均匀丢帧而非全部迟到**。
+  2. **播放预取** 14 帧（倍速>1.5 取 24）+ 陈旧丢弃。
+  3. **起播预热** `PREROLL_FRAMES=6`/`PREROLL_TIMEOUT_S=0.5`——等 6 帧就绪才启动时钟（与我们 resume 快路径同思路）。
+  4. **GOP 级解码缓存**——seek 落前关键帧→解到目标→按 PTS 缓存全部；播放不重启解码器（与 dsvc 连续解码同构）。
+  5. **渲染条 + 内容哈希预览**——128 位 FNV-1a 只哈希「影响像素」字段、位置相对化（ripple 编辑哈希不变）；成本模型（H.264=3ms/HEVC=6ms/CPU层=10ms/转场=12ms）超 `REALTIME_BUDGET=1.5` 标红；ProRes `<hash>.mov` 原子写。
+  6. **代理**（ProRes 422 Proxy / H.264 ¼½ 尺寸，导出恒全分辨率）。
+  7. **音频独立线程 + 0.2s 环形缓冲**（`LEAD_S=0.2`，设备回调只拷贝）+ 声卡主钟。
+- **实测标定**（M4 Pro）：无效果 8s 掉 11 帧 / +4 效果掉 189-191 / 渲染预览后 0-1 帧。
+- **可抄设计（3 项）**：①`playback_plan` 公式（6 行，可映射 dsvc rate 控制）②渲染条 UI（我们有数据无展示）③成本模型思路（预判替代撞墙）。**不可抄代码**（Rust+wgpu+自研编解码器，架构/产品/语言三重不匹配）。
+- **体积实测**（拆包）：单 exe 77.6MB（.text 39.4MB 代码 + .rdata 36.3MB 含内嵌 CJK 字体）+ CLI 58.6MB；**我们** exe 100MB + ffmpeg 84MB + libmpv 94MB ≈ 280MB。**他们自写编解码器是 WebAssembly 浏览器目标所迫**（web 版 14.8MB），非更优选择；155 open issue 中 9 个 codec 相关，自认「相机手机文件测不够」=自研维护负担实证。
+
+### 18.2 ⚠ 表述修正：NVDEC「903fps 实测」→ 实为文献
+- **原表述（10-09 我给 owner 的分析）**：「用显卡解码：**实测过了**，903 帧/秒 vs 1835」——**不准确**。
+- **核实**：903 出自 `ASSET §六 09-12 行`/`HANDOFF §4.0i`，原文是「**NVDEC Ada 官方 903fps**」=**NVIDIA 官方规格 + 子代理文献**（738k tokens 调研役），**非我方实测**。
+- **但结论不变**——我方有**独立实测**：`probe_parallel_refill`（2.mp4 真源）GPU nvdec 多输入 N=1/4/8 = 2.4/3.4/3.8 段/s（上限 **1.1x**），每段进程被 CUDA init 300-450ms 淹没；软解同场景 K=8 = 16.5 段/s（**4.8x**）。另一探针（`probe_decode_through`）本机软解冲刺 2160fps。
+- **正确表述**：「我方实测 NVDEC 在稀疏访问下不扩展（1.1x vs 软解 4.8x）；文献上的 NVIDIA 官方数字（903fps）亦低于本机软解」——**两个独立证据都指向不划算**，但引用时须区分来源。
+
+### 18.3 成熟组件为何不可用（复核，汇总既有调研）
+- **NLE 引擎**：MLT 按恒定帧率换算 seek→VFR 失真（Shotcut 官方劝转码）；GES 跨段=源内 seek→同款换段税。**全走 seek 系**。
+- **解码库**：L-SMASH/DGDecNV=宿主插件（后者付费闭源）；decord 死亡；DALI/PyNvVideoCodec=CUDA 锁+批量抽帧设计。
+- **播放器后端**（9 月实测）：libVLC rate>1=全解码+迟帧丢弃；Qt 时钟加速不省 CPU；GStreamer 裸流 TRICKMODE 无意义；WebCodecs 需整体 HTML 化；SDL2 无机制性收益。
+- **根因**：需求组合行业空白——播放器无「密集段包级跳过」、编辑器用帧内代理（40-187GB/h vs 我们 2.26GB/h）、帧级库止步「第 N 帧」。**无一家把三者合一**。
+- **结论**：解码/容器是商品轮子（PyAV 封装）；「最后一百米」（关键帧表+计数+指纹 ≈150 行）**无货可买**，MLT/BestSource/FFMS2 **全各自本地实现**→ 自建是行业惯例。
+
+### 18.4 下一步（供 owner 决策）
+- **P0**：owner 手检（确认实际体感；关键问：平时用几倍速）→ 若只用 1-2x 则瓶颈不咬，不必做 P1。
+- **P1**（2-3 天，需「开工」）：唤醒物化代理层（探针已实证 3.mp4：构建 9.2s/真 10x/0 丢帧；4.mp4 全片估 2-4min/0.5-1GB）——唯一能解「4x 预览=导出×4」的结构性方案。
+- **P2**（半天）：`skip_loop_filter` 解码提速探针（或把帽 20→28-32，画质代价待拍板）。
+- **不做**：换语言/自写编解码器/换播放器后端（逐条有实测证据否决）。
