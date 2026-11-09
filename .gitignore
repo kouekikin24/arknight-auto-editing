@@ -99,3 +99,7 @@ CLAUDE_HANDOFF.md
 # Project-owned libmpv provenance + binaries (evidence on disk; hashes recorded in handoff)
 tools/libmpv/
 graphify-out/
+
+# 阶段0修正：临时工具目录与二进制依赖不入库
+.tmp-unityperf/
+*.whl
