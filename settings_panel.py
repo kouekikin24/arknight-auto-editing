@@ -130,13 +130,26 @@ class SettingsPanel(ttk.LabelFrame):
             foreground="#666666",
         ).grid(row=sep_r + 9, column=0, columnspan=2, sticky=tk.W)
 
+        # P1 物化代理（2026-10-11 定案）：业务速度烘入的 1080p 连续文件，
+        # 播放只需 UI 倍速解码（UI4x 恒 240fps），真 40x、零停顿。
+        # 构建 ~4.5 分钟一次性（分批+批级缓存），跨会话复用。
+        self.proxy_materialize_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tab_basic, text="物化代理（1080p 真 40x 零停顿）",
+                        variable=self.proxy_materialize_var).grid(
+            row=sep_r + 10, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(
+            tab_basic,
+            text="分析/编辑后台构建导出节奏代理；播放=代理画质，暂停/导出仍源画质",
+            foreground="#666666",
+        ).grid(row=sep_r + 11, column=0, columnspan=2, sticky=tk.W)
+
         ttk.Separator(tab_basic, orient=tk.HORIZONTAL).grid(
-            row=sep_r + 10, column=0, columnspan=2, sticky=tk.EW, pady=4)
+            row=sep_r + 12, column=0, columnspan=2, sticky=tk.EW, pady=4)
 
         self.key_repeat_speed_var = tk.IntVar(value=30)
-        ttk.Label(tab_basic, text="←→ 连续移动速度\n(帧/秒):").grid(row=sep_r + 11, column=0, sticky=tk.W, pady=2)
+        ttk.Label(tab_basic, text="←→ 连续移动速度\n(帧/秒):").grid(row=sep_r + 13, column=0, sticky=tk.W, pady=2)
         ttk.Spinbox(tab_basic, from_=1, to=120, textvariable=self.key_repeat_speed_var, width=7).grid(
-            row=sep_r + 11, column=1, sticky=tk.W, padx=4)
+            row=sep_r + 13, column=1, sticky=tk.W, padx=4)
 
         # ---- 匹配阈值 ----
         self.thr_pause_var = tk.DoubleVar(value=0.7)
@@ -437,6 +450,7 @@ class SettingsPanel(ttk.LabelFrame):
             'speedup_02': self.speedup_02x_var.get(),
             'speedup_02_factor': self.speedup_02x_factor_var.get(),
             'skim_preview': self.skim_preview_var.get(),
+            'proxy_materialize': self.proxy_materialize_var.get(),
             'key_repeat_speed': self.key_repeat_speed_var.get(),
             'decode_backend': self._decode_backend_key(),
             'ffmpeg_path': ffmpeg_path,

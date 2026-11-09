@@ -374,3 +374,1004 @@ fd9ada3 dsvc 源码入库 → 86ac797 直通核心（ledger/service/skim+tests�
 - **P1**（2-3 天，需「开工」）：唤醒物化代理层（探针已实证 3.mp4：构建 9.2s/真 10x/0 丢帧；4.mp4 全片估 2-4min/0.5-1GB）——唯一能解「4x 预览=导出×4」的结构性方案。
 - **P2**（半天）：`skip_loop_filter` 解码提速探针（或把帽 20→28-32，画质代价待拍板）。
 - **不做**：换语言/自写编解码器/换播放器后端（逐条有实测证据否决）。
+
+## 19. 真机双 bug 修复 + 参照项目评估（2026-10-10·owner「开工修这两个」）
+
+### 19.1 空格「有时未响应」——根因实证 + 修复（T0 探针）
+
+- **根因**（`probe_tk_space_binding` 实证）：Tk bindtags 顺序 = widget→class→toplevel→all。
+  原实现对按钮类绑 `root.bind_class(cls, '<space>', lambda e: 'break')` ——
+  class 级返回 `'break'` **终止整条链**，焦点在按钮上时空格既没触发按钮、
+  也永远到不了 root 的 `_on_key_space`（探针实测 `root_handler_fired=False`）。
+  用户点过任一按钮后按空格=完全失灵；点画面/时间轴（focus_preview 抢焦点）后又正常
+  ——正是「有时不响应」的形态。
+- **修复**（`preview_player.py::_bind_keys`）：class 级改为**直连我们的 handler**
+  `root.bind_class(cls, '<space>', self._on_key_space)`——语义与 root 级完全一致；
+  其返回的 `'break'` 仍抑制按钮自身空格响应（`probe_bindtags_order` 实证：
+  handler 恰好触发 1 次、不双触发）。
+- **回归测试**：`tests/test_preview_dthrough_tier.py::SpaceClassBindingTests`
+  （断言每个按钮类的 `<space>` 直连 `_on_key_space`，禁止吞键 lambda 回归）。
+
+### 19.2 红条在最后 + 按钮仍「暂停」——根因实证 + 修复（T0 探针）
+
+- **引擎侧先证**（`probe_eof_lastframe`，真 dsvc+mpv，4.mp4 真段表）：
+  从末帧 `start=424175` 起播 → dsvc 推 1 帧 → ~2.9s 后 eof 事件 →
+  引擎 `playing:false / reason:"eof"`。**引擎侧正确**。
+- **GUI 侧复现**（`probe_redbar_stuck`，真 main.main()+真引擎，四场景）：
+  **R2 = 拖红条到末尾且按住不松手** → 引擎已报 eof 持续 8s+，UI 仍
+  `is_playing=True`、按钮「暂停」、红条钉末尾 —— **与 owner 截图态完全一致**。
+  根因：`_sync_eof_stop` 判据带 `self._is_dragging` 门 → 拖拽中永不归位；
+  松手后 `_on_tl_drag_end` 又 `_send_play(末帧)` 触发「末帧重播」空转
+  ——acceptance 日志 `start=424175` 反复出现的来源。
+- **修复**（`preview_player.py` 三处）：
+  ①`_sync_eof_stop` 去掉 `_is_dragging` 门（真拖拽 seek 的瞬态 inactive 必从
+  `reason="playing"` 出发，reason 门已足够；eof 终态必须同步）；
+  ②`_on_tl_drag_end` 松手时先对账 `_sync_eof_stop()`，堵住 4Hz 同步的
+  240ms 窗口内「松手→重播」竞态；
+  ③渲染循环 4Hz 维护块补 `_update_labels()`（见 19.3）。
+- **复验**（同一探针重跑）：R2 `stuck:false`（引擎 eof 后 UI 正确归位）；
+  R2b 不再出现 `start=423310` 幽灵重播。回归测试
+  `EofStopDuringDragTests` 4 例（拖拽中 eof 归位/瞬态不误触/stop 不误触/非播放 noop）。
+
+### 19.3 「帧数完全没对应上」——时间标签原生模式不刷新（T0 探针）
+
+- **截图解码**：OSD 帧 `424,175/424,175`（mpv overlay，正确）而时间标签
+  `44:06 / 117:49`（=上一次 `_update_labels` 的旧值）。根因：原生渲染没有
+  `_display_rgb` 帧泵，`_update_labels` 只在 `_seek`/`_step`/`_display_rgb`
+  被调 → 播放中永不刷新。
+- **修复**：渲染循环 `_perf_ui_tick % 15 == 0` 维护块补 `_update_labels()`
+  （4Hz；cv 模式 `_display_rgb` 已逐帧刷新，本次幂等无副作用）。
+- **复验**（`probe_label_refresh`）：播放 4s 内标签 `00:00 → 00:01 → 00:02`
+  随帧推进；暂停后冻结。**未加新单测**（标签刷新是渲染循环行为，探针已证；
+  单测需 mock 整个循环，性价比低）。
+
+### 19.4 EOF 延迟分解（探针 `probe_eof_latency`，T0）
+
+从末帧起播到引擎报 eof 的 2.7s 分解：`loadfile→file-loaded` 0.06s →
+tp 首次 0.06s → tp 冻结 0.11s → **tp 冻结→engine_eof 2.63s**。
+dsvc 事件时间戳：gen 0.14s → loaded 1.72s（**关键帧扫描 1.6s**）→
+seek_ok+eof 2.86s（**seek 解码 1.1s**）。即：末帧起播本身要 ~2.9s 才报 eof
+（dsvc 每次 load 都全片扫关键帧 3535 个）。**结论**：这是「末帧起播」的固有
+延迟，不是缺陷；但 UI 在等待期必须能自愈（19.2 的修复保证拖拽中也能归位）。
+
+### 19.5 参照项目评估：`D:\1bt(1)\arknight-auto-editing-main`（owner 令）
+
+**身份**：7 月 workspace，含三份产物——`upstream_v26_7_10_enhanced/`（v26.7.10
++ 增强合并，含 MERGE_REPORT/UPSTREAM_VERSION 含 9 文件 pristine sha256）、
+`deliverable_v2_analysis/`（重构版 + 15 缺陷审计 BUG_REPORT）、
+`source_with_arknight_extension/`（Fable5 PR 材料 30+ 文档）。
+
+**可参考内容（按价值排序）**：
+1. **BUG_REPORT.md（15 缺陷）**：与我们架构交叉核对后，**3 类仍适用**：
+   - **F1/L-8 类**：ffmpeg `stderr=PIPE` 无人读 → 64KB 满后死锁（他们 H 级缺陷）。
+     **我们不适用**：`analyzer.py` 全部用 `tempfile.TemporaryFile()` 收 stderr
+     （713/1778/3306 行），无管道回压面。
+   - **L-8 类**：`winfo_width()` 为 0 时除零（平移/缩放）。**我们命中**：
+     `timeline_widget.py::_pan_move` 有 `dx / self.canvas.winfo_width()` 无钳位
+     （滚轮缩放路径也依赖 Windows `event.delta`，X11 不兼容）。
+     **建议**：`w = max(1, winfo_width())`（低成本加固，未动手——不在本次两 bug 范围）。
+   - **M-6 类**：worker 线程直调 `self.after(...)`（Tk 非线程安全）。我们已收敛到
+     `task_manager` 回调面，未发现同类直调（抽查 analyzer 无 `threading.Thread`）。
+2. **UPSTREAM_VERSION.md 的 pristine sha256 表**：可复用的「版本指纹」方法——
+   与我们 analysis_cache 的「键=内容寻址」同哲学，作为外部对照证据。
+3. **MERGE_REPORT 的「兼容不变式」清单**：帧分类顺序/公式不变、diffs float32、
+   公开函数签名不变的显式声明——与我们 R1 parity 表同构，可作文档范式参考。
+4. **导出增强**（临时输出/不覆盖提交/源码率模式/FFV1-MKV/NVENC）：
+   与我们的导出路线无冲突，但**架构不同**（他们 cv2 逐帧 + pipe 写 ffmpeg；
+   我们 PTS 认证批量管线），不建议移植。
+
+**不可用/不相关**：deliverable_v2 的重构布局（analysis_pipeline/player_* 拆分）
+与我们现行架构（mpv/dsvc/task_manager）完全不同代；其 headless_stubs 方案
+对我们无价值（我们已有真引擎探针链）。
+
+### 19.6 验证与门禁（本次）
+
+- `python -m pytest -q` = **651 passed + 94 subtests**（新增 6 例回归测试全绿）。
+- `tools/acceptance_gate.py --level L2` = **7/7 PASS**（123s，含 dsvc 位级/引擎 E2E/
+  碎段/混合倍率四探针）。
+- `tools/preflight.py` = PASS。
+- 探针产物（.cache/v3ass/，gitignore）：`probe_eof_lastframe.py`+results、
+  `probe_redbar_stuck.py`+results、`probe_label_refresh.py`+results、
+  `probe_eof_latency.py`+results、`probe_eof_1x_stall.py`+results、
+  `probe_redbar_loop.py`+results、`probe_redbar_eof_gui.py`+results、
+  `probe_lost_release.py`+results（后四个为诊断中间产物，保留供溯源）。
+
+### 19.7 待办（供 owner 决策）
+
+- **未提交**：本会话改动（`preview_player.py` 三处修复 + `tests/test_preview_dthrough_tier.py`
+  新增两组测试）在工作区，等「验收」。
+- **GUI 已停**（跑 L3 前须停 GUI；L3 门禁正在后台跑，结果见下轮）。
+- **可选加固（未动手）**：`_pan_move` 除零钳位（19.5 第 1 条）。
+- **参照项目是否清理**：`D:\1bt(1)` 占盘待 owner 定（评估已完成，可留档）。
+
+## 20. Review 自查 + 重大发现：dsvc 代数竞态（2026-10-10·owner 令「Review 一下有没有引入新的问题」）
+
+### 20.1 自查三处修复的引入风险（逐条实证）
+
+- **① `_sync_eof_stop` 去拖拽门——安全，已证**：
+  - 拖拽 seek 不触发模式重载（直通档走流内 seek；EDL 走 seek_edl 原地），
+    `probe_reload_transient` 实测模式切换 99 采样 **0 个**假 eof 窗；
+  - CV 引擎（video_io）拖拽 seek 的瞬态 reason=`"seek"`（第 868 行），
+    非 `"eof"` → reason 门仍拦住；
+  - 真 eof 时 `loaded_ready` 保持 True（对照组实证），无歧义。
+- **② `_on_tl_drag_end` 松手先对账——安全**：`_sync_eof_stop` 幂等
+  （非播放/no-op；eof 后 UI 已停则 `is_playing=False` 直接返回）。
+- **③ 渲染循环补 `_update_labels()`——发现并修复了我自己引入的裸调用**：
+  `_update_labels` 内部调 `settings.get_params()`（活 Tk 变量），销毁中/
+  半初始化时可抛；渲染循环维护块裸抛会**终止循环**（=整个 UI 冻结，恰是
+  本次要修的那类形态）。已包 try 对齐同块其余调用（`_refresh_perf_label`
+  内部包、`_sync_eof_stop` 包快照）。单测验证 get_params 抛异常时循环
+  仍存活。
+- **④ 空格 class 绑定——安全，已证**：`probe_bindtags_order` 实测 handler
+  恰好触发 1 次；L3 手检 T6_space `toggled=true`；对 Toplevel 对话框
+  （隐藏静帧实例 overrideredirect）无影响（其无按钮焦点场景）。
+
+### 20.2 重大发现：dsvc 代数竞态（=「红条在最后仍在播放」的**真根因**）
+
+- **线索**：`probe_reload_transient` 对照组（播放中调 `play_dthrough(末帧)`）
+  首跑 20s 无 eof；复跑 1.41s 即 eof → 疑间歇。`probe_pwp_repeat` 六次重复
+  **2/6 超时**（真竞态，非 flake）。
+- **现场**（`probe_eof_stall_capture` 捕获）：引擎 `reason:"playing"`、tp
+  以 1x 从 154.2s 续走（超出台账虚拟总长 139.6s）、dsvc `gen:3` 流持续推
+  ~61 帧/s、`source_frame` 钳在末帧 424175、**无 seek_ok/eof/error**。
+- **根因（源码级，`tools/dsvc/src/main.rs`）**：
+  - reader 线程：`fetch_add(1)` **之后**才 `send(cmd)`；
+  - decode_loop：`recv(cmd)` **之后**才读 `shared.generation.load()`；
+  - load+seek 背靠背入队（生产起播：`play_dthrough` 的 load 之后，mpv
+    demuxer 立刻经 stream_cb `seek_fn` 发 seek）时，**load 出队后读到的是
+    seek 的代数**：load 以最新代运行、自身 `generation != gen` 检查恒假 →
+    永不中断地走全片（分钟级）；seek 在通道里饿死。
+  - 症状完全吻合 owner 截图：流从早先位置续推（tp/60.2FPS 仍亮）、
+    `source_frame` 被台账钳在末帧（红条钉末尾）、永不 eof（按钮永停
+    「暂停」）——**且引擎不报 eof 时，20.1 的 GUI 修复也救不了**。
+  - 服务级直证（`probe_dsvc_genrace`）：load+seek 背靠背 → 无 seek_ok/eof、
+    span 事件从低 si（17,7,8,9,10…）递增。
+- **修复**：新增 `Queued { gen, cmd }`——代数在 reader **入队瞬间**
+  `fetch_add(1)+1` 绑定并随命令传递；decode_loop 不再读全局。背靠背命令
+  各持其代，旧命令在新代下达时必被中断（Stop/Quit 分支同样携带当前代）。
+- **验证**：
+  - `probe_dsvc_genrace` 10/10 ok（修前 run 0 超时）；
+  - `probe_pwp_repeat` **0/6 超时**、eof 恒 ~1.2s（修前 2/6 超时）；
+  - `probe_eof_lastframe` 三场景正常（A 2.81s / B 1.25s / C 1.54s）；
+  - `probe_redbar_stuck` R2 `stuck:false`、R2b 无幽灵重播；
+  - **L2 门禁位级四项全过**（`A_full_bytes_exact=True / C_discard_exact=True`
+    ——解码输出零变化）；单测 651+94；**L3 门禁 11/11**（含手检九项、随机
+    压测「状态卡死=False」）。
+- **产物**：exe sha256 前 16 位 `1d7db445763edde6`（旧 `b1150b0ee6906c4d`）；
+  旧 exe 备份 `.cache/v3ass/dsvc/dsvc_pre_genfix_backup.exe`；源码同步
+  `tools/dsvc/src/main.rs` ⇄ `.cache/v3ass/dsvc/src/main.rs`（逐字节一致）；
+  `tools/dsvc/README.md` 补「修订史」节。
+
+### 20.3 教训（候选 R12）
+
+- **「探针过=功能通」再证盲区**：四探针全绿（含 E2E）仍漏此竞态——它只在
+  「播放中重载+seek 背靠背」的时序下触发，单次序列探针难命中。**修复=加
+  「重复 N 次」的压力型探针**（`probe_pwp_repeat` 六次即暴露 2/6）。
+- **协议两端各持一份状态机时，代数（generation）必须在同一临界点绑定**：
+  入队时绑定 vs 出队时读取，是隐蔽的跨进程竞态源。
+
+### 20.4 当前状态
+
+- 改动：`preview_player.py`（三处修复 + review 加固）、
+  `tests/test_preview_dthrough_tier.py`（+6 测试）、`tools/dsvc/src/main.rs`
+  （竞态修复）、`tools/dsvc/README.md`、本棒。**未提交，等「验收」**。
+- 新 dsvc.exe 已就位（`.cache/v3ass/dsvc/target/release/`，生产查找路径）。
+- GUI 已停（L3 门禁要求）；恢复命令：`ARKNIGHT_PREVIEW_ENGINE=mpv python main.py`。
+
+## 21. 功能差距分析：参照项目有而我们没有的功能（2026-10-10·owner 令）
+
+owner 指出评估方向应为「**对方已实现、我们缺失的功能**」（例：0.2x 区域裁剪）。
+主会话源码级盘点两份代码后确认的差距清单（按价值排序）：
+
+| # | 功能 | 参照实现 | 我们现状 | 成本 |
+|---|---|---|---|---|
+| 1 | **0.2x 区域三选一（keep/speedup/cut）** | 三选框；默认 **cut**；cut 经 clip_segments 软缺口贯通预览+导出 | 仅布尔加速（=keep/speedup 两态），**无 cut** | 核 0.5 天+集成 1 天 |
+| 2 | **高级边界检测器群** | operator panel 证据 / speed digit 恢复 / 暂停前变暗单帧 / 0.2x 后抖动 / 释放抖动 / 震荡尾 | 全无（只有 diff 掩码+边界阈值） | 全套数周；单项 1-3 天 |
+| 3 | **软缺口剪辑模型** | 自动删除区（0.2x/抖动/变暗）作 clip 内软缺口，端点可拉回 | clip 仅由 pause 间隔生成，无软缺口概念 | 2-3 天 |
+| 4 | **导出模式扩展** | 源码率 / 无损 FFV1·MKV / GPU 无损 / 2x 减速（repeat=2） | 仅质量 0-10 + GPU 加速 + 保音频 | 每项 1-2 天 |
+| 5 | **交互小件** | 双击画面播放暂停 / 回车加载 / 拖放导入 / 画布滚轮 / 空格 KeyRelease 防抖 / 自动配置提示 | 均无（回车/双击/防抖=半小时级） | 合计 1-2 天 |
+
+**不适用/不需移植**：其 DCT+hist 边界判据（与我们的 diff 阈值体系不同代）；其重构模块布局；
+其 headless stubs。**我们反超的**：直通档预览、分析缓存、PTS 认证导出、分档门、双轴台账。
+
+**关键架构优势**：我们的预览与导出**共用 `_build_timeline_plan`**——0.2x cut 只需进
+`_build_delete_mask` 一处，预览（EDL/直通 spans）与导出自动一致（参照项目为对齐这一点
+专门重构了 clip_segments 模型）。
+
+**待 owner 定夺**：是否「开工」实现 #1（0.2x 裁剪）及其配套（#3 软缺口可拉回）。
+
+## 22. FilmCraft 40x 实测（2026-10-10·owner 令「需要实测」）
+
+**问题**：FilmCraft 自研编解码器会撞 40x（=UI 4x × 业务 10x，需 2400 源帧/秒解码）的墙吗？
+**方法**：解包其官方 Windows 构建（`.cache/rust_nle_review/fc_extract/`），用其自带
+`filmcraft-cli.exe bench-decode`（顺序解码基准，与其播放同源 GopCache 路径）测同一
+4.mp4（1080p60 H.264 2.4Mbps）与自制代理；对照测我们的 dsvc（同机、同文件、
+`pop_chunk` 主动排水消除背压）与 ffmpeg CLI。
+
+**结果（14400 帧窗口 = 240s，本机 RTX 4060 Laptop + Ryzen 7 8845H）**：
+
+| 场景 | FilmCraft | 我们 dsvc | 40x 需求 |
+|---|---|---|---|
+| 全画质 1080p | **750 fps**（NVDEC 82%，≈12.5x 上限）| 2437 fps（隔离）· 1380 fps（GUI 实载）| 2400 fps |
+| ½ 代理 960×540 | 1313 fps（≈21.9x）| 8784 fps | 2400 fps |
+| ¼ 代理 480×270 | 2293 fps（**≈38.2x，仍差**）| 21782 fps（≈363x）| 2400 fps |
+
+**关键事实**：
+1. **FilmCraft 撞墙，且撞得比我们狠**：全画质 750 fps = 12.5x 上限（40x 需求 2400），
+   而且它已在用 NVDEC 硬解（GPU decoder util 82%，控制组 0%）——**其硬解路径被
+   NVDEC 自身 ~900fps 吞吐封顶**（与文献 903fps 吻合），慢于我们 16 线程软解。
+2. **我们 dsvc 全画质隔离解码 2437 fps ≈ 40x 需求线**（nonref-skip 开；关=1504）；
+   GUI 实载 1380 fps（cap=20 的由来）。即：**软解峰值勉强够 40x、零余量**——
+   生产不可用，这正是 P1 物化代理的必要性来源。
+3. **代理路线双证**：我们 ¼ 代理 21782 fps 有 **9x 余量**（40x 下仅需 2400）；
+   FilmCraft ¼ 代理 2293 fps 仍差 5% → 它只能靠 stride 均匀丢帧兜底（保节奏缺帧）。
+4. **FilmCraft 自认**：README「biggest gaps」第一条 = "Speed on big footage"，
+   自评"能干活"仅 50-60%；其解法=硬解 + 代理 + 渲染预览（绿条物化）三件套
+   ——与我们的 P1 方向同构，佐证路线正确。
+
+**证据落盘**：`.cache/rust_nle_review/fc_extract/filmcraft-0.4.0-windows-x64-portable/`
+（官方 win64 构建，含 bench-decode CLI）；自制代理 `.cache/fc_bench/`（proxy_q240/h240.mp4）。
+**对 P1 决策的含义**：40x 场景下"直接解码源"无解（我们 2437≈临界、FilmCraft 750 差 3 倍），
+**物化代理是唯一能把解码负载降到 1x 的路线**；且 ¼ 尺寸已实测 9x 余量，代理档位无需激进。
+
+### 22.1 追加：FilmCraft 慢于我们的根因 = GPU 硬件解码（NVDEC）的硅片吞吐上限
+
+**owner 问**：为什么 FilmCraft 比我们差？跑 CPU 还是 GPU？
+**实测三组对照（同机 RTX 4060 Laptop + Ryzen 7 8845H/16 线程，同 4.mp4 1080p60）**：
+
+| 路径 | 速率 | GPU decoder util | 性质 |
+|---|---|---|---|
+| FilmCraft bench | 750 fps | **80-84%** | **GPU 硬解**（Media Foundation→NVDEC） |
+| ffmpeg 纯 NVDEC（h264_cuvid） | **976 fps** | **99%** | **GPU 硬解**（解码器打满=硅片极限） |
+| ffmpeg 软解（对照） | 2263 fps | 0% | CPU |
+| 我们 dsvc（软解） | 2270 fps | **0%** | **CPU** |
+
+**结论**：
+1. **FilmCraft 跑在 GPU 上**（硬件解码，GPU decoder 占用 80%+ 是铁证）；**我们跑在 CPU 上**（软解，GPU decoder 恒 0%）。
+2. **GPU 反而慢的原因 = NVDEC 硅片吞吐上限**：ffmpeg 纯 NVDEC 路径把解码器压到 **99% 占用**，速率也只有 976 fps（≈2.0 GPixel/s）——这是 RTX 4060 Laptop 这代硬件解码器对该码流的物理天花板。16 核软解可达 2270 fps（≈4.7 GPixel/s），**是硬解的 2.3 倍**。
+3. FilmCraft 的 750 fps 略低于 NVDEC 裸上限（976），差值 ≈23% = 其自身管线开销（帧拷贝/色彩转换/调度）。
+4. 与既有文献互证：ASSET §六 记录的「NVDEC Ada 官方 903fps」文献值，本机实测 976 fps，吻合。**「显卡解码更快」在本机对此负载是伪命题**——这解释了为何我们 9 月就实测否决 NVDEC 路线（probe_parallel_refill：稀疏访问仅 1.1x），现在顺序访问也确认硬解更慢。
+5. 40x 需求 2400 fps = 4.98 GPixel/s：**只有 16 核软解（4.7 GPixel/s）接近**；硬解（2.0）差 2.5 倍。两边都到不了 40x——代理仍是唯一解。
+
+### 22.2 修正 + 上游 GPU 优化核查（2026-10-10·owner 追问「从哪得出的结论/上游是否优化」）
+
+**① 修正我上一轮的表述**：「NVDEC ~980fps 是硬件上限」**不准确**——980 是
+**单会话（单进程）**速率，不是硅片硬上限。实测并发扩展（同机同文件）：
+
+| 并发 NVDEC 进程数 | 每进程 | 合计 |
+|---|---|---|
+| 1 | 973 fps | 973 fps |
+| 2 | 957 / 490 | **1447 fps**（1.49x）|
+| 4 | 920/479/324/245 | **1968 fps**（2.02x）|
+
+即 NVDEC 有并发扩展性，但**扩展效率递减**（4 会话仅 2.0x），且 4 会话仍只到
+1968 fps（40x 需求 2400 的 82%）——**硬件路线接近但仍差 40x 门槛**；
+软解 16 线程单进程 2437 fps（102%）反而更高。结论方向不变（硬解不占优），
+但「硬上限」措辞应改为「单会话 ~980，多会话 ~2000 封顶」。
+
+**② 上游（liemark）最新版确实做了 GPU 优化**——PR #10「Gpu optimization」
+（2026-10-06 合入，commit e368d15b；文案「Add support to GPU decode...
+May have a x10 speedup finally」）：
+- 新增 `gpu_caps.py`（1152 行：解码变体构建/实测探测/编码器探测）+ `pipeline.py`
+  重构（FFmpeg 管道解码：硬解→缩放→转灰→rawvideo）；
+- 解码变体：NVDEC(scale_cuda/scale_npp/软件缩放)、QSV(scale_qsv/vpp_qsv/软件缩放)、
+  D3D11VA/DXVA2；启动时**实测每个变体**（`probe_decode_variant`：解 12 帧
+  400×225 验证字节数与非全零）；
+- **实测本机该路径**：其 NVDEC+scale_cuda 变体 14400 帧 **15.4s（934 fps）**
+  vs 其软件变体 **7.9s（1821 fps）**——**硬解路径反而慢近一倍**。
+- **关键缺陷**：`probe_decode_variant` 只验「能出正确字节」，**不测速度**；
+  `profile.decode_variant` 取**首个 ok 的变体**（变体列表按厂商序，NVDEC 在前）
+  → 在 NVDEC 可用的机器上**必然选中较慢的硬解**。即上游的 GPU 优化在本机
+  实测为**负优化**（分析链路 2x 变慢），且其探测机制无法发现这一点。
+- 注：上游该优化针对**分析**（400×225 灰度，非预览播放）；对我们的
+  「预览 40x」问题无直接关系——我们的瓶颈在播放解码全分辨率帧。
+
+**③ 与我们对照**（同机同文件 14400 帧）：
+| 路径 | 速率 | 备注 |
+|---|---|---|
+| 上游 NVDEC 变体（分析分辨率）| 934 fps | 硬解 |
+| 上游软件变体（分析分辨率）| 1821 fps | 软解，**快 95%** |
+| 我们 dsvc 全画质（非参考跳帧）| 2437 fps | 软解 |
+| FilmCraft（GPU 硬解）| 750 fps | 硬件会话+自有管线 |
+
+**④ 结论**：上游最新版做了 GPU 解码优化，但（a）面向分析非预览；（b）其
+变体选择机制选到较慢的硬解，在本机是负优化；（c）即便并发到 4 会话，
+NVDEC 合计 1968 fps 仍低于 40x 门槛，软解 2437 fps 反而更高。**「改用硬解
+提速」在我们这台机器上继续被否决（第三组独立证据）**。
+
+### 22.3 NVDEC 深挖实验（2026-10-10·owner 问「为何慢/调用问题吗/能否提升/CUDA 有用吗」）
+
+**实验系列（同机同文件 4.mp4 1080p60，120~240s 窗口）**：
+
+**① 调用路径对比（判定是否"调用姿势"问题）**——四种姿势全测：
+| 调用方式 | fps |
+|---|---|
+| `-c:v h264_cuvid`（显式 cuvid 解码器） | 738 |
+| `-hwaccel cuda`（默认） | 967 |
+| `-hwaccel cuda -hwaccel_output_format cuda -c:v h264_cuvid` | 971 |
+| `-hwaccel d3d11va`（Windows Media Foundation 路线） | 724 |
+| 软件对照 | 2249 |
+**结论：不是调用问题**——跨 API 家族（NVDEC/cuvid 与 D3D11VA/MF）四个姿势全在 720~970
+区间，软件 2250。差异（738 vs 971）是次要的封装开销，不改变量级。
+
+**② 并发墙钟测试（判定总吞吐是否有余量）——⚠ 修正 §22.2 的错误结论**：
+| 并发会话数 | 总帧数 | 墙钟 | **合计吞吐** |
+|---|---|---|---|
+| 1 | 7200 | 7.7s | **940 fps** |
+| 4 | 28800 | 30.1s | **958 fps** |
+| 8 | 57600 | 60.0s | **961 fps** |
+**合计吞吐恒 ~950-960 fps，不随会话数增长**（8 会话时 GPU decoder util 100%、
+video clock 2160MHz 满、功耗仅 38W=非功耗墙）。§22.2 记的「4 会话 1968」是
+**方法错误**：那是把不同时长窗口的每进程瞬时 fps 相加；墙钟法证明预算被共享。
+**正确结论：NVDEC 对 1080p60 的持续总吞吐 = ~960 fps（硬上限）。**
+
+**③ 分辨率曲线（判定受限维度）**：
+| 源分辨率 | fps | GPix/s | us/帧 |
+|---|---|---|---|
+| 1920×1080 | 962 | 1.99 | 1040 |
+| 1280×720 | 1835 | 1.69 | 545 |
+| 960×540 | 2743 | 1.42 | 365 |
+| 480×270 | 5415 | 0.70 | 185 |
+| 240×136 | 7065 | 0.23 | 142 |
+**两段体制**：≥540p 是**像素吞吐受限**（~1.4-2.0 GPix/s）；≤270p 撞**帧率上限
+~7000 fps**（~140µs/帧固定开销）。**码率几乎不影响**（同 1080p 低码率 925 vs
+原片 962 → 不是码流受限，是像素/固定开销受限）。
+
+**④ CPU+GPU 混合（判定是否有未开发余量）**：软解单独 2128 fps；硬解单独 943；
+两者**同时跑**墙钟 7.7s → 合计 1870 fps < 软解单独 2128——**互相争抢（CPU 侧被
+GPU 驱动线程/PCIe 干扰），混合无增益**。
+
+**⑤ CUDA 的作用边界**：CUDA ≠ 解码。解码走 NVDEC 固定功能块（不占 CUDA 核）；
+CUDA 核可用于缩放/色彩转换（scale_cuda），但那是另一个阶段。**"用 CUDA 加速
+解码"是概念混淆——解码吞吐由 NVDEC 块决定，与 CUDA 核数无关。**
+
+**最终定论（五组独立实验一致）**：本机 NVDEC 对 1080p60 硬上限 ~960 fps，
+调用姿势/并发/码率都改不了；软解 16 线程 ~2250 fps 是其 2.3 倍。
+40x（2400 fps）两者都不够——**代理路线不受影响，仍是唯一解**。
+是否深入调研：**解码吞吐问题已测透，不必再调研**；唯一值得外查的是
+「多 NVDEC 引擎的显卡（桌面 AD104/AD102 有 2~3 个 NVDEC）能否线性叠加」，
+但那需要换硬件而非研究。
+
+## 23. 大型调研：上游预览降分辨率？FilmCraft 方案？业界 40x 怎么做？（2026-10-10·owner 令）
+
+**调研方法**：主会话源码级核查上游（gh api 拉最新 12ed1a1d）+ FilmCraft 本地源码
+（.cache/rust_nle_review/）+ 双并行子代理行业调研（开源 NLE 源码级 / 商业 NLE+硬解
+基准）。子代理产出落盘 `.cache/nle_research/`。
+
+### 23.1 上游（liemark）预览：**不降分辨率**（解码后显示时才缩）
+
+- `video_io.py::_push_frame`：`cap.read()` **全分辨率解码** → `cv2.resize(INTER_AREA)`
+  缩到画布尺寸 → 转 RGB 入队。**解码成本=源分辨率全量**，缩放只省显示/转换带宽。
+- `gpu_caps.open_video_capture`：`cv2.VideoCapture(path, CAP_FFMPEG,
+  [CAP_PROP_HW_ACCELERATION, VIDEO_ACCELERATION_ANY])`——**用 D3D11VA 硬解**（我们实测
+  该路径 724fps，见 §22.3）。
+- **无预览分辨率设置、无代理、无渲染缓存**。40x 下它要解 2400fps 全分辨率 = 不可达
+  （其硬解路径 724fps = 12x 上限）。
+
+### 23.2 FilmCraft 预览方案（重析）：代理+预渲染缓存+跳帧三件套
+
+**引擎/编码器身份**（与"自研编解码器"的常见印象不同）：
+- **解码走系统硬件会话**（gop.rs 实证：42 个并发硬件会话、6.5GB VRAM、HARD_DECODERS=8
+  上限）——Windows 上即 Media Foundation→NVDEC；自研 Rust 解码器（h264/hevc/vp9/prores
+  crate）是**回退路径**（其 WebAssembly 浏览器目标所迫，非性能选择）。
+- **编码**：导出 NVENC（nvenc/ffi.rs 转录自 NVIDIA SDK）；预览渲染写 ProRes 422。
+- **渲染**：wgpu（GPU 合成）。
+
+**预览防卡顿六层**（源码级）：
+1. **代理**：ProRes 422 Proxy/LT ¼·½、H.264 ¼·½，默认 **¼ ProRes Proxy**；导出恒回源。
+2. **draft 解码**（真解码时捷径）：播放中 + scale≤0.5 时，H.264 **非参考图跳过去块滤波**。
+3. **catch_up 跳图**：告诉解码器哪些帧已迟到 → 跳过"只服务迟到帧的非参考图"。
+4. **stride 均匀跳帧**：`playback_plan(render_cost,fps,workers)`→`(lead,stride)`；
+   跟不上时"均匀丢中间帧而非全部迟到"；`step=|speed|` 整数源帧步进。
+5. **GOP 级解码缓存**：seek 落前关键帧→解到目标→按 PTS 全缓存；播放不重启解码器。
+6. **预取 14/24 帧** + **声卡主钟**（音频 0.2s 环形缓冲，画面跟随声音）。
+7. **渲染预览（物化）**：内容哈希命名 ProRes 422 `<hash>.mov`，编辑只失效触碰段。
+
+**实测其天花板**（§22）：全画质 750fps（12.5x）、¼ 代理 2293fps（38.2x）——**它自己
+也到不了 40x**，自认 "Speed on big footage" 是最大短板，"ready for real work 50-60%"。
+
+### 23.3 FilmCraft 是否"完全还原 PR"（Premiere）？——**否**
+
+- 自评 **功能清单 ~87%**（菜单项/特效/面板/格式层面），**"能干活" ~50-60%**。
+- 明确缺口：无插件（VST3/OpenFX）、交付编码只有 H.264 软编+HEVC 硬编（无 AV1 导出）、
+  真实世界素材测试不足（"camera and phone files in the wild are less tested"）、
+  Windows/Linux 测试远少于 macOS、AI 功能少。
+- **架构不同**：自研 codec crate + wgpu + egui + 自有工程格式（.fcproj），是
+  "独立实现"而非"克隆"。**它没有还原 PR 的预览架构**（PR 有 Playback Resolution/
+  proxy/渲染条三套；FilmCraft 有 proxy/渲染条但无 Playback Resolution 式的分数解码）。
+
+### 23.4 业界预览方案全景（子代理调研，源码/文档级出处）
+
+**核心结论一：没有任何 NLE 做"解码时降分辨率"**——H.264/HEVC 帧间依赖决定"要显示
+第 N 帧必须解整条参考链"。所有"预览降分辨率"（MLT consumer scale / Resolve Timeline
+Proxy / FCP Better Performance / Blender preview）都是**解码后**的显示/合成降级，
+**不省解码算力**。能改变解码负载的只有三条路：
+  (a) **换文件**（代理/优化媒体：更小+通常全 I 帧）；
+  (b) **跳包不进解码器**（MLT 对 `AV_CODEC_PROP_INTRA_ONLY` 源 `must_decode=0`；
+      mpv `skipframe=nonkey`；FilmCraft catch_up）；
+  (c) **减少解码帧数**（stride——但长 GOP 下每个落点仍要从关键帧解起）。
+
+**核心结论二：开源 NLE 的代理默认就是全 I 帧**——Shotcut `-g 1 -bf 0`
+（proxymanager.cpp:369-374）、Kdenlive x264 档 `-g 1 -bf 0`（encodingprofiles.rc）。
+**这不是巧合**：全 I 帧代理 + speed 步进 = `must_decode=0` → **解码量只与显示帧数
+成正比**（40x 时解码 ≈1/40）。这是开源生态唯一能线性伸缩到 40x 的组合。
+
+**核心结论三：速度上限是产品设计值**——Avid JKL **8x**（键盘；deck 控制另有 16/24x）、
+Kdenlive **10x**、FCP **32x**（官方明示）、VLC **31.25x**（硬 clamp）、mpv 100x
+（但撞解码墙）。**没有任何 NLE 把 40x 当交互预览目标**——40x 属"批处理/分析"域。
+
+**核心结论四：硬解基准（第三方/官方）**：
+- NVIDIA 官方 per-engine（Ada）：H.264 1080p **903fps**（=本机实测 974 吻合）；
+  **单会话不超单引擎，多引擎只对多会话线性**（GeForce 全系 1 个 NVDEC，除非 5080/5090）。
+- 3×NVDEC（L40G）实测 **2615fps**——恰好越过 2400（1.09x），是"单机单路 40x 硬解"
+  唯一实测支撑点，但需工作站卡。
+- QSV 1080p 最高 ~493fps（Arrow Lake 实测）；AMD VCN 无公开吞吐数据。
+- **随机访问崩塌 10-24 倍**（NVIDIA 官方：GOP250 随机采样 37.3fps vs 顺序 881fps）。
+
+**核心结论五：不解码路线**——HAP（DXT1 纹理）2400fps 需 2.5GB/s 显存带宽（现代卡
+1-2TB/s 不是瓶颈），代价 2.5GB/40秒 存储；GPU 纹理全驻留需 19.9GB VRAM；
+HLS `EXT-X-I-FRAMES-ONLY` 是协议层标准化的"I-frame-only 物化"（任意倍速只受取帧限制）。
+
+### 23.5 我们要达到 40x：综合方案（与业界机制逐条对齐）
+
+**40x = UI4x × 业务10x = 2400 源帧/秒**。逐条对照：
+| 路线 | 实测/调研 | 判定 |
+|---|---|---|
+| 直解源全分辨率 | 我们 2437fps 隔离（102% 零余量）/ GUI 1380fps（57%） | ✗ 无余量，生产不可用 |
+| 硬解 | 本机 974fps；上游路径实测 934 vs 其软解 1821 | ✗ 更慢 |
+| 代理（我们已有实测） | ¼ 代理 **21782fps**（9x 余量） | ✓ **可行** |
+| **代理+全 I 帧**（业界标准，我们未做） | Shotcut/Kdenlive `-g 1 -bf 0` | ✓ **加强项** |
+| 代理+业务速度烘入（我们 P1 设计） | probe_proxy_skim 已证：真 10x 恒 60fps、零停顿 | ✓ **最优** |
+| 渲染缓存（物化当前编辑） | Resolve/Kdenlive/FCP 均有；我们无 | ○ 可选 |
+
+**结论**：40x 可达，路径 = **物化代理**（唯一同时保节奏与帧完整），且应按业界标准
+**加全 I 帧**（使 40x 解码量 ∝ 显示帧数而非源帧数，彻底绕开解码墙）；进一步可把
+**业务 10x 烘入代理**（播放只需 UI 4x × 代理 1x = 240fps 解码）——这正是我们
+P1 的原设计，且 probe_proxy_skim 已实测验证。**上游与 FilmCraft 都未做到这一点**：
+上游无代理、FilmCraft 有代理但非全 I 帧（其 ¼ 代理 38.2x 仍差 40x，且其代理是
+同速小尺寸，不是速度烘入版）。
+
+### 23.6 Review 自查（2026-10-11·owner 令「Review 一下结论是否正确」）——两处修正
+
+**修正一：「代理要全 I 帧」这个建议过度简化了，甚至方向反了。**
+§23.5 我写「应按业界标准加全 I 帧……使 40x 解码量 ∝ 显示帧数」——**实测证伪**：
+
+| 60s / 480×270 代理 | 体积 | 顺序解码（PyAV 单线程） |
+|---|---|---|
+| 长 GOP H.264（-g 250） | 1.6 MB | **7702 fps** |
+| 全 I 帧 H.264（-g 1） | 47.7 MB（30x） | **1030 fps（慢 7.5x）** |
+| ProRes 422 Proxy（全 I） | 70.8 MB（44x） | 10831 fps |
+
+**机制**：全 I 帧每帧都是完整帧，**比特量暴增**；「解码量 ∝ 显示帧数」这个
+公式**只在"包级跳过"（不把中间帧喂进解码器）时才成立**。若只是照常顺序解码，
+全 I 帧反而更慢（H.264 全 I 帧 1030 vs 长 GOP 7702）。实测包级跳过 stride=40：
+全 I 帧 90/90 帧干净解出，长 GOP 只解出 61/90（参考链断裂=画面损坏）。
+
+**对我们的真实含义**：
+- **40x 用"1/4 代理 + 顺序解码"已经够**（长 GOP 代理实测 21782 fps = 9x 余量，
+  连 PyAV 单线程都有 3.2x）——**不需要全 I 帧**；
+- 全 I 帧的真实价值在**别处**：(a) 任意位置拖动/scrub O(1)（无 GOP 回退）；
+  (b) 若将来要 >40x 或"包级跳过"优化，全 I 帧 + skip 是唯一路径（需给 dsvc
+  加新能力：当前 dsvc 只做 `AVDISCARD_NONREF`，**不做 demux 级跳包**）；
+- **代价要如实算**：全 I 帧代理体积 30-44x（47.7MB vs 1.6MB / 60s）——
+  与我们「代理 2.26GB/h 比行业小 15-50 倍」的既有优势直接冲突。
+
+**修正二：「Shotcut/Kdenlive 代理默认全 I 帧」这个事实成立，但推论要小心。**
+源码复核确认（`.cache/nle_research/` 已存源）：
+- Kdenlive `data/encodingprofiles.rc` `[proxy]`：`x264=... -g 1 -bf 0 ...`
+  （含 vaapi/amf/qsv/videotoolbox 各变体，仅 nvenc 例外 `-g 2`）；
+- Shotcut `src/proxymanager.cpp:369-374`：`args << "-g" << (hevc_nvenc ? "0" : "1")`
+  `<< "-bf" << "0"`——确认（HEVC-NVENC 特例）。
+**但**：它们选全 I 帧的首要目的是**scrub/seek 流畅**（编辑时反复定位），不是
+"40x 播放"——它们的产品速度上限只有 10x（Kdenlive）。**把"全 I 帧代理"当成
+"40x 的必要条件"是我的过度外推。**
+
+**结论修正后的正确表述**：
+- 40x 可达路径 = **1/4 长 GOP 代理 + 顺序解码**（已实测 9x 余量，**无需全 I 帧**）；
+- 我们 P1「业务速度烘入代理」的设计依然最优（播放只需 240fps 解码）；
+- 全 I 帧是**可选增强**（改善 scrub；为 >40x 留路），代价是体积 30-44x——
+  **建议：先不做**，除非 scrub 手感或更高倍速成为需求。
+
+### 23.7 Review 二次自查（2026-10-11）——三处再修正（含对 §22/§23 的关键翻案）
+
+**翻案一（重要）：FilmCraft「到不了 40x」的结论**部分错误**——我用了自己的
+H.264 代理测它，而不是它的默认代理格式。**
+- FilmCraft 的**默认代理是 ProRes 422 Proxy**（`DEFAULT_PROXY_PRESET =
+  "prores_proxy_quarter"`，proxies.rs:63）——**ProRes 天然全 I 帧**。
+- 用其默认格式（ProRes 422 Proxy ¼，240s）实测：**4112-4135 fps = 68.5x**
+  ——**它其实能超过 40x**。
+- 我之前测的 H.264 代理（2293fps=38.2x）是**它列表里的另一个选项**（h264_quarter），
+  不是默认。**"FilmCraft 也到不了 40x"不成立。**
+- 但注意：其 ProRes 代理体积 **4.25 GB/h**（我们的 H.264 代理 0.11 GB/h，
+  **大 39 倍**）——它是拿磁盘换解码速度。
+
+**翻案二：全 I 帧 vs 长 GOP 的正确结论（修正 §23.6 的过度修正）**
+- **ProRes（全 I 帧，专为解码优化）顺序解码 10831 fps**（PyAV）——**比 H.264
+  长 GOP 代理（7702 fps）还快 40%**；而 **H.264 全 I 帧**（1030 fps）最慢。
+- 所以正确表述是：**"全 I 帧"本身不决定速度，比特率与解码器优化才决定**。
+  ProRes 快是因为它专为快速解码设计（帧内、低熵、无参考）；H.264 全 I 帧慢是
+  因为每帧都要过完整 CABAC 熵解码且码率暴增。
+- **对我们的选择**：我们的 H.264 长 GOP 代理（21782 fps）已经远超 40x，
+  **保持现状即可**；若未来要 scrub 手感或更高倍速，**应选 ProRes 类帧内格式
+  （而非 H.264 全 I 帧）**，代价是体积 30-40 倍。
+
+**翻案三：dsvc 不支持 ProRes**（实测 `frame format not yuv420p`）——ProRes 解出
+yuv422p10，dsvc 的 I420 管道不兼容。若未来采用 ProRes 代理，需给 dsvc 加格式
+转换或换路径。**这是选型时必须知道的约束。**
+
+**修正后的最终结论（供决策）**：
+| 方案 | 解码余量 | 体积 | 状态 |
+|---|---|---|---|
+| 我们 H.264 长 GOP ¼ 代理（现设计） | 21782 fps（9x） | 0.11 GB/h | ✓ 已实证，**足够 40x** |
+| 我们 + 业务速度烘入（P1 原设计） | 播放只需 240fps | 同上 | ✓ 最优，待开工 |
+| ProRes 全 I 帧代理（FilmCraft 默认） | ~4112 fps（1.7x） | 4.25 GB/h（39x） | ○ 可换 scrub 手感 |
+| H.264 全 I 帧代理 | 更慢（1030fps） | 30x | ✗ 不要用 |
+
+**教训（候选 R12）**：对比测试必须用**对方的默认配置**，不能用"我以为的等价物"。
+我用自建 H.264 代理去测一个默认用 ProRes 的系统，导致"它到不了 40x"的错误结论。
+
+## 24. P1 物化代理全量干跑（2026-10-11·owner「下一步该做什么，给出具体方案」准备证据）
+
+**目的**：把 §23 的路线结论落到「开工单」级数字——用 4.mp4 真段表 + 生产
+导出管线，实测「业务速度烘入代理」的全链成本与效果，回答「下一步做什么、
+做多久、多大、能不能成」。
+
+**§24.1 全量构建实测**（`probe_p1_fullbuild.py`，540p NVENC cq22 gop30 bf0，
+7 批×2000 段，生产 select/setpts 滤镜 + concat；输出帧数硬对账）：
+
+| 项 | 实测 |
+|---|---|
+| 保留段/输出帧 | 13619 段 / **20184 帧**（= 导出节奏全量；业务烘入：pause 删 + 1x→2 + 0.2x→10）|
+| 构建墙钟 | **267.9s（≈4.5 min）**，分批 85.8/63.1/31.6/32.6/20.4/19.2/14.5s（首批含冷启动最重）|
+| 解码扫描量 | 421923 帧（99.5% 全片——稀疏保留段的固有代价，间隙不连续）|
+| 产物 | **366.8MB @960×540**，20184 帧、时长 336.42s（与导出虚拟轴逐帧吻合）|
+| 体积口径 | ≈2.2 GB/小时源 或 ≈65MB/输出分钟；1080p 同 cq22 估 ×3-4（~1.2GB）|
+
+**§24.2 代理播放实测**（同一 366.8MB 全量代理，mpv 顺序解码）：
+
+| UI 倍速 | 墙钟到片尾 | 实测速率 | >350ms 停顿 |
+|---|---|---|---|
+| 4x（=240fps 解码需求）| 83.9s | **3.99x** | **0** |
+| 8x | 42.0s | **7.98x** | **0** |
+
+PyAV 单线程 540p 解码 646fps ≫ 240fps 需求（2.7x 余量，连单线程都够）。
+**UI 4x 下 0.2x 段源帧速度 = 2400 帧/s = 40x 精确达标**（映射代数验证：
+source 123456 → 代理帧 2453 → 回 123456 双射精确；0.2x 段 10 帧走 100 源帧
+×240/10 = 2400fps）。
+
+**§24.3 结论与决策含义**：
+1. **40x 全链已被实测走通**：构建 4.5min 一次性 → 播放 UI 4x 干净（0 停顿）、
+   UI 8x 干净（余量 2x）。这是 P1 从「探针级」（3.mp4 73 段）升级到
+   「项目级」（4.mp4 13619 段）的证据。
+2. **构建成本 4.5min 是本方案的主代价**（一次性，异步可播不阻塞）；后续
+   增量=单批重编（3.mp4 实测 2.07s/批，4.mp4 批级估 ~10-30s）。
+3. **体积 367MB@540p 可接受**（对比：P1-RAM 1080p 版估算 630MB；全 I 帧
+   业界代理 40-187GB/h）。540p 画质档=预览可接受、暂停静帧仍回源。
+4. **架构复用面**：构建器（skim_cache.py 513 行已退役但完整）、批次缓存单元、
+   认证 tick 对账（probe_proxy_skim 已证 1276/1276）、任务调度/防抖
+   （`_maybe_schedule_skim_build` 现成）——**不是从零造，是唤醒+改轴**。
+5. **轴设计**（映射零改动成立的根据）：代理=导出帧序列 ⇒ 与既有
+   `CertifiedEdl` 虚拟时间轴**逐帧同构**；代理帧 k ↔ 导出帧 k；现有
+   `_frame_for_position_locked` 的 EDL 分支可直接吃（只需把「虚拟帧 →
+   源帧」映射表换成「虚拟帧 → 代理帧」直接读取）。播放路径 mpv 恒 speed=1，
+   UI 倍速由**帧抽取 stride**（同现有 preview_step 机制）或 UI 侧节流实现，
+   避免再引入第二条时间轴。
+
+### 24.4 分辨率档与清晰度实测（2026-10-11·owner「是否会降低预览清晰度」）
+
+**三档对源 SSIM**（4.mp4 真实内容，两窗各 60s：静景 600s / 动作 3000s；
+对源按相同画布缩放后计算；「渲染尺度」= GUI 视频面 1000×647 逻辑像素）：
+
+| 档位 | SSIM@渲染尺度(1000×647) | SSIM@物理(1500×970) | 全片体积(4.mp4/5.6min) | 播放余量 |
+|---|---|---|---|---|
+| 540p | 0.985 / 0.985 | 0.970 / 0.967 | 367MB（实测）| 4x/8x 零停顿 |
+| 720p | 0.995 / 0.995 | 0.986 / 0.985 | ≈0.65GB（子集外推）| 4x/8x 零停顿 |
+| 1080p | 0.998 / 0.998 | 0.998 / 0.997 | 1.2GB（实测）| 4x 零停顿 |
+
+**关键事实**：
+1. **构建时间与档位无关**（540p 267.9s vs 1080p 264.7s——解码扫描 99.5% 全片
+   是主项，编码分辨率几乎不影响）；**播放余量也都够**（1080p 档 PyAV 单线程
+   367-503fps vs UI4x 需求 240fps，mpv 实测 3.99x 零停顿）→ **选档只权衡
+   磁盘与清晰度，不权衡速度**。
+2. **720p（1280×720）仍高于窗口实际显示面积（1000×647 逻辑）→ 上屏是缩小
+   而非放大**，与源被缩小的路径同质；540p（960×540）则轻微放大 ~1.1x。
+3. 与 240p skim 否决案对比：240p=10.2 万像素且被放大 2.35 倍（糊的直接原因）；
+   540p=51.8 万像素（5.1x）、720p=92.2 万像素（9x）、1080p=207 万像素（20x）。
+4. **暂停静帧/逐帧/拖动定位永远回源渲染**（C4 静帧机制不动）——代理只影响
+   播放中的运动画面；导出完全不受影响（导出仍从源全质量跑）。
+
+### 24.5 D2 接线三风险实测（2026-10-11，全 T0；代理=1080p 全量文件）
+
+1. **运行时变速**（UI 滑条 1x↔4x 播放中切换）：1x→4x→2x→4x 四相全部精确
+   （realized 1.00/4.00/2.00/4.00），**0 丢帧**——mpv speed 属性运行中切换在
+   本构建+本文件上干净（此前 #13694 顾虑针对的是 EDL/stream_cb 场景；
+   单文件代理无此问题）。
+2. **帧精确 seek**：暂停态 `seek absolute+exact` 到 k=10000（t=166.6667s）
+   → tp=166.6667 **误差 0 帧**；播放中 seek 到 200.0s 落位 0.01s 级。
+3. **构建/播放并发**：全量 540p 构建在后台跑（解码 99.5% 全片）的同时，
+   1080p 代理 @4x 播放 20s 窗 **realized 4.28x、0 停顿**；构建自身正常完成
+   （231.2s）。→ 「构建期间照常可播」承诺成立，无需暂停播放。
+4. **构建并发下回退路径不劣化**：1080p 全量构建（ffmpeg 活跃）同时在跑时，
+   既有 dsvc 引擎 E2E 探针复跑 **PASS**（R1 注册/R2 完整播放至 EOF
+   tp_end 8.6≈8.67/R3 seek delta=0.0/R4 零孤儿）——构建吃满解码时直通档
+   播放仍稳（两者共用解码器但调度互不饿死）。1080p 全量构建并发墙钟
+   230.1s（vs 独跑 264.7s，反而更快=缓存热）。
+
+**D2 设计定稿（由上述实测决定）**：代理播放=单文件 mpv + speed=UI 倍速；
+seek=源帧→代理帧（searchsorted）→mpv exact seek；读回=代理 tp×60→代理帧→
+源帧（映射数组 20184×int64=161KB 现算）；暂停静帧/UI<1x/代理未就绪三情形
+回落既有源路径与直通档。**无需 dsvc 参与代理播放**（dsvc 仅作构建期兜底）。
+
+## 25. P1 物化代理实施（2026-10-11·owner「开工」；D1-D3 完成，D4 验证中）
+
+### 25.1 交付物
+
+**新模块 `proxy_cache.py`**（~950 行）：
+- **业务速度烘入**：`export_del_mask` 直接调 `analyzer._build_delete_mask`
+  （pause 删 + clip 裁 + 1x→2 + 0.2x→factor），**与导出同一份代码** →
+  代理 = 导出帧序列（帧级一致）；
+- **构建**：分批 select/setpts（生产滤镜同款）+ NVENC cq22 gop30 bf0 +
+  concat stream copy；**批级缓存**（`_BatchCache`，固定源窗口签名 → 编辑
+  只重编受影响批次，其余复用）；原子落盘 + LRU 容量（默认 20GB）；
+- **映射**：`source_frames`（代理帧 k → 源帧，双射）+ `ticks`（认证
+  time_base 精确轴，VFR 逐帧）+ `biz_steps`（逐帧业务倍率，角标用）；
+- **验证门**：帧数硬对账（±1 哨兵容差）+ 时长对账 + 预算守卫；
+- **键单一权威** `expected_proxy_key`：构建端/调度器/播放门三处同一函数
+  （曾因调度用剪辑指纹、构建用导出掩码指纹算出不同键 → 装了却永不匹配，
+  真机 E2E 抓出，已修并加测试钉死）。
+
+**引擎 `mpv_engine.py`**（+~180 行）：`set_proxy_artifact`/`clear_proxy_artifact`/
+`play_proxy`/`seek_proxy_source_frame`/`_proxy_frame_for_position_locked`/
+`_proxy_biz_rate_for_frame`；模式="proxy"（`_frame_for_position_locked`
+第三分支）；暂停 +5/120 豁免扩到 proxy；`seek_source_verified` 在 proxy
+模式拒收（False→回落）；snapshot speed=UI×biz（角标 40x 来源）。
+
+**GUI `preview_player.py`**（+~200 行）：`_maybe_schedule_proxy_build`
+（守卫：原生引擎+认证+跳裁剪+删段+开关+键匹配/在飞同代跳过）+
+`_arm_proxy_rebuild`（编辑 debounce 1.2s）→ `_publish_project_snapshot`
+自动 arm + `_finish_analysis` 预热；`_send_play` 代理优先（键匹配→
+play_proxy，否则回落直通）；`_seek_frame` proxy 拦截；角标「代理Nx」。
+
+**设置 `settings_panel.py`**：`proxy_materialize`（默认开）+ 说明行。
+
+### 25.2 真机 E2E（R8 同源探针 `probe_proxy_gui_e2e.py`，真 main.main()）
+
+| 步 | 结果 |
+|---|---|
+| T2 媒体探测 | 3.8s 就绪 |
+| T4 代理就绪 | **2.4s（缓存命中，预建 1.2GB）**，key=27e8b0b0… |
+| T4b 键匹配 | **true**（引擎键==播放门 want，同一权威函数）|
+| T5/T6 播放 | mode=**proxy**，0.2x 段角标 **40.0x**（业务烘入生效）|
+| T7 源帧推进 | 6324 帧/1.0s=**6305 源帧/秒**（含跨删除间隙跳跃，40x 段语义正确）|
+| T8 seek | 目标 123456 → **落点 123456 误差 0** |
+| T9 UI 1x | mode=proxy，speed=1.0（代理下 UI 倍速语义正确）|
+
+### 25.3 验证门与回归
+
+- **单测 668+94 全绿**（新增 `tests/test_proxy_cache.py` 17 例：烘入语义/
+  映射双射/键语义/批次稳定性/缓存往返/LRU/引擎契约/GUI 接线）；
+- **门禁 L0-L2 7/7 PASS**（120s）；GUI 已重启 pid 11648 载新码。
+
+### 25.4 已知边界（如实登记）
+
+- **构建成本**：4.mp4 1080p 全量 233-267s（一次性，异步；构建期间照常可播
+  已实测：并发播放 0 停顿 + dsvc E2E PASS）；
+- **批级复用粒度**：固定 33 分钟源窗口（120k 帧）+2000 段双约束——窗口内
+  编辑重编该批（几十秒），窗口外零成本；
+- **删除段内源帧的 seek**：钳到下一保留帧（与 EDL 语义一致）；
+- **`_proxy_biz_rate_for_frame` 回退**：无 biz_steps 时用映射几何估计（粗）。
+
+### 25.5 Review（2026-10-11·owner 令「Review 一下有没有引入新的问题」）
+
+**复核范围**：P1 全部新码（proxy_cache.py/mpv_engine/预览器/设置）+ 与既有
+机制的交互面。**发现 6 个问题、全部修复并加测试钉死**：
+
+| # | 问题 | 性质 | 修复 |
+|---|---|---|---|
+| 1 | **close() 失效清单缺 `_PROXY_TASK`** | 关闭后构建线程继续跑（CPU/磁盘浪费；on_success 有 _closing 门不会误装）| 补 invalidate + 句柄清零 |
+| 2 | **触发缺口：认证晚于分析** | 分析预热被 `frame_pts_authoritative` 门挡掉后无第二触发点 → 代理永不建 | 认证完成回调补 `_maybe_schedule_proxy_build()` |
+| 3 | **触发缺口：设置变更**（业务开关/倍率/跳裁剪）| 键变但无重建触发 → 永不更新 | 播放门「门过但键不匹配」→ arm 自愈重建（不依赖面板回调）|
+| 4 | **代理接管未清 skim blob** | 极端路径残留 ~294MB RAM（直通分支有清、代理漏）| 代理接管成功后同样 clear_skim_blob |
+| 5 | **`_proxy_rebuild_after` 未随 close 取消** | 关闭后 Tk after 回调可能触发 | close 清理列表补该字段 |
+| 6 | **播放门无失败记忆 → 无限重试环** | 永久失败（如预算超限）时自愈 arm 每 1.2s 重试昂贵构建 | `_proxy_failed_head` 记忆：同 head 不再重试，编辑/设置变化自然恢复 |
+
+**顺带修复/加固**：
+- `build_proxy` 空段表守卫（`EMPTY_SCHEDULE` 替代晦涩 ffmpeg 报错）；
+- 播放门键**缓存**（`_expected_proxy_key_cached`：全表计算 ~60ms，播放键
+  连按不再双付；作用域/设置变化自动失效）——尊重「空格/播放键响应性」的
+  历史教训；
+- 自愈 arm 在 `ignore_biz=True` 时跳过（构建端从不产出该键，arm 只会空转）。
+
+**复核排除项（核实无误）**：
+- 分析缓存指纹**未被新参数污染**（`params_fingerprint` 只含阈值/分辨率等；
+  4.mp4 秒开缓存安全）；
+- 段表 dict 无原地变异（`apply_many` 先深拷贝再改；构建线程读快照安全）；
+- 设置面板行号无冲突（sep_r+10/11/12/13 连续）；
+- dthrough resume 快路径有 `mode != dthrough` 门（代理模式不会误入）；
+- 步进语义（代理模式禁用原生 frame-step，走精确寻址）——前轮已修；
+- 批缓存容量（8GB 总量+64 文件双上限）——前轮已修。
+
+**验证**：单测 **674+94 全绿**（新增 6 例钉住本轮修复：自愈 arm/键缓存/
+缓存失效/失败记忆/ignore 分支）；门禁 **L0-L2 7/7**（125s）；R8 E2E 复跑
+**全链 PASS**（键匹配/40.0x/seek 0 误差/UI 1x）；GUI 重启 **pid 23576**。
+
+### 25.6 编辑后 40x 保持（2026-10-11·owner 问「修改暂停的部分还能 40x 吗」）
+
+**答案：能，且已全链实测**。回答问题的过程中发现并修掉两个真实性能
+问题（都是真机 E2E 驱动）：
+
+**问题 A：批窗口太粗（33 分钟）→ 编辑重编 3 批 88s。**
+实测（4.mp4 真段表）：120k 帧窗口下编辑点所在窗含 ~4900 段 > 2000 段
+上限 → 切成 3 批；删 1 段令窗口内批成员位移 → 3 批全重编。**修复**：
+窗口 120k→**20k 帧（≈5.5min）**——全片 22 窗、最密窗 1674 段 < 上限
+（每窗恰 1 批），实测编辑 1 段只重编 **1/22 批**（数据：21/22 批指纹
+逐位不变）。
+
+**问题 B：验证环节全片解码 111s（占重建时间一半以上）。**
+实测同文件全解码 **111.0s** vs **包计数 0.3s（364x）**，且非零包数 ==
+解码帧数（20227，逐位一致——本管线 `-bf 0` 纯视频流一包恰一帧）。
+**修复**：`verify_proxy` 默认包计数 + 抽样解码首 30 帧兜底；`deep=True`
+保留全解码口径（诊断用）。
+
+**问题 C（体验）：重建完成时正在播放不会自动切回代理。**
+**修复**：`on_success` 检测 `is_playing` → 以当前帧重发播放（键已匹配
+→ 立即切回代理 40x，用户无需手动暂停/播放）。Tk 线程安全性已核实
+（task_manager 回调经 `dispatch_pending` 在 Tk 线程执行）。
+
+**全链 E2E（R8 同源，真 main.main()，`probe_proxy_edit_rebuild.py`）**：
+| 阶段 | 实测 |
+|---|---|
+| 基线（编辑前）| mode=proxy，角标 **40.0x** |
+| 编辑暂停段（seg 100, 21052-21085 all→keep）| 立即播放回落直通（20x 封顶，不卡）|
+| 增量重建 | **20.5s 墙钟 / 构建 13s**（22 批复用 21 批）|
+| 重建后 | mode=proxy，角标 **40.0x** 恢复 |
+| 编辑生效验证 | 被 keep 的段首帧出现在新代理映射里（segment_present=true）|
+
+**批缓存预热**：22 批/1.2GB 已入 `.cache/proxy/batches`（签名与生产
+计算 22/22 逐位一致）→ 用户**第一次编辑**即为增量重建（~20s 级），
+无需先付一次全量。
+
+**验证**：单测 **675+94 全绿**（新增无缝切换用例）；门禁 **7/7**（121s）；
+GUI 重启 **pid 44528** 载全部修复。
+
+### 25.7 编辑重建提速（2026-10-11·owner「20 秒太慢，完全无法接受」）
+
+**结论：20s → ~8-12s（构建 5-7s + GUI 调度/debounce ~1.5s + 轮询发现延迟）**。
+四个实测驱动的优化：
+
+| 优化 | 前 | 后 | 依据 |
+|---|---|---|---|
+| **批窗口** 120k→20k→**4k 帧** | 重编 3 批 88s / 1 批 10.7s | **1 批 ~2s** | W=4k 时全片 95 窗、最密窗 531 段<2000 上限、编辑只改所在窗；实测单块 2.0s（解码跨度 19.6k→3k 帧）|
+| **验证门** | 全解码 111s | **元数据 0.02s** | 三层：容器 nb_frames（主判）→ 解复用计数（回落）→ 抽样解码 30 帧（兜底损坏）；deep=True 保留全解码口径 |
+| **concat 重封装** | +faststart 6.7s | **3.1s（去 faststart）** | 实测 faststart 占 3.6s；本地文件加载延迟无差别（28ms vs 26ms）、seek 0ms 误差 |
+| **认证时间轴缓存** | 每次重建 1.4s×2 | **0.09s（缓存后）** | 424k 行 `CertifiedPtsTimeline` 按源 sha 缓存（认证不可变）；`output_ticks_for_schedule` 复用同一缓存（原第二次重建 1.5s）|
+
+**debounce** 1.2s→0.4s（编辑→调度 <0.7s）。
+
+**当前构成（实测，W=4k + 温批缓存）**：编辑→debounce 0.5s → 调度 0.18s →
+构建 5-7s（单块 2s + concat 3.1s + verify 0.02s + ticks 0.09s）→ 安装即切。
+
+**探针**：`probe_rebuild_stages.py`（GUI 真路径插桩）+ `probe_proxy_edit_rebuild.py`
+（全链 E2E）。**放弃项**：清单式播放（mpv concat demuxer 在 >22 条/混合时长时
+只读首块，时长求和漂移 1.5-15s；单文件重封装语义可靠，保留）。
+
+**验证**：单测 675+94 全绿；门禁 7/7（126s）；E2E：编辑→回落直通（不卡）→
+~10s 后自动切回代理 40.0x，编辑内容出现在新代理（segment_present=true）。
+
+## 26. D 盘清理（2026-10-12·owner「按 Tier 1+2 清」；回收 31.67 GB）
+
+**触发**：owner 令「分析 D 盘占用 → 给清理方案 → 按 Tier 1+2 清」。全程
+只读审查先行，逐项 grep 验证引用关系后执行。
+
+**回收**：D 盘剩余 119.95 → **151.62 GB**；`.cache` 38.9 → **7.26 GB**。
+
+**删除明细（Tier 1 测试残渣 18.4 GB）**：`proxy/stage_*.mp4`×4（faststart
+对比）4.43GB；`v3ass/` 11 个基准目录 13.3GB（proxy_build_test/bench_breakdown/
+bench_e2e/chunks_v2/proxy_batch_warm/bench_w2000/proxy_quality/bench_rebuild/
+proxy_d1_test/bench_split/proxy_batch_test）；实验清单文本 15 个。
+**（Tier 2 过期代理 13.29 GB）**：`proxy/` 根 12 个十六进制命名 mp4（历次
+编辑版本代理，非默认键）。
+
+**保留清单（逐项验证在位）**：
+- 运行时依赖（代码硬编码）：`dsvc/target/release/dsvc.exe`（`dthrough_service.py:23`
+  DEFAULT_EXE）、`ffmpeg-dev/`（:25 DEFAULT_FFMPEG_BIN）；
+- **默认代理** `proxy/27e8b0b05319fe8956e6d61658f1381a.mp4`（+npz，GUI 默认设置
+  键，导入 4.mp4 即命中）；`proxy/batches/`（109 个批缓存，增量重建用）；
+- 文档保护资产：`research_phase3/A2a_singlepass_v2623.mp4`（样本 4 单趟基准，
+  上次误删事故主角）、`sentinel_fix/4_full_audio.mp4`（导出验证产物）；
+- 调研证据：`fc_bench`/`nle_research`/`rust_nle_review`（Tier 3，默认保留）。
+
+**清理后验证（全过）**：单测 **675+94 绿**；门禁 **L0-L2 7/7**（128s，含真
+dsvc 四项）；受保护资产 6/6 在位；GUI 重启 **pid 17196**。
+
+**未动项（归属不明待 owner）**：`ArknightsPathFinding/tmp`（1.89GB，gh/gh_real
+疑似克隆）、`pathfinding_workspace`（1.8GB）、`D:\work`（14.3GB 疑似他项目）。
+
+## 27. 会话交接（2026-10-12·上下文压缩前快照）
+
+**当前工作区状态（全部未提交）**：
+- 新增：`proxy_cache.py`（~1100 行 P1 构建器）、`tests/test_proxy_cache.py`（24 例）；
+- 修改：`mpv_engine.py`（代理模式 +246）、`preview_player.py`（P1 调度+两 bug 修复
+  +449）、`settings_panel.py`（代理开关 +20）、`tests/test_preview_fps_osd.py`、
+  `tests/test_preview_dthrough_tier.py`、`tools/dsvc/src/main.rs`（代数竞态修复
+  +46）、`tools/dsvc/README.md`、`ASSET_INVENTORY.md`、`HANDOFF`（本棒）。
+
+**P1 最终性能（W=4k 窗口 + 温批缓存）**：编辑→可播 **0.67s**（=旧行为 0.58s，
+编辑后立即走直通档不卡）；后台重建 **~10s**（单块 2s + concat 3.1s + 验证 0.02s）
+→ 自动切回代理 **40.0x**。旧系统无 40x 能力（20x 封顶），**非反向修改**（A/B 实测：
+旧 0.58s vs 新 0.67s，停顿均为 0）。
+
+**待 owner 手检（GUI pid 17196）**：
+1. 导入 4.mp4 → 控制台 `[proxy] 物化代理就绪`（应 2-3s=缓存命中）；
+2. UI 4x 播放 → 右上角「**代理40.0x**」+ 画面清晰 + 零卡顿；
+3. 播放中改暂停段 → 立即继续播（不卡）→ ~10s 后角标自动回「代理40.0x」；
+4. 播放中拖/点时间轴 → 落位精确、红条跟随；
+5. 关「物化代理」开关 → 回落「直通Nx」（旧行为）。
+
+**手检通过后**：「验收」→ 建议两笔提交：①P1 物化代理（proxy_cache.py +
+mpv_engine + preview_player P1 部分 + settings_panel + test_proxy_cache）；
+②两 bug 修复（preview_player 空格/eof + dsvc 竞态 + 对应测试）。或按 owner 粒度。
+
+**未决/风险项**：
+- 代理构建为**单文件重封装**（1.2GB 写盘 ~3s 为物理下限）；如需更快可选 540p
+  档（约 4-5s，画质 0.985）——owner 未拍板；
+- `proxy/` LRU 上限 20GB 已恢复余量（现 2.37GB）；
+- 历史遗留：`.cache/proxy` 的 npz 孤儿（对应已删 mp4）无害保留。
+
+**归档收尾（本会话）**：①`asset_index.json` 审计基线自 09-04 冻结未刷新，
+积压 212 项「新增未登记」告警（全为 probe_/verify_/HANDOFF_ 类登记资产与
+会话探针，零异常）→ 已 `--write` 重建（77→289 项，纯增量 0 删除），复跑
+audit **289/289 一致零漂移**；②ASSET §六 表格一处空行（上轮插入遗留）已
+修，全表连续；③ASSET §六/§八 已登记 P1 落地行与 D 盘清理行。
+
+**归档完整性审计（10-12 owner 令「分析下是否足够完整，有没有遗漏」）**：
+逐项核对工作区↔文档后修复 **11 处遗漏/漂移**，全部实证：
+- **§六 补 4 行**：09-23/24 三症状修复（横跳/冻死/主线程停顿）、10-10 双 bug
+  + dsvc 代数竞态、1e 非参考帧丢弃、FilmCraft 40x 实测+NVDEC 天花板——原
+  全部只在棒/checklist 中，ASSET 未登记；
+- **§六 结构修复**：7 行单格行（09-13~09-16 时代，行内无列分隔）被
+  `tools/preflight.py` 解析器**静默丢弃**（能力清单少 7 条）→ 补齐列分隔，
+  preflight 能力 56→**63 条**；1 行 7 格（09-13 立项）第 7 格渲染时丢失 →
+  合并；全 5 表列数一致性机器验证通过；
+- **§三 刷新**：提交状态停留 09-08（"未提交 6 文件 +1655/−38 + 新增 3"）
+  已全面过期 → 改为 10-12 实测（未提交 10 文件 +2636/−97 + 新增 proxy_cache
+  等 2 件；已入库清单补直通栈/缓存/工具）；
+- **§八 状态行 6 处**：选项2/P1-RAM/1c/造轮子审计/上游调研/P1 定案——
+  停留"施工中/待开工"已过期 → 标已收口（附入库提交号）；
+- **§八 补 2 行**：10-09 mpv_spike 证据损失决策（owner 接受+标注）、
+  10-10 双 bug+竞态修复（待验收）；10 月行按时间序重排；
+- **§二 运行时依赖补 2 行**：dsvc.exe + ffmpeg-dev（代码硬编码、10-12
+  清理确认为受保护资产）；
+- **§四 探针目录补录**：09-13~10-12 四个世代 40+ 探针名（原目录只到 09-12）；
+  另修正 2 处探针名（probe_proxy_spec→proxy_spec_probe、probe_shader_embed
+  →shader_embed_probe，与实际文件名不符）；
+- **§十 工具表补 3 行**：acceptance_gate/gui_stress/conftest（R10/R8/R9 的
+  机械版原未列入）；
+- **悬空引用标注**：§六 干跑行证据里 `proxy_build_test/full_*.mp4` 已在
+  10-12 清理删除 → 注明"数字已固化+JSON 读法"；
+- **§五 交接链**：补 VERIFIEDSEEK 入库状态（10-08 随 c2438d4 入库）。
+**验证（全过）**：preflight 63 条解析正常；audit 289/289；单测 **675+94 绿**
+（28.9s）；全表列数一致性机器扫描 5/5 OK。
+
+## 28. 播放内核调研 + MDK 实测（2026-10-13·owner「按你的推荐执行」；全 T0）
+
+**缘起**：owner 从 NipaPlay-Reload 生态提出五个播放内核（mdk/video_player/
+libmpv/media_kit/liberika）问是否值得深入调研。复核后：**四个后端**（NipaPlay
+官方文档明示 Media Kit=libmpv 的 Flutter 封装，不是两套内核）；其中唯一
+值得实测的=**MDK**（WangBin=QtAV 作者；唯一声称「Optimized Continuous
+seeking…Suitable for timeline preview」的闭源内核；liberika 无剪辑语义、
+video_player 无 Windows）。
+
+**方法（R8 口径自证）**：自建 C++ 探针 `mdk_probe.cpp`（MSVC 14.44 + MDK
+SDK v0.39.0；R2 自建理由=官方 DecodeFps 每帧 printf+fflush 拖慢且无 seek
+计时）；同源（4.mp4 2.27GB/7069.9s/424176 帧）、同机、同计时（seek 下发→
+首帧解码完成）。**坑一枚**：MDK 打不开中文路径（status=0x80000000）→ 用
+NTFS 硬链接（零拷贝）绕开。
+
+**结果**：
+| 测试 | MDK | 对照（我们） |
+|---|---|---|
+| T1 顺序解码（60s 窗/全片） | 1273fps / **1903fps** | dsvc 2029fps（隔离）|
+| T1 硬解 D3D11/DXVA/CUDA | 786/660/951fps（**全劣于自家软解**）| NVDEC 976fps（同构）|
+| T2 随机 seek 300 点 | fast **45.5ms** / accurate **61.7ms** | 换段税 30-80ms/段 |
+| T3 碎段几何 500 点串行 | 42.7ms/次（官方 Timeline 配方 42.3ms，**零加速**）| 直通档逐段兑现 |
+| T3 连发 500 点 | **498/500 Cancelled(-2)=seek 合并**（只兑现最新）| 帧精确逐段呈现 |
+
+**关键裁决**：MDK「连续 seek 优化」实为 **seek 合并/去抖**（不降低单次
+seek 成本、碎段掠过大面积丢帧），**无 40x 能力、无包级跳过、核心闭源+
+密钥制** → **不换内核**（第三次独立闭环：后端文献/FilmCraft/MDK 全指向
+「问题不在内核在碎段拼接解码账，解=物化」；P1 已落地 40x）。
+
+**产出**：报告 `agents/research_player_kernels/01_mdk_bench.md`（含复现
+命令）；ASSET §六+§四 登记；audit 289/289 零漂移；checklist 头部本轮记录。
+
+**遗留**：①`.cache/kernel_review/` 2.4GB（SDK 85M/clone 24M/切块 18M）
+可删或保留；②4.mp4 处理建议（分段录制首选/局部分析 2-3 天/预切分下策）
+未执行，待 owner。
+
+### 28.1 补测三件（2026-10-13·owner「都补，开工」；全 T0）
+
+owner 令补齐首轮登记的三个盲区，全部完成：
+
+**① MDK 落点精度（T4）**：fast seek **1060ms≈64 帧**（落关键帧）/ accurate
+**7ms≈0.4 帧**——对照我们认证轴 seek-verified **0 误差**；MDK 的"快"与"准"
+必须二选一，我们不需要。已并入报告 01_mdk_bench.md §T4。
+
+**② liberika 实跑烟测**：官方 v0.2.1 Windows x64 C ABI 包（`erika_capi.dll`，
+Python ctypes 驱动，4.mp4 硬链接）。打开→Ready 333.7ms；随机 seek（30 点）
+mean **196.5ms**/max 360.6；落点 p50 **12.4ms=0.75 帧**（**非帧精确**，
+API 只有 `seek(micros)` 无帧号）；**回显判别器**（半帧偏移目标）证实
+**real_landing** 非回显；播放推进 0.94x 正常。→ 比 MDK 慢一量级、无剪辑
+语义，**不引入**（与源码级判定一致）。报告=01_mdk_bench.md 附录 A。
+
+**③ P1 跨源冒烟：2.mp4（重复 PTS ~21% + VFR 疑难源）全链 PASS**：
+导入 0.19s → 分析（冷跑落缓存 1.5MB key `789ea0564afa`）→ **首次全量构建
+135s / 3337 帧 / 217MB / 55.6s 内容** → 4x 播放 mode=proxy → **源帧推进
+3372-3444/秒=40.0x 达标** → 编辑 seg0 auto→all（删段 683）→ **回落 dthrough
+20x 不卡** → **重建 0.15s**（批缓存命中，新 key `fbd3611f…`）→ 自动回
+proxy → **暂停态 seek 20000→20000 delta=0 帧**。**「P1 通用可用」盲区关闭**。
+报告=02_proxy_cross_source.md；探针=`probe_proxy_cross_source.py`。
+
+**探针口径修正三枚（产品零缺陷）**：①编辑须真实变更（`all`→`all` 空操作
+不触发重建）；②seek 目标须选确定保留帧（全帧 50000 落在全删段 213 内，
+按设计钳到 50008，delta=8 是正确语义）；③探针须补 R9 弹窗补丁（首跑被
+「已缓存」showinfo 挂死 20 分钟，CPU 空转——**R9 第三次咬人，补丁已加**）。
+
+**登记**：ASSET §六 +3 行（MDK 行补 T4/liberika 行/P1 跨源行）、§四 ⑤ 世代
+补录；checklist 头部补测段。audit 复跑 289/289 零漂移（报告在 agents/，
+探针在 .cache，均不影响资产基线）。
+
+### 28.2 P1 代理 cq 瘦身扫描（2026-10-13·owner「执行」；全 T0）
+
+「保 1080p 又瘦身」提案落地：生产同源参数（`analyzer._video_encoder_args`
+实读，NVENC p4 + `cq=18+(10-q)`）逐档扫描 + **全片权威构建**。
+
+**关键方法学**：窗口外推不可信——碎段拼接（13619 段）编码开销远大于连续
+窗口，cq22 窗口外推 404MB vs 实测全片 1205MB（差 3 倍）→ cq24/cq26 直接跑
+生产入口全量构建拿权威数字。
+
+**结果（4.mp4 全片，三档 source_frames 逐位一致）**：
+
+| 档位 | 体积 | vs cq22 | render SSIM | 解码 rtime |
+|---|---|---|---|---|
+| cq22（现状预建）| 1204.9MB | — | 0.99732 | 24.4s |
+| **cq24（推荐）** | **969.0MB** | **-20%** | 0.99648 | 19.8s |
+| cq26 | 788.2MB | -35% | 0.99530 | 18.8s |
+
+**反直觉发现**：低 cq 解码更快（比特量小）——再次印证「解码墙在比特量
+不在帧数」。单帧抽检含 ±1/±2 邻居对齐诊断（三档最佳均 delta=0，无系统
+偏移）；单帧噪声大（动作帧 ±1 帧掉 0.02）不作判据。
+
+**待 owner 拍板**：维持 cq22 / 切 cq24 / 切 cq26。切换=改 `ProxySpec.quality`
+默认值 + 重建（4.mp4 全量 208s 一次性）。三份实验代理留 `.cache/proxy/`
+（cq24/cq26 各一份）待选定后清理；窗口中间产物 739MB 已清理（数字固化
+在 `probe_cq_sweep_results.json`）。
+
+**报告**：`agents/research_player_kernels/03_cq_slim_sweep.md`；
+探针：`probe_cq_sweep.py` / `probe_p1_cq24_build.py` / `probe_p1_cq26_build.py`。
+
+### 28.3 净室 prompt + graphify 过滤脚本（2026-10-24·owner「执行」）
+
+**① graphify 试用（代码知识图，13.4 万星 Apache-2.0）**
+- 与预览性能**无关**；对"接手 agent 理解 69k 行代码的调用关系"有价值。
+- 原版实测：169 文件 → 4511 节点/11329 边/11.4s；**17.9% 节点来自 .md**
+  → `explain` 出现"被《六、已证明能力表》引用"噪音。
+- **过滤版**（只扫产品代码、剔除标准库）：34 文件 → **1400 节点/1.2s**，
+  explain 干净。
+- **能力边界（复核修正）**：`explain` 可信（带行号）；`path` **3/5 正确**，
+  根因=函数内局部 import 不被 AST 建模 + "两模块本无直接依赖"时返回真实但
+  反直觉的最短路径。**首轮曾误判"path 不可靠"，复核后修正**（多组测试+
+  networkx 直验才定谳——R5 教训：勿用单反例概括）。
+- 固化：`tools/graphify_build.py`；环境 `.cache/graphify_env`（187MB 隔离 venv）。
+
+**② 净室盲测 prompt**：`agents/research_player_kernels/CLEANROOM_PROMPT.md`
+- 目的：让独立 agent 在不知道历史结论的前提下重新构想预览方案。
+- 修正 4 处必须项（审计发现）：补删 4 份泄题文档、删 7 个方向性测试、
+  声明 skim_cache.py 不可删、声明 dsvc.exe 与 HEAD 不同代。
+- **实搭验证通过**：worktree → 7 junction → 删泄题 → 自证扫描全空 →
+  清理 → 主工作区依赖零损伤（dsvc/libmpv/ffmpeg/analysis 均完好）。
+- 残余风险（已登记在 prompt 附录）：skim_cache.py 不可删、dthrough 是现状
+  提示、git 历史无法物理阻断（只能靠阶段 5 前禁读约束）。
+
+**登记**：ASSET §五（文档分工 +2）、§十（工具表 +1）；checklist 头部。
+**未改动**：产品码零改动（P1 仍待验收）。

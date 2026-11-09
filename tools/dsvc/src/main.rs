@@ -71,6 +71,20 @@ enum Cmd {
     Quit,
 }
 
+/// 通道消息：命令 + **入队时**绑定的世代号（gen 绑定的唯一权威点）。
+///
+/// 世代必须在 reader 入队瞬间绑定，而非 decode_loop 出队时读全局——
+/// 背靠背的 load+seek（生产起播路径：play_dthrough 的 load 之后，mpv
+/// demuxer 立刻经 stream_cb seek_fn 发 seek）入队时，旧实现让 load 在
+/// 出队后读到 **seek 的** 代数：load 遂以最新代运行、自身
+/// `generation != gen` 检查恒假，永不中断地走全片；seek 在通道里饿死。
+/// 症状（probe_pwp_repeat 复现 2/6）：末帧起播后流从早先位置续推、
+/// 永不报 eof、无 seek_ok/error（`probe_dsvc_genrace` 服务级直证）。
+struct Queued {
+    gen: u64,
+    cmd: Cmd,
+}
+
 struct Shared {
     generation: AtomicU64,
     quit: AtomicBool,
@@ -260,7 +274,7 @@ fn main() {
         stop: AtomicBool::new(false),
         kf_cache: Mutex::new(HashMap::new()),
     });
-    let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+    let (tx, rx) = std::sync::mpsc::channel::<Queued>();
     let shared2 = shared.clone();
     let writer = std::thread::spawn(move || decode_loop(&shared2, rx));
 
@@ -284,40 +298,52 @@ fn main() {
             Cmd::Quit => {
                 shared.quit.store(true, Ordering::SeqCst);
                 shared.stop.store(true, Ordering::SeqCst);
-                let _ = tx.send(cmd);
+                let _ = tx.send(Queued {
+                    gen: shared.generation.load(Ordering::SeqCst),
+                    cmd,
+                });
                 break;
             }
             Cmd::Stop => {
                 shared.stop.store(true, Ordering::SeqCst);
-                let _ = tx.send(cmd);
+                let _ = tx.send(Queued {
+                    gen: shared.generation.load(Ordering::SeqCst),
+                    cmd,
+                });
             }
             Cmd::Load(_) | Cmd::Seek { .. } => {
-                shared.generation.fetch_add(1, Ordering::SeqCst);
+                // 代数与命令同一临界点绑定（见 Queued 注释）：fetch_add
+                // 返回**本次**新代，随命令入队——decode_loop 不再读全局，
+                // 背靠背命令各持其代，旧命令在新代下达时必被中断。
+                let gen = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
                 shared.stop.store(false, Ordering::SeqCst);
-                let _ = tx.send(cmd);
+                let _ = tx.send(Queued { gen, cmd });
             }
         }
     }
     shared.quit.store(true, Ordering::SeqCst);
     shared.stop.store(true, Ordering::SeqCst);
-    let _ = tx.send(Cmd::Quit); // stdin EOF（非显式 quit）时唤醒 decode_loop，防 join 死锁
+    let _ = tx.send(Queued {
+        gen: shared.generation.load(Ordering::SeqCst),
+        cmd: Cmd::Quit,
+    }); // stdin EOF（非显式 quit）时唤醒 decode_loop，防 join 死锁
     let _ = writer.join();
 }
 
-fn decode_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<Cmd>) {
+fn decode_loop(shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<Queued>) {
     let mut stdout = std::io::stdout().lock();
     loop {
-        let cmd = match rx.recv() {
+        let queued = match rx.recv() {
             Ok(c) => c,
             Err(_) => return,
         };
-        let (ctx, target) = match cmd {
+        let gen = queued.gen;
+        let (ctx, target) = match queued.cmd {
             Cmd::Quit => return,
             Cmd::Stop => continue,
             Cmd::Load(ctx) => (ctx, None),
             Cmd::Seek { virtual_frame, ctx } => (ctx, Some(virtual_frame)),
         };
-        let gen = shared.generation.load(Ordering::SeqCst);
         ev(&format!(r#"{{"ev":"gen","gen":{}}}"#, gen));
         if let Err(e) = run_stream(shared, &mut stdout, &ctx, gen, target) {
             ev(&format!(

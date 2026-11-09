@@ -37,6 +37,7 @@ def _bare_player() -> VideoPreviewPlayer:
     player._io.native_rendering = True
     player._io.fps = 60.0  # time-pos 口径需要真实源帧率
     player._io.dthrough_active = False  # 防 Mock 自动属性真值劫持（1c 直通拦截）
+    player._io.proxy_active = False  # 防 Mock 自动属性真值劫持（P1 代理拦截）
     # 默认引擎拒收验证定位：既有测试组保持旧 seek+贴帧路径语义，
     # VerifiedSeekTests 显式覆写为 True（防 Mock 自动属性真值劫持）
     player._io.seek_source_verified = mock.Mock(return_value=False)

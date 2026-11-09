@@ -9,6 +9,18 @@
    "class": "individual"
   },
   {
+   "path": ".cache\\v3ass\\bench_rebuild.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\bench_w2000_full.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\build_chunks_v2.py",
+   "class": "individual"
+  },
+  {
    "path": ".cache\\v3ass\\burn_isolate.py",
    "class": "individual"
   },
@@ -45,7 +57,27 @@
    "class": "default_size_probe"
   },
   {
+   "path": ".cache\\v3ass\\diag_g64.py",
+   "class": "individual"
+  },
+  {
    "path": ".cache\\v3ass\\diag_pts_range.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\diag_rawload.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\diag_rawpush.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\diag_rawseek.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\diag_step.py",
    "class": "individual"
   },
   {
@@ -62,6 +94,10 @@
   },
   {
    "path": ".cache\\v3ass\\g_precise.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\handcheck_samesource.py",
    "class": "individual"
   },
   {
@@ -93,7 +129,59 @@
    "class": "individual"
   },
   {
+   "path": ".cache\\v3ass\\prebuild_cache_4mp4.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_02x_criterion.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_02x_fix_impact.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_1a_wheels.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_ab_edit_replay.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_analysis_throughput.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_b0_2mp4_build.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_b0_tlimit.py",
+   "class": "probe_"
+  },
+  {
    "path": ".cache\\v3ass\\probe_b_geometry.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_bindtags_order.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_edl_skipframe.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_osd_edl.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_osd_engine.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_speed_drops.py",
    "class": "probe_"
   },
   {
@@ -101,7 +189,343 @@
    "class": "probe_"
   },
   {
+   "path": ".cache\\v3ass\\probe_click_freeze.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_cq_sweep.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_decode_through.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_cont.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_genrace.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_seek_latency.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_seek_latency2.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_smoke.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_e2e.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_engine.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_frag.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_mixedrate.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_prod.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_engine_diag.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_1x_stall.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_fwd.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_lastframe.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_latency.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_replay.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_seek.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_stall_capture.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_frame_step.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_label_refresh.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_lost_release.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_cq24_build.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_cq26_build.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_fullbuild.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_fullbuild_1080.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_prod_build.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_res_margin.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_parallel_refill.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_playwhileplaying.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_cross_source.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_edit_rebuild.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_gui_e2e.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_skim.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_pskip_ab.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_pwp_repeat.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_pythonw_spawn.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_ram_footprint.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_random_seek.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_real_spans_resume.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_rebuild_stages.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_eof_gui.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_jump.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_jump2.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_jump3.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_loop.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_stuck.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_reload_transient.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_repro_apt_errno22.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_block.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_block_deep.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_block_nofast.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_fastpath.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_forensics.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_profile.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_profile2.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_sha.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_stacks.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_stall.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_seek_sweep.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_seek_target.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_seek_timepos.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_e2e.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_phase_timing.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_ram_pipe.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_ram_streamcb.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_scale1000.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skipframe_hybrid.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_stall_pin.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_stall_scaling.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_start_seek_assumption.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_static_identity.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_sweep_tier2.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_tk_space_binding.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_tp_freeze.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_ui_lag.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_upstream_decode_bench.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_upstream_perstep.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_zero_jump.py",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\proxy_spec_probe.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\shader_embed_probe.py",
+   "class": "individual"
+  },
+  {
    "path": ".cache\\v3ass\\shift_test.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\smoke_engine_step.py",
    "class": "individual"
   },
   {
@@ -145,11 +569,23 @@
    "class": "individual"
   },
   {
+   "path": ".cache\\v3ass\\verify_analysis_cache.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_analysis_cache_v2.py",
+   "class": "verify_"
+  },
+  {
    "path": ".cache\\v3ass\\verify_c4_prod.py",
    "class": "verify_"
   },
   {
    "path": ".cache\\v3ass\\verify_fixes.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_fixes_0916.py",
    "class": "verify_"
   },
   {
@@ -161,12 +597,384 @@
    "class": "verify_"
   },
   {
+   "path": ".cache\\v3ass\\verify_immediate_click.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_option2_prod.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_prebuild_hit.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_redbar_gui.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_cb.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_cert.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_fixes.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_fixes_stacks.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_slow.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_slow2.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_warm.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_watch.py",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\warm_batches.py",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\watch_gui_session.py",
+   "class": "individual"
+  },
+  {
    "path": ".cache\\v3ass\\window_curve.py",
    "class": "window_curve"
   },
   {
    "path": ".cache\\v3ass\\window_curve2.py",
    "class": "window_curve"
+  },
+  {
+   "path": ".cache\\v3ass\\diag_step_results.json",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\frame_step_probe_results.json",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\gui_stress_results.json",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\handcheck_samesource_results.json",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\prebuild_cache_4mp4_results.json",
+   "class": "individual"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_02x_criterion_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_02x_fix_impact_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_ab_A_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_ab_B_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_analysis_throughput_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_b0_2mp4_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_b0_tlimit_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_drops_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_edl_skipframe_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_osd_edl_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_biz_osd_engine_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_click_freeze_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_cq_sweep_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_genrace_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_seek_latency2_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dsvc_seek_latency_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_engine_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_frag_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_dthrough_mixedrate_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_engine_diag_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_1x_stall_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_lastframe_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_latency_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_eof_stall_capture_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_gui_handcheck2_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_label_refresh_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_lost_release_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_clarity_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_fullbuild_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_p1_res_margin_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_parallel_refill_p34_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_parallel_refill_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_playwhileplaying_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_cross_source_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_edit_rebuild_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_gui_e2e_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_proxy_skim_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_pwp_repeat_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_ram_footprint_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_random_seek_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_real_spans_resume_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_eof_gui_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_jump2_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_jump3_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_jump_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_loop_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_redbar_stuck_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_reload_transient_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_block_deep_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_block_noFastPath_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_block_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_block_stacks_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_fastpath_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_forensics_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_profile_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_sha_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_resume_stall_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_seek_target_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_seek_timepos_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_e2e_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_phase_timing_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_ram_pipe_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_ram_streamcb_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_skim_scale1000_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_stall_pin_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_stall_scaling_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_start_seek_assumption_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_static_identity_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_sweep_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_sweep_tier2_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_ui_lag_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_upstream_decode_bench_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\probe_zero_jump_results.json",
+   "class": "probe_"
+  },
+  {
+   "path": ".cache\\v3ass\\repro_space_click_results.json",
+   "class": "individual"
   },
   {
    "path": ".cache\\v3ass\\spike_c4_results.json",
@@ -177,7 +985,59 @@
    "class": "spike_"
   },
   {
+   "path": ".cache\\v3ass\\verify_analysis_cache_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_analysis_cache_v2_results.json",
+   "class": "verify_"
+  },
+  {
    "path": ".cache\\v3ass\\verify_c4_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_fixes_0916_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_immediate_click_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_option2_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_option2_results_1.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_option2_results_3.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_option2_results_4.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_prebuild_hit_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_redbar_gui_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_fixes_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_fixes_stacks_results.json",
+   "class": "verify_"
+  },
+  {
+   "path": ".cache\\v3ass\\verify_review_warm_results.json",
    "class": "verify_"
   },
   {
@@ -241,6 +1101,10 @@
    "class": "individual"
   },
   {
+   "path": ".cache\\pyav_kf\\3_117633470_1784276825.npz",
+   "class": "individual"
+  },
+  {
    "path": ".cache\\pyav_kf\\4_2265644549_1784276989.npz",
    "class": "individual"
   },
@@ -254,6 +1118,10 @@
   },
   {
    "path": "HANDOFF_EXPORT_PERF_20260830.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_NATIVESTEP_20260905.md",
    "class": "HANDOFF_"
   },
   {
@@ -290,6 +1158,10 @@
   },
   {
    "path": "HANDOFF_V3ASS_20260904.md",
+   "class": "HANDOFF_"
+  },
+  {
+   "path": "HANDOFF_VERIFIEDSEEK_20260905.md",
    "class": "HANDOFF_"
   },
   {

@@ -1,0 +1,25 @@
+wip: 预览节拍指标分支进度存档（2026-11-10）
+
+阶段 0「保命」提交：把分支 fix/preview-pacing-metrics 上未入库的改动全部存档，
+避免后续清理/重组丢失。
+
+内容（相对 origin/fix/preview-pacing-metrics）：
+  11 个已跟踪文件  +2,910 / -132 行
+    · preview_player.py  +461
+    · mpv_engine.py      +246
+    · settings_panel.py   +20
+    · tools/dsvc/src/main.rs +46
+    · tests/test_preview_dthrough_tier.py +93
+    · tests/test_preview_fps_osd.py +1
+    · tools/dsvc/README.md +21
+    · 其余 4 个（.gitignore / ASSET_INVENTORY / HANDOFF_VERIFIEDSEEK / asset_index.json）
+  7 个新增未跟踪项
+    · proxy_cache.py（45K）、tests/test_proxy_cache.py（24K）
+    · tools/graphify_build.py（6.1K）
+    · .zcodeignore、.tmp-unityperf/、agents/research_player_kernels/、clang-21.1.7-*.whl
+
+顺带做了一次**纯行尾归一化**（CRLF→LF，12 个文件）：仓库约定 LF，而工作区被
+某个工具整体转成了 CRLF，导致 git diff 显示 13,018 行、实际只有 2,910 行。
+归一化不改变任何字节内容，仅让 diff 可读。
+
+验证：python -m pytest -q → 675 passed, 94 subtests passed。

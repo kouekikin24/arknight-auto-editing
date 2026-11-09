@@ -14,6 +14,7 @@ from unittest import mock
 
 from frame_types import FRAME_TYPE_0_2X
 from preview_engine import PreviewEngineError
+from preview_player import VideoPreviewPlayer
 from timeline_plan import TimelinePlan
 
 from tests.test_preview_fps_osd import _bare_player
@@ -244,6 +245,98 @@ class DThroughTierGateTests(unittest.TestCase):
         self.assertTrue(player._send_play(10))
         player._maybe_schedule_skim_build.assert_called_once()
         player._io.play.assert_called_once()
+
+
+class EofStopDuringDragTests(unittest.TestCase):
+    """10-10 真机 T0（红条在最后仍在播放，探针 probe_redbar_stuck 实证）：
+
+    拖红条到末尾（或拖拽中自然播完）时引擎已报 eof，但旧实现
+    `_sync_eof_stop` 被 `_is_dragging` 门挡住 → 按钮永停「暂停」、
+    红条钉末尾；松手后 `_on_tl_drag_end` 又 `_send_play(末帧)` 触发
+    「末帧重播」假播放（acceptance 日志 start=424175 反复出现的来源）。
+    修复=拖拽中不豁免 eof 终态；瞬态 inactive 由 reason 门挡住。
+    """
+
+    def _player(self, *, dragging: bool, reason, active):
+        player = _bare_player()
+        player._is_dragging = dragging
+        player._play_ended_at_eof = False
+        player._stop_playback_ui = mock.Mock()
+        player._io.snapshot_perf = mock.Mock(return_value={
+            "playback_active": active,
+            "play_end_reason": reason,
+        })
+        return player
+
+    def test_dragging_eof_still_syncs_ui(self):
+        player = self._player(dragging=True, reason="eof", active=False)
+        player.is_playing = True
+        player._sync_eof_stop()
+        player._stop_playback_ui.assert_called_once_with(from_user=False)
+        self.assertTrue(player._play_ended_at_eof)
+
+    def test_dragging_transient_seek_not_misdetected(self):
+        # 真拖拽 seek 的瞬态 inactive：reason 仍是 playing → 不误触停播
+        player = self._player(dragging=True, reason="playing", active=False)
+        player.is_playing = True
+        player._sync_eof_stop()
+        player._stop_playback_ui.assert_not_called()
+        self.assertFalse(player._play_ended_at_eof)
+
+    def test_dragging_stop_reason_not_eof_not_misdetected(self):
+        player = self._player(dragging=True, reason="stop", active=False)
+        player.is_playing = True
+        player._sync_eof_stop()
+        player._stop_playback_ui.assert_not_called()
+
+    def test_not_playing_is_noop(self):
+        player = self._player(dragging=True, reason="eof", active=False)
+        player.is_playing = False
+        player._sync_eof_stop()
+        player._stop_playback_ui.assert_not_called()
+
+
+class SpaceClassBindingTests(unittest.TestCase):
+    """10-10 真机 T0（空格「有时未响应」，探针 probe_tk_space_binding 实证）：
+
+    Tk bindtags 顺序 = widget→class→toplevel→all。旧实现给按钮类绑
+    `lambda e: 'break'` —— class 级返回 'break' **终止整条链**，焦点在
+    按钮上时空格既没触发按钮、也到不了 root 的 `_on_key_space`（探针实测
+    root_handler_fired=False）。修复=class 级直接调我们的 handler（返回的
+    'break' 仍抑制按钮原生空格响应，探针 probe_bindtags_order 证恰好触发
+    1 次、不双触发）。
+    """
+
+    def test_class_space_binding_calls_real_handler(self):
+        player = VideoPreviewPlayer.__new__(VideoPreviewPlayer)
+        player._closing = False
+        player._bind_after_id = None
+        bound: dict = {}
+
+        class _Root:
+            def bind(self, seq, fn, add=None):
+                bound[("root", seq)] = fn
+
+            def bind_class(self, cls, seq, fn):
+                bound[("class", cls, seq)] = fn
+
+        player.winfo_toplevel = lambda: _Root()
+        player._bind_keys()
+        # 每个按钮类都必须绑到**真实 handler**，而不是吞键的 'break' lambda
+        for cls in ("TButton", "Button", "TCheckbutton", "TRadiobutton",
+                    "TCombobox", "TNotebook"):
+            fn = bound.get(("class", cls, "<space>"))
+            self.assertIsNotNone(fn, f"{cls} 未绑 <space>")
+            self.assertEqual(
+                fn, player._on_key_space,
+                f"{cls} 的 <space> 必须直连 _on_key_space（class 级 'break' "
+                "会终止 bindtags 链、空格永久失灵）")
+
+    def test_class_handler_returns_break_to_suppress_button(self):
+        # handler 的 'break' 抑制按钮自身空格行为；语义与 root 级一致
+        player = VideoPreviewPlayer.__new__(VideoPreviewPlayer)
+        player._closing = True
+        self.assertEqual(player._on_key_space(SimpleNamespace()), "break")
 
 
 if __name__ == "__main__":

@@ -98,3 +98,4 @@ CLAUDE_HANDOFF.md
 
 # Project-owned libmpv provenance + binaries (evidence on disk; hashes recorded in handoff)
 tools/libmpv/
+graphify-out/

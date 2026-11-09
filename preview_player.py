@@ -66,6 +66,7 @@ _FRAME_PTS_TASK = "player.frame_pts_certification"
 _EXPORT_TASK = "player.export.full"
 _SEGMENT_EXPORT_TASK = "player.export.segments"
 _SKIM_TASK = "player.skim_build"
+_PROXY_TASK = "player.proxy_build"
 
 
 def _run_analysis_task(context: TaskContext, snapshot: dict) -> tuple:
@@ -206,6 +207,34 @@ def _run_skim_build_task(context: TaskContext, snapshot: dict):
     return blob
 
 
+def _run_proxy_build_task(context: TaskContext, snapshot: dict):
+    """后台构建 P1 物化代理（业务速度烘入的 1080p 连续文件）。
+
+    ProxyBuildError 由 on_error 接住 → 回落既有直通档/EDL，
+    播放链永不因物化代理失败而中断。
+    """
+    import proxy_cache
+
+    context.checkpoint()
+    artifact = proxy_cache.build_proxy_for_plan(
+        snapshot["media_info"],
+        snapshot["states"],
+        snapshot["pause_segments"],
+        snapshot["speed_segments"],
+        snapshot["clip_segments"],
+        speedup_1x=snapshot["speedup_1x"],
+        speedup_02=snapshot["speedup_02"],
+        speedup_02_factor=snapshot["speedup_02_factor"],
+        fps=snapshot["fps"],
+        spec=snapshot["spec"],
+        cache_root=snapshot.get("cache_root"),
+        cancel_event=lambda: context.cancelled,
+        progress_cb=snapshot.get("progress_cb"),
+    )
+    context.checkpoint()
+    return artifact
+
+
 class VideoPreviewPlayer(tk.Frame):
     def __init__(
         self,
@@ -234,6 +263,13 @@ class VideoPreviewPlayer(tk.Frame):
         self._skim_build_handle: TaskHandle | None = None
         self._skim_build_head: tuple | None = None
         self._skim_rebuild_after = None
+        # P1 物化代理（1080p 业务烘入）构建任务：head 同 skim 形态但含
+        # 档位与业务设置（任一变化=新构建）；debounce 让高频编辑只排一次。
+        self._proxy_build_handle: TaskHandle | None = None
+        self._proxy_build_head: tuple | None = None
+        self._proxy_failed_head: tuple | None = None
+        self._proxy_rebuild_after = None
+        self._proxy_key_cache: tuple | None = None
         self._closing = False
         requested_engine = (
             preview_engine
@@ -688,6 +724,7 @@ class VideoPreviewPlayer(tk.Frame):
         self.task_manager.invalidate(_EXPORT_TASK)
         self.task_manager.invalidate(_SEGMENT_EXPORT_TASK)
         self.task_manager.invalidate(_SKIM_TASK)
+        self.task_manager.invalidate(_PROXY_TASK)
         self._analysis_handle = None
         self._media_info_handle = None
         self._frame_pts_handle = None
@@ -696,6 +733,8 @@ class VideoPreviewPlayer(tk.Frame):
         self._pending_analysis_source = None
         self._skim_build_handle = None
         self._skim_build_head = None
+        self._proxy_build_handle = None
+        self._proxy_build_head = None
         self.is_playing = False
         self._key_held = None
         self._calib_active = False
@@ -709,6 +748,7 @@ class VideoPreviewPlayer(tk.Frame):
             "_perf_after_id",
             "_native_cover_after_id",
             "_skim_rebuild_after",
+            "_proxy_rebuild_after",
         ):
             after_id = getattr(self, attr, None)
             if after_id is not None:
@@ -981,6 +1021,14 @@ class VideoPreviewPlayer(tk.Frame):
                         name="arknight-preview-cert-bind",
                         daemon=True,
                     ).start()
+                # P1 代理补触发（10-11 自查）：分析常早于认证完成——分析
+                # 落定那次预热被 frame_pts_authoritative 门静默挡掉，此后
+                # 若无编辑就再无触发点。认证落定是第二个天然触发点。
+                try:
+                    self._maybe_schedule_proxy_build()
+                except Exception as exc:
+                    print(f"[proxy] 认证后调度失败: {type(exc).__name__}: {exc}",
+                          flush=True)
 
         def on_error(exc: BaseException) -> None:
             if self._closing or Path(self.video_path).resolve() != Path(source_path):
@@ -1141,6 +1189,283 @@ class VideoPreviewPlayer(tk.Frame):
         """Discard derived plan data without changing the edit revision."""
         self._cut_plan_cache = None
 
+    # ---- P1 物化代理（1080p，业务速度烘入；owner 定案 2026-10-11） ----
+
+    # 编辑→重建 debounce：批级缓存把重建压到 ~2s（W=4k 实测），debounce
+    # 本身不该比构建还贵（owner「20s 太慢」：1.2s debounce 占 6%）。
+    # 0.4s 仍足够合并拖拽/刷掩码的高频快照（拖动期每拍一次）。
+    _PROXY_REBUILD_DEBOUNCE_MS = 400
+
+    def _proxy_spec(self):
+        """当前代理档位（设置面板可选；默认 1080p）。"""
+        import proxy_cache
+
+        settings = getattr(self, "settings", None)
+        params = {}
+        try:
+            params = settings.get_params() if settings is not None else {}
+        except Exception:
+            params = {}
+        target_h = int(params.get("proxy_target_h", 1080) or 1080)
+        return proxy_cache.ProxySpec(target_h=target_h)
+
+    def _expected_proxy_key_cached(self, *, ignore_biz: bool) -> str | None:
+        """播放门用键（带缓存）：expected_proxy_key 全表计算 ~60ms，
+        播放键按下时不该付两次。缓存键=作用域修订×业务设置×忽略旗标；
+        任一变化自动失效（编辑/开关变更走新键）。
+        """
+        if getattr(self, "states_array", None) is None or self.media_info is None:
+            return None
+        settings = getattr(self, "settings", None)
+        try:
+            params = settings.get_params() if settings is not None else {}
+        except Exception:
+            params = {}
+        speedup_1x = False if ignore_biz else bool(params.get("speedup_1x", True))
+        speedup_02 = False if ignore_biz else bool(params.get("speedup_02", True))
+        factor_02 = int(params.get("speedup_02_factor", 10) or 10)
+        spec = self._proxy_spec()
+        project_generation, timeline_revision = self._task_scope()
+        cache_key = (
+            int(project_generation),
+            int(timeline_revision),
+            speedup_1x,
+            speedup_02,
+            factor_02,
+            int(spec.target_h),
+        )
+        cached = getattr(self, "_proxy_key_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        try:
+            import proxy_cache as _pc
+
+            key = _pc.expected_proxy_key(
+                self.media_info,
+                self.states_array,
+                list(self.pause_segments),
+                list(self.speed_segments),
+                list(self.clip_segments),
+                speedup_1x=speedup_1x,
+                speedup_02=speedup_02,
+                speedup_02_factor=factor_02,
+                fps=float(self._io.fps or 60.0),
+                spec=spec,
+            )
+        except Exception:
+            return None
+        self._proxy_key_cache = (cache_key, key)
+        return key
+
+    def _arm_proxy_rebuild(self) -> None:
+        """编辑落定 debounce：拖动/刷掩码高频发快照，静默 1.2s 才排重建。
+
+        批级缓存让编辑代价=重编受影响批次（其余 concat 复用），
+        但仍要防「每拍一次快照」把任务队列打爆。
+        """
+        if getattr(self, "_closing", True):
+            return
+        after = getattr(self, "after", None)
+        if not callable(after):
+            return
+        pending = getattr(self, "_proxy_rebuild_after", None)
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
+            except Exception:
+                pass
+        try:
+            self._proxy_rebuild_after = self.after(
+                self._PROXY_REBUILD_DEBOUNCE_MS, self._on_proxy_rebuild_due
+            )
+        except Exception:
+            self._proxy_rebuild_after = None
+
+    def _on_proxy_rebuild_due(self) -> None:
+        self._proxy_rebuild_after = None
+        if getattr(self, "_closing", True):
+            return
+        try:
+            self._maybe_schedule_proxy_build()
+        except Exception as exc:
+            print(f"[proxy] debounce 重建调度失败: {type(exc).__name__}: {exc}",
+                  flush=True)
+
+    def _maybe_schedule_proxy_build(self) -> None:
+        """P1 物化代理：段表/设置变化时后台构建（业务速度烘入的连续文件）。
+
+        守卫：mpv 原生引擎 + 代理能力可用 + 认证账本 + 跳裁剪开 +
+        存在删除段 + 开关开；引擎 proxy_key 已匹配当前代数或在飞同代
+        时跳过。replace=True：新编辑顶替旧构建。失败只打日志回落既有
+        直通档/EDL——播放链不受影响。
+        """
+        if getattr(self, "_closing", True):
+            return
+        engine = getattr(self, "_io", None)
+        media = getattr(self, "media_info", None)
+        if engine is None or media is None:
+            return
+        if not bool(getattr(engine, "native_rendering", False)):
+            return
+        if not callable(getattr(engine, "set_proxy_artifact", None)):
+            return  # 非 mpv 引擎（legacy 桩/隔离测试）
+        if not getattr(media, "frame_pts_authoritative", False):
+            return
+        skip_var = getattr(self, "skip_trimmed", None)
+        try:
+            if skip_var is None or not bool(skip_var.get()):
+                return
+        except Exception:
+            return
+        settings = getattr(self, "settings", None)
+        try:
+            params = settings.get_params() if settings is not None else {}
+        except Exception:
+            params = {}
+        if not params.get("proxy_materialize", True):
+            return  # 设置面板关闭了物化代理
+        states = getattr(self, "states_array", None)
+        if states is None:
+            return
+        try:
+            plan = self._build_timeline_plan()
+        except Exception:
+            return
+        if not plan.deleted_ranges:
+            return
+        project_generation, timeline_revision = self._task_scope()
+        spec = self._proxy_spec()
+        speedup_1x = bool(params.get("speedup_1x", True))
+        speedup_02 = bool(params.get("speedup_02", True))
+        factor_02 = int(params.get("speedup_02_factor", 10) or 10)
+        fps = float(getattr(self, "fps", 60.0) or 60.0)
+        try:
+            import proxy_cache
+
+            # 键的单一权威=构建端同一函数（导出节奏掩码指纹）：曾用剪辑
+            # 计划指纹算出不同键 → 代理装了却永不匹配（10-11 E2E 抓出）。
+            key = proxy_cache.expected_proxy_key(
+                media,
+                states,
+                list(self.pause_segments),
+                list(self.speed_segments),
+                list(self.clip_segments),
+                speedup_1x=speedup_1x,
+                speedup_02=speedup_02,
+                speedup_02_factor=factor_02,
+                fps=fps,
+                spec=spec,
+            )
+        except Exception:
+            return
+        head = (
+            str(media.source_sha256),
+            str(key),
+            project_generation,
+            timeline_revision,
+            int(spec.target_h),
+            speedup_1x,
+            speedup_02,
+            factor_02,
+        )
+        if getattr(engine, "proxy_key", None) == key:
+            return  # 引擎已持有当前代代理
+        if getattr(self, "_proxy_build_head", None) == head:
+            return  # 同代构建在飞
+        # 失败记忆（10-11 自查）：同 head 构建失败过就不再重试，直到
+        # 编辑/设置变化产生新 head。防「永久失败 → 播放门自愈 arm →
+        # 每 1.2s 重试一次昂贵构建」的无限重试环。
+        if getattr(self, "_proxy_failed_head", None) == head:
+            return
+        source_path = str(Path(self.video_path).expanduser().resolve())
+        snapshot = {
+            "media_info": media,
+            "states": states,
+            "pause_segments": list(self.pause_segments),
+            "speed_segments": list(self.speed_segments),
+            "clip_segments": list(self.clip_segments),
+            "speedup_1x": speedup_1x,
+            "speedup_02": speedup_02,
+            "speedup_02_factor": factor_02,
+            "fps": fps,
+            "spec": spec,
+            "cache_root": None,
+        }
+
+        def on_success(artifact) -> None:
+            self._proxy_build_head = None
+            self._proxy_failed_head = None  # 成功清失败记忆
+            if self._closing or self._io is not engine:
+                return
+            try:
+                if Path(self.video_path).resolve() != Path(source_path):
+                    return
+            except OSError:
+                return
+            try:
+                installed = bool(
+                    engine.set_proxy_artifact(artifact, artifact.key or key)
+                )
+            except Exception as exc:
+                print(f"[proxy] 代理安装失败: {type(exc).__name__}: {exc}",
+                      flush=True)
+                return
+            if installed:
+                print(f"[proxy] 物化代理就绪: {artifact.frames} 帧 / "
+                      f"{artifact.duration_s:.1f}s / {artifact.mb:.0f}MB / "
+                      f"构建 {artifact.build_s:.0f}s（{spec.target_h}p）",
+                      flush=True)
+                self._refresh_perf_label(force=True)
+                # 编辑后无缝切回代理（10-11）：重建完成时若正在播放
+                # （当前走直通/EDL 回落路径），以当前帧重发播放请求 →
+                # 键已匹配 → 立即切回代理 40x，用户无需手动暂停/播放。
+                if getattr(self, "is_playing", False):
+                    try:
+                        self._send_play(self.current_frame_idx)
+                    except Exception as exc:
+                        print(f"[proxy] 播放中切换失败（保持回落路径）: "
+                              f"{type(exc).__name__}: {exc}", flush=True)
+
+        def on_error(exc: BaseException) -> None:
+            self._proxy_build_head = None
+            import proxy_cache
+
+            if isinstance(exc, (proxy_cache.ProxyBuildCancelled, TaskCancelled)):
+                return  # 被新构建顶替/scope 失效，静默
+            # 失败记忆：同 head 不再重试（防播放门自愈 arm 无限重试环）；
+            # 编辑/设置变化产生新 head 后自然恢复尝试。
+            self._proxy_failed_head = head
+            print(f"[proxy] 构建失败（回落直通档/EDL，同配置不再重试）: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+
+        def on_cancelled() -> None:
+            self._proxy_build_head = None
+
+        def on_done(_status) -> None:
+            self._proxy_build_handle = None
+
+        self._proxy_build_head = head
+        try:
+            self._proxy_build_handle = self.task_manager.submit(
+                _PROXY_TASK,
+                lambda context: _run_proxy_build_task(context, snapshot),
+                on_success=on_success,
+                on_error=on_error,
+                on_cancelled=on_cancelled,
+                on_done=on_done,
+                project_generation=project_generation,
+                timeline_revision=timeline_revision,
+                replace=True,
+            )
+        except RuntimeError as exc:
+            self._proxy_build_head = None
+            print(f"[proxy] 任务提交被拒: {exc}", flush=True)
+
+    def _proxy_play_ready(self) -> bool:
+        """引擎侧代理是否就绪（键匹配由调用方在 _send_play 判定）。"""
+        engine = getattr(self, "_io", None)
+        return bool(engine is not None and getattr(engine, "proxy_ready", False))
+
     def _publish_project_snapshot(self, snapshot) -> None:
         """Publish detached compatibility views from the authoritative owner."""
         self.pause_segments, self.speed_segments, self.clip_segments = (
@@ -1159,6 +1484,11 @@ class VideoPreviewPlayer(tk.Frame):
         # 的 skim blob 代数过期（key 守卫自动回落 Tier1）。重建不在变更时
         # 预热——只在 >3x 播放且直通失格时懒触发（09-13 T0：预热=任何编辑
         # 后白烧 5 分钟+294MB，且 blob 在库即用令 ≤cap 播放也糊）。
+        #
+        # P1 物化代理（2026-10-11 定案）：与 skim 相反，编辑后**主动**
+        # debounce 重建——批级缓存把代价压到「受影响批次重编」，代理是
+        # 40x 播放的主路径而非兜底，值得预热。
+        self._arm_proxy_rebuild()
 
     _SKIM_REBUILD_DEBOUNCE_MS = 1200
 
@@ -1316,6 +1646,16 @@ class VideoPreviewPlayer(tk.Frame):
         # 直通档定位：源帧 → 台账名义 tick → dsvc 重定位。必须先于 EDL/
         # verified/源寻址拦截——那些路径按 EDL 虚拟秒或源秒换算字节地址，
         # 对 rawpush CFR 轴全是错位坐标。
+        # 物化代理同理先拦截（源帧 → 代理帧 → exact seek，实测 0 帧误差）。
+        if bool(getattr(self._io, "proxy_active", False)):
+            seek_proxy = getattr(self._io, "seek_proxy_source_frame", None)
+            if callable(seek_proxy):
+                seek_proxy(int(frame_idx))
+                if not self.is_playing:
+                    # 静帧贴请求帧（C4 独立解码=源画质）；恢复播放后引擎
+                    # 回读代理帧→源帧映射，红条/帧号零改动。
+                    self._show_paused_still(int(frame_idx))
+                return
         if bool(getattr(self._io, "dthrough_active", False)):
             self._io.seek_dthrough_source_frame(int(frame_idx))
             if not self.is_playing:
@@ -2364,7 +2704,58 @@ class VideoPreviewPlayer(tk.Frame):
                     print(f"[dthrough] 未接管（{gate_reason}）→ Tier1（不建代理）",
                           flush=True)
             accepted = False
-            if dthrough_spans is not None:
+            # P1 物化代理优先（2026-10-11）：键匹配的代理在库时直接播代理
+            # （业务速度已烘入，mpv speed=UI，实测 UI4x/8x 零停顿）；未就绪
+            # 时立即回落既有直通档（构建期间照常可播，构建并发实测不劣化）。
+            # 自愈（10-11 自查）：门条件满足但键不匹配（业务开关/倍率变更、
+            # 编辑、档位变化）时 arm 重建——不依赖设置面板回调，任何键输入
+            # 变化都收敛到「下一次播放后 1.2s 内重建」。
+            proxy_used = False
+            proxy_gate_ok = (
+                native_engine
+                and speed >= 1.0
+                and bool(self.skip_trimmed.get())
+                and plan.deleted_ranges
+                and p.get('proxy_materialize', True)
+                and self.media_info is not None
+                and getattr(self, "states_array", None) is not None
+            )
+            if proxy_gate_ok:
+                try:
+                    # 带缓存（~60ms 全表计算不该在每次播放键上付两次）
+                    want_key = self._expected_proxy_key_cached(ignore_biz=ignore_biz)
+                    if (
+                        want_key is not None
+                        and getattr(self._io, "proxy_ready", False) is True
+                        and getattr(self._io, "proxy_key", None) == want_key
+                    ):
+                        accepted = bool(self._io.play_proxy(
+                            start_source_frame=start, ui_rate=speed
+                        ))
+                        proxy_used = accepted
+                        if accepted:
+                            # 代理接管：skim blob 永无用武之地，清场省内存
+                            # （与直通分支同款；两代代理并存无意义）。
+                            clear_skim = getattr(self._io, "clear_skim_blob", None)
+                            if callable(clear_skim):
+                                try:
+                                    clear_skim()
+                                except Exception:
+                                    pass
+                            print(f"[proxy] 接管 start={start} ui={speed:g}x",
+                                  flush=True)
+                    else:
+                        # 键不匹配/未装：自愈重建（debounce 合并高频播放请求）。
+                        # ignore_biz=True 时跳过：代理按业务设置烘入，构建端
+                        # 从不产出「忽略业务」键 → arm 只会空转（回落直通=正确语义）。
+                        if not ignore_biz:
+                            self._arm_proxy_rebuild()
+                except (PreviewEngineError, ValueError, TypeError) as exc:
+                    print(f"[proxy] play_proxy 异常 → 回落直通: {exc}", flush=True)
+                    proxy_used = False
+            if proxy_used:
+                dthrough_spans = None  # 跳过直通（已在播代理）
+            if not accepted and dthrough_spans is not None:
                 print(f"[dthrough] 接管 spans={len(dthrough_spans)} "
                       f"rate=[{min(s.rate for s in dthrough_spans)}~"
                       f"{max(s.rate for s in dthrough_spans)}] start={start}",
@@ -2515,13 +2906,22 @@ class VideoPreviewPlayer(tk.Frame):
 
     def _sync_eof_stop(self) -> None:
         """片尾 IO 已停但按钮仍显示暂停时，自动对齐 UI 并冻结统计展示。"""
-        if not self.is_playing or not self._io or self._is_dragging:
+        if not self.is_playing or not self._io:
             return
         try:
             snap = self._io.snapshot_perf()
         except Exception:
             return
-        # 仅片尾自动停；seek/用户暂停不要误触（拖进度条时 IO 也会短暂 inactive）
+        # 仅片尾自动停；seek/用户暂停不要误触。拖拽中**不豁免**：
+        # 10-10 真机 T0（红条在最后仍在播放，探针 probe_redbar_stuck 实证）：
+        # 原判据带 `self._is_dragging` 门——用户拖红条到末尾时引擎已报
+        # eof（引擎侧探针 probe_eof_lastframe 证 1~3s 必达），但 UI 因拖拽
+        # 门永不同步，按钮一直「暂停」、红条钉末尾（R2 复现：引擎 eof 持续
+        # 8s+ 而 UI 仍 playing）；松手后 _on_tl_drag_end 还会 _send_play
+        # (424175) 触发「末帧重播」假播放（acceptance 日志 start=424175 反复
+        # 出现的来源）。拖拽门是多余防线：真拖拽 seek 的瞬态 inactive 必从
+        # reason="playing" 出发（seek 路径只改 pause，不改 play_end_reason），
+        # reason 门已足够；「拖到末尾后引擎自然播完」是真终态，必须同步。
         if snap.get("playback_active"):
             return
         if snap.get("play_end_reason") != "eof":
@@ -2966,8 +3366,18 @@ class VideoPreviewPlayer(tk.Frame):
         root.bind('<space>', self._on_key_space)
         root.bind('<o>', self._toggle_preview_opt, add='+')
         root.bind('<O>', self._toggle_preview_opt, add='+')
+        # 10-10 真机 T0（空格「有时未响应」根因，探针 probe_tk_space_binding 实证）：
+        # 原实现对按钮类绑 `lambda e: 'break'` —— Tk 的 bindtags 顺序是
+        # widget→class→toplevel→all，class 级返回 'break' 会**终止整条链**，
+        # 于是焦点在按钮上时空格既没触发按钮、也永远到不了 root 的
+        # `_on_key_space`（探针实测 root_handler_fired=False）。用户点过任一
+        # 按钮后按空格=完全失灵，点画面/时间轴（focus_preview 抢焦点）后又
+        # 正常——正是「有时不响应」的形态。
+        # 修复=class 级直接调用我们的 handler：语义与 root 级完全一致
+        # （空格=播放/暂停），其返回的 'break' 仍然抑制按钮自身的空格响应
+        # （探针 probe_bindtags_order 实证：handler 恰好触发 1 次，不双触发）。
         for cls in ('TButton', 'Button', 'TCheckbutton', 'TRadiobutton', 'TCombobox', 'TNotebook'):
-            root.bind_class(cls, '<space>', lambda e: 'break')
+            root.bind_class(cls, '<space>', self._on_key_space)
 
     def _on_key_press_left(self, event):
         if self._closing:
@@ -3078,12 +3488,19 @@ class VideoPreviewPlayer(tk.Frame):
         if seek: self._seek(new_idx, skip_trim=False)
 
     def _native_step_enabled(self) -> bool:
-        """原生步进可用：原生引擎 + 暂停中 + 引擎暴露 step_frame。"""
+        """原生步进可用：原生引擎 + 暂停中 + 引擎暴露 step_frame。
+
+        **物化代理模式除外**（10-11 自查抓出）：mpv frame-step 步的是
+        *代理帧*——0.2x 段一个代理帧=10 个源帧，UI 标签却按 +1 源帧递增，
+        语义错位。代理模式步进走 `_seek_frame` 的代理精确寻址（±1 源帧，
+        落点交引擎钳到保留帧），与 EDL 语义一致。
+        """
         io = getattr(self, "_io", None)
         return (
             io is not None
             and not self.is_playing
             and not self._closing
+            and not bool(getattr(io, "proxy_active", False))
             and bool(getattr(io, "native_rendering", False))
             and callable(getattr(io, "step_frame", None))
         )
@@ -3472,6 +3889,11 @@ class VideoPreviewPlayer(tk.Frame):
                 self._frame_q.get_nowait()
             except Empty:
                 break
+        # 10-10：松手前先对账 eof——若拖拽期间引擎已自然播完（4Hz 同步
+        # 可能还没跑到，最多 240ms 窗口），这里直接归位，不再 _send_play
+        # 触发「末帧重播」空转（acceptance 日志 start=424175 反复出现的
+        # 另一半来源）。
+        self._sync_eof_stop()
         if self.is_playing: self._send_play(self.current_frame_idx)
 
     def _on_timeline_pause_select(self, seg_id: int | None):
@@ -3554,6 +3976,10 @@ class VideoPreviewPlayer(tk.Frame):
                 speed_text = ""
             if mode == "dthrough":
                 tag = f"直通{speed_text}"
+            elif mode == "proxy":
+                # 物化代理：speed=UI×业务烘入倍率（0.2x 段 UI4x 下 = 40x，
+                # 业务加速生效的直接可视证据）
+                tag = f"代理{speed_text}"
             elif mode == "skim":
                 tag = f"掠过{speed_text}"
             elif mode == "edl":
@@ -3782,6 +4208,21 @@ class VideoPreviewPlayer(tk.Frame):
         if self._perf_ui_tick % 15 == 0:
             self._sync_eof_stop()
             self._refresh_perf_label()
+            # 10-10 真机 T0（「帧数完全没对应上」）：原生渲染没有帧泵
+            # （`_display_rgb` 只在 cv 队列路径被调），lbl_time/lbl_info 在
+            # 播放中永不刷新——截图实证 OSD 424,175/424,175 而时间标签停在
+            # 44:06（上一次 _update_labels 的时刻）。此处节流 4Hz 刷新；
+            # cv 模式下 _display_rgb 已逐帧刷新，本次幂等无副作用。
+            #
+            # 10-10 review 自查加固：_update_labels 内部会调
+            # `settings.get_params()`（活 Tk 变量），销毁中/半初始化时可抛。
+            # 本维护块是渲染循环的一环，裸抛会终止循环（=整个 UI 冻结，
+            # 恰是本次要修的那类形态）；同块其余调用都自带 try（_refresh_
+            # perf_label 内部包、_sync_eof_stop 包快照），此处对齐包一层。
+            try:
+                self._update_labels()
+            except Exception:
+                pass
         self._render_after_id = self.after(16, self._render_loop)
 
     def _display_rgb(self, rgb: np.ndarray):
@@ -4339,8 +4780,14 @@ class VideoPreviewPlayer(tk.Frame):
         self.timeline.mark_dirty()
         self.btn_analyze.config(state=tk.NORMAL, text="自动模板分析")
         self.timeline.redraw()
-        # （09-13 移除 Tier2 预热：分析落定就建代理=直通档时代纯浪费；
-        # 代理只在 >3x 播放且直通失格时按需懒构建。）
+        # P1 物化代理预热（2026-10-11 定案）：分析落定=段表初版就绪，
+        # 后台立即构建（构建期间照常可播，并发实测不劣化）；构建失败只
+        # 打日志回落直通档/EDL，播放链不受影响。
+        try:
+            self._maybe_schedule_proxy_build()
+        except Exception as exc:
+            print(f"[proxy] 预热调度失败: {type(exc).__name__}: {exc}",
+                  flush=True)
         boundary_note = (
             "边界: 第一遍上下文（已跳过二次扫片）"
             if context_used

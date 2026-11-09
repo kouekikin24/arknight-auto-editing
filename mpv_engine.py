@@ -20,6 +20,8 @@ import threading
 import time
 from typing import Any, Callable, Sequence
 
+import numpy as np
+
 from certified_edl import CertifiedEdl, build_certified_edl
 from dthrough_ledger import DThroughLedger, LedgerSpan, coerce_span
 from dthrough_service import DThroughService, DThroughServiceError
@@ -364,6 +366,19 @@ class MpvEngine:
         self._dthrough_keepalive: list = []
         self._dthrough_opens = 0
         self._dthrough_reads = 0
+        # P1 物化代理（2026-10-11 owner 定案 1080p）：业务速度烘入的连续
+        # 文件 + 映射数组。播放=单文件 mpv speed=UI 倍速（无 EDL/无拼接
+        # 边界/无 dsvc），读回=代理 tp→tick→代理帧→源帧（ticks 为认证
+        # 精确轴时 VFR 也逐帧准确）。1080p 实测 UI4x 零停顿（§24.4）。
+        self._proxy_artifact: Any | None = None
+        self._proxy_key: str | None = None
+        self._proxy_ui_rate = 1.0
+        self._proxy_source_frames: np.ndarray | None = None
+        self._proxy_ticks: np.ndarray | None = None
+        self._proxy_biz_steps: np.ndarray | None = None
+        self._proxy_time_base = Fraction(1, 15360)
+        self._proxy_fps = 60.0
+        self._proxy_frames = 0
         self._osd_topleft = ""
         self._osd_corner = ""
         self._play_end_reason: str | None = None
@@ -1114,7 +1129,7 @@ class MpvEngine:
             exact
             and self._is_paused_locked(player)
             and self._verify is None
-            and self._mode not in ("skim", "dthrough")
+            and self._mode not in ("skim", "dthrough", "proxy")
         ):
             # A paused exact seek presents a stale frame a couple of source
             # ticks before the target at PTS/segment boundaries: the user
@@ -1240,7 +1255,7 @@ class MpvEngine:
         with self._lock:
             if self._closed:
                 raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
-            if self._mode in ("edl", "skim"):
+            if self._mode in ("edl", "skim", "proxy", "dthrough"):
                 return False
             frame = int(request.source_frame)
             try:
@@ -1970,6 +1985,225 @@ class MpvEngine:
         由 skim_key 判断；两者同时成立才有 Tier2 播放资格。"""
         return self._skim_ready
 
+    # ---- P1 物化代理（业务速度烘入的连续文件；1080p 定案 2026-10-11） ----
+
+    def set_proxy_artifact(self, artifact: Any, key: str) -> bool:
+        """安装构建完成的代理（后台工作线程调用安全）。
+
+        artifact=proxy_cache.ProxyArtifact（path/source_frames/ticks/frames）。
+        换代 = 整体换引用；已打开的流继续播旧文件（引用保活），新代理随
+        下一次 loadfile 生效（URL 变化 → _ensure_loaded 不误判同路径）。
+        """
+        with self._lock:
+            if self._closed:
+                return False
+            if artifact is None or not getattr(artifact, "source_frames", None) is not None:
+                raise TypeError("proxy artifact must carry a source_frames mapping")
+            frames = np.asarray(artifact.source_frames, dtype=np.int64)
+            if frames.ndim != 1 or frames.size == 0:
+                raise TypeError("proxy source_frames must be a non-empty 1-D array")
+            path = Path(str(artifact.path))
+            if not path.is_file():
+                raise PreviewEngineError(
+                    "PROXY_MISSING", f"proxy file not found: {path}"
+                )
+            self._proxy_artifact = artifact
+            self._proxy_key = str(key)
+            self._proxy_source_frames = frames
+            ticks = getattr(artifact, "ticks", None)
+            self._proxy_ticks = (
+                np.asarray(ticks, dtype=np.int64)
+                if ticks is not None and len(ticks) == frames.size
+                else None
+            )
+            steps = getattr(artifact, "biz_steps", None)
+            self._proxy_biz_steps = (
+                np.asarray(steps, dtype=np.int32)
+                if steps is not None and len(steps) == frames.size
+                else None
+            )
+            tb = getattr(artifact, "time_base", None)
+            self._proxy_time_base = Fraction(tb) if tb is not None else Fraction(1, 15360)
+            fps = getattr(artifact, "fps", None)
+            try:
+                fps_val = float(fps) if fps else 0.0
+            except (TypeError, ValueError):
+                fps_val = 0.0
+            if fps_val <= 0:
+                try:
+                    fps_val = float(getattr(self, "fps", 0.0) or 60.0)
+                except (TypeError, ValueError):
+                    fps_val = 60.0
+            self._proxy_fps = fps_val
+            self._proxy_frames = int(frames.size)
+            return True
+
+    def clear_proxy_artifact(self) -> None:
+        """释放代理（源切换/编辑失效/构建换代）。"""
+        with self._lock:
+            self._proxy_artifact = None
+            self._proxy_key = None
+            self._proxy_source_frames = None
+            self._proxy_ticks = None
+            self._proxy_biz_steps = None
+            self._proxy_frames = 0
+
+    @property
+    def proxy_key(self) -> str | None:
+        return self._proxy_key
+
+    @property
+    def proxy_ready(self) -> bool:
+        """代理在库（与请求的键匹配由调用方判定）。"""
+        return self._proxy_artifact is not None
+
+    @property
+    def proxy_active(self) -> bool:
+        with self._lock:
+            return self._mode == "proxy"
+
+    def play_proxy(
+        self,
+        *,
+        start_source_frame: int = 0,
+        ui_rate: float = 1.0,
+    ) -> bool:
+        """代理播放：单文件 load + speed=UI 倍速（业务速度已烘入）。
+
+        与 play_dthrough 的差别：无 dsvc/无 stream_cb/无拼接——一个普通
+        mp4 文件 + 一个映射数组。``ui_rate`` 运行中可变（GUI 滑条直接改
+        speed，实测 1x↔4x 切换 0 丢帧）。
+        """
+        with self._lock:
+            if self._closed:
+                raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
+            artifact = self._proxy_artifact
+            if artifact is None or self._proxy_source_frames is None:
+                raise PreviewEngineError(
+                    "PROXY_NOT_READY", "no proxy artifact is installed"
+                )
+            rate = float(ui_rate)
+            if rate <= 0 or not math.isfinite(rate):
+                raise ValueError("ui_rate must be a finite positive number")
+            if isinstance(start_source_frame, bool) or not isinstance(
+                start_source_frame, int
+            ):
+                raise TypeError("start_source_frame must be an integer")
+            frames = self._proxy_source_frames
+            k = int(np.searchsorted(frames, int(start_source_frame), side="left"))
+            if k >= frames.size:
+                k = frames.size - 1
+            self._proxy_ui_rate = rate
+            self._proxy_fps = self._proxy_fps or 60.0
+            self._verify = None
+            self._biz_speed = None  # 代理：业务速率已烘入文件，mpv 只管 UI
+            self._biz_speed_cap = None
+            # 已载同一代理文件 → 直接 seek+变速（免重载）
+            proxy_path = str(Path(str(artifact.path)).resolve())
+            if (
+                self._mode == "proxy"
+                and getattr(self, "_loaded_path", None) == proxy_path
+                and self._loaded_ready
+            ):
+                seconds = self._proxy_seconds_for_frame_locked(k)
+                self._command_seek_locked(seconds, exact=True)
+                self._set_speed_locked(rate)
+                self._resume_locked()
+                return True
+            self._ensure_loaded_locked(proxy_path, "proxy")
+            seconds = self._proxy_seconds_for_frame_locked(k)
+            if self._loaded_ready:
+                self._command_seek_locked(seconds, exact=True)
+                self._set_speed_locked(rate)
+                self._resume_locked()
+            else:
+                self._pending_seek = (seconds, True)
+                self._pending_speed = rate
+                self._pending_resume = True
+            return True
+
+    def seek_proxy_source_frame(self, source_frame: int) -> bool:
+        """代理定位（GUI 拖轴/步进入口）：源帧 → 代理帧 → exact seek。"""
+        with self._lock:
+            if self._closed:
+                raise PreviewEngineError("ENGINE_CLOSED", "preview engine is closed")
+            if self._mode != "proxy" or self._proxy_source_frames is None:
+                raise PreviewEngineError(
+                    "PROXY_NOT_ACTIVE", "proxy mode is not active"
+                )
+            if isinstance(source_frame, bool) or not isinstance(source_frame, int):
+                raise TypeError("source_frame must be an integer")
+            frames = self._proxy_source_frames
+            k = int(np.searchsorted(frames, int(source_frame), side="left"))
+            if k >= frames.size:
+                k = frames.size - 1
+            seconds = self._proxy_seconds_for_frame_locked(k)
+            self._command_seek_locked(seconds, exact=True)
+            self._source_frame = int(frames[k])
+            return True
+
+    def _proxy_biz_rate_for_frame(self, source_frame: int) -> int:
+        """该源帧在代理里被烘入的业务倍率（角标用）。
+
+        优先用构建期算好的逐帧 steps（精确）；缺失时回退映射几何估计
+        （相邻源帧差 = 该处业务 step）。
+        """
+        steps = self._proxy_biz_steps
+        frames = self._proxy_source_frames
+        if frames is None:
+            return 1
+        try:
+            if steps is not None and steps.size == frames.size:
+                k = int(np.searchsorted(frames, int(source_frame), side="left"))
+                if k >= frames.size:
+                    k = frames.size - 1
+                return max(1, int(steps[k]))
+        except (TypeError, ValueError, IndexError):
+            pass
+        if frames.size < 2:
+            return 1
+        k = int(np.searchsorted(frames, int(source_frame), side="left"))
+        if k >= frames.size:
+            k = frames.size - 1
+        diffs = []
+        if k + 1 < frames.size:
+            diffs.append(int(frames[k + 1]) - int(frames[k]))
+        if k > 0:
+            diffs.append(int(frames[k]) - int(frames[k - 1]))
+        if not diffs:
+            return 1
+        return max(1, max(diffs))
+
+    def _proxy_seconds_for_frame_locked(self, k: int) -> Fraction:
+        """代理第 k 帧的呈现时刻（ticks 精确轴优先，缺失用均匀 fps）。"""
+        ticks = self._proxy_ticks
+        if ticks is not None and 0 <= int(k) < ticks.size:
+            return Fraction(int(ticks[int(k)]), 1) * self._proxy_time_base
+        return Fraction(int(k), 1) / Fraction(max(self._proxy_fps, 1e-6))
+
+    def _proxy_frame_for_position_locked(self, position: float) -> int:
+        """代理 tp 读回：秒 → 代理帧 k → 源帧。
+
+        ticks 为认证精确轴时按 tick 二分（VFR 逐帧精确）；缺失时均匀近似。
+        """
+        frames = self._proxy_source_frames
+        if frames is None:
+            return self._source_frame
+        try:
+            if self._proxy_ticks is not None and self._proxy_ticks.size == frames.size:
+                tick = int(round(max(0.0, float(position)) * float(self._proxy_time_base.denominator)))
+                k = int(np.searchsorted(self._proxy_ticks, tick, side="right")) - 1
+            else:
+                k = int(math.floor(max(0.0, float(position)) * self._proxy_fps))
+            if k < 0:
+                k = 0
+            if k >= frames.size:
+                k = frames.size - 1
+            return int(frames[k])
+        except (TypeError, ValueError, IndexError):
+            return self._source_frame
+
+
     def _set_speed_locked(self, value: float) -> None:
         player = self._require_player_locked()
         rate = float(value)
@@ -2110,6 +2344,8 @@ class MpvEngine:
     def _frame_for_position_locked(self, position: float) -> int:
         if self._mode == "dthrough":
             return self._dthrough_frame_for_position_locked(position)
+        if self._mode == "proxy":
+            return self._proxy_frame_for_position_locked(position)
         if self._mode in ("edl", "skim") and self._edl is not None:
             return self._edl.source_frame_for_virtual_time(Fraction(str(max(0.0, position))))
         if self._timeline is None:
@@ -2293,6 +2529,12 @@ class MpvEngine:
                 value["speed"] = None
             if self._mode == "dthrough" and self._dthrough_rate > 0:
                 value["speed"] = float(self._dthrough_rate)
+            if self._mode == "proxy":
+                # 代理：mpv speed=UI 倍速；业务速度已烘入文件 → 生效倍速
+                # = UI × 该帧业务倍率（GUI 角标要显示「40x」就靠它）。
+                value["speed"] = float(self._proxy_ui_rate) * float(
+                    self._proxy_biz_rate_for_frame(self._source_frame)
+                )
             presented = int(value.get("presented", 0))
             if drops is None:
                 value["mpv_drop_pct"] = None
